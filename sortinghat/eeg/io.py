@@ -29,28 +29,53 @@ CANONICAL_19: tuple[str, ...] = (
 # T3/T4/T5/T6 labels. The other nine 10-20 channels (F3, F4, C3, C4, P3, P4, Fz, Cz, Pz) are optional for QC.
 DEFAULT_MINIMUM_CHANNELS: tuple[str, ...] = ("Fp1", "Fp2", "F7", "F8", "T3", "T4", "T5", "T6", "O1", "O2")
 
-_ALIASES = {"T7": "T3", "T8": "T4", "P7": "T5", "P8": "T6"}
-_CANON_UPPER = {c.upper(): c for c in CANONICAL_19}
-_PREFIX_RE = re.compile(r"^\s*EEG[\s_:\-]+", re.I)
-_SUFFIX_RE = re.compile(r"[\s_\-]*(REF|LE|AV|AVG|AR|AVERAGE|LINKED)\s*$", re.I)
-
-
 class EDFError(ValueError):
     """Malformed or unsupported EDF."""
+
+
+_ALIASES = {"T7": "T3", "T8": "T4", "P7": "T5", "P8": "T6"}
+_CANON_UPPER = {c.upper(): c for c in CANONICAL_19}
+# Vendor prefixes: "EEG Fp1-REF" (Nihon Kohden / Natus), "POL Fp1" (Polaris / Persyst exports), "EEG:Fp1", "EEG_Fp1".
+_PREFIX_RE = re.compile(r"^\s*(?:EEG|POL|EEG\.)[\s_:\-\.]+", re.I)
+# What may follow the electrode and still mean "this electrode against a common reference": a named reference
+# (Ref, Ref1, G2, GND, SYS), linked ears / mastoids / average (LE, A1, A2, M1, M2, A1A2, AV, AVG, AR, CAR, Linked),
+# e.g. "Fp1-Ref", "Fp1-AVG", "C3-A2", "T5-M1", "Fp1-(A1+A2)/2". Anything else (``Fp1-F7``) is a BIPOLAR label.
+_REF_TOKEN_RE = re.compile(r"^(?:REF\d?|REFERENCE|LE|RE|AV|AVG|AVE|AVERAGE|AR|CAR|LINKED(?:EARS?)?|LINKEDMASTOIDS?|"
+                           r"[AM][12]|A1A2\d?|A2A1\d?|M1M2\d?|G[12]|GND|SYS|CZREF)$")
+_SPLIT_RE = re.compile(r"[-_/:.]+")
+# Raw labels that contain two electrodes (``Fp1-F7``): recognised so diagnostics can count bipolar montages.
+_BIPOLAR_RE = re.compile(r"^(?:EEG\s+|POL\s+)?([A-Za-z]{1,2}[0-9zZ]{1,2})\s*[-]\s*([A-Za-z]{1,2}[0-9zZ]{1,2})$")
 
 
 def normalize_channel_name(name: str) -> str | None:
     """Map a raw EDF label to a canonical 10-20 name, or ``None`` if it is not a referential 10-20 channel.
 
-    Strips an ``EEG `` prefix and ``-REF`` / ``-LE`` / ``-AV`` style suffixes, case-insensitive, and maps
-    T7/T8/P7/P8 to T3/T4/T5/T6. Bipolar labels (``Fp1-F7``), ECG, EOG, etc. return ``None``.
+    Accepts the real label styles: ``Fp1``, ``FP1``, ``EEG Fp1-Ref``, ``EEG Fp1-REF``, ``EEG T7``, ``POL Fp1``,
+    ``Fp1-AVG`` / ``-LE`` / ``-AV``, ``C3-A2`` / ``T5-M1`` (ear / mastoid reference), ``Fp1-G2``, ``EEG Fp1 - Ref``,
+    trailing dots; maps T7/T8/P7/P8 to T3/T4/T5/T6. Bipolar labels (``Fp1-F7``), ECG, EOG, A1 alone, etc.
+    return ``None``.
     """
-    s = str(name).strip()
-    s = _PREFIX_RE.sub("", s)
-    s = _SUFFIX_RE.sub("", s)
-    s = s.strip().replace(" ", "").upper()
-    s = _ALIASES.get(s, s)
-    return _CANON_UPPER.get(s)
+    s = _PREFIX_RE.sub("", str(name).strip())
+    core = re.sub(r"[\s\x00]+", "", s).upper()
+    if not core:
+        return None
+    first, rest = (_SPLIT_RE.split(core, maxsplit=1) + [""])[:2]
+    first = _ALIASES.get(first, first)
+    if first not in _CANON_UPPER:
+        return None
+    rest = re.sub(r"[()+]", "", rest).strip("-_/:.")
+    if rest and not _REF_TOKEN_RE.match(rest.replace("/", "")):
+        return None
+    return _CANON_UPPER[first]
+
+
+def is_bipolar_label(name: str) -> bool:
+    """True for ``Fp1-F7`` style labels (two electrode names), which are not referential channels."""
+    m = _BIPOLAR_RE.match(str(name).strip())
+    if not m:
+        return False
+    a, b = (_ALIASES.get(x.upper(), x.upper()) for x in m.groups())
+    return a in _CANON_UPPER and b in _CANON_UPPER
 
 
 @dataclass
@@ -83,6 +108,7 @@ class EDFHeader:
     header_bytes: int
     discontinuous: bool
     is_annotation: list[bool]
+    edf_type: str = "EDF"                 # "EDF", "EDF+C" (continuous) or "EDF+D" (discontinuous), from the reserved field
 
     @property
     def fs(self) -> np.ndarray:
@@ -119,6 +145,7 @@ def _parse_header(fh: BinaryIO, file_size: int | None) -> EDFHeader:
         raise EDFError("not an EDF file (bad version field)")
     reserved = fixed[192:236].decode("ascii", "replace")
     discontinuous = reserved.startswith("EDF+D")
+    edf_type = "EDF+D" if discontinuous else "EDF+C" if reserved.startswith("EDF+C") else "EDF"
     header_bytes = int(_f(fixed[184:192], "header bytes"))
     n_records = int(_f(fixed[236:244], "n records"))
     rec_dur = _f(fixed[244:252], "record duration")
@@ -147,7 +174,7 @@ def _parse_header(fh: BinaryIO, file_size: int | None) -> EDFHeader:
     spr = np.array([int(_f(b, "samples/record")) for b in take(8)])
     take(32)  # reserved
     hdr = EDFHeader(ns, n_records, rec_dur, labels, dims, pmin, pmax, dmin, dmax, spr, header_bytes,
-                    discontinuous, [lb.startswith("EDF Annotations") for lb in labels])
+                    discontinuous, [lb.startswith("EDF Annotations") for lb in labels], edf_type)
     if n_records < 0 and file_size is not None:     # unknown record count: infer from size
         hdr.n_records = max(0, (file_size - header_bytes) // hdr.record_bytes)
     return hdr
@@ -176,6 +203,26 @@ def _uv_scale(dim: str) -> float:
     raise EDFError(f"unsupported physical dimension {dim!r}")
 
 
+SCALING_OK = "ok"
+SCALING_DIG_RANGE_ZERO = "digital_range_zero"      # dmin == dmax: no sample-to-unit mapping at all
+SCALING_PHYS_RANGE_ZERO = "physical_range_zero"    # pmin == pmax (e.g. 0/0): every sample maps to ONE value (flat)
+SCALING_NONFINITE = "non_finite_range"
+
+
+def channel_scaling_status(h: EDFHeader, i: int) -> str:
+    """Whether signal ``i`` has a usable digital -> physical mapping. An EDF whose physical range is zero (or whose
+    digital range is zero) decodes to a CONSTANT regardless of the samples; that is a calibration problem, not a
+    flat electrode, so such a channel must be reported as unusable rather than as flat data."""
+    if not (np.isfinite(h.phys_min[i]) and np.isfinite(h.phys_max[i]) and np.isfinite(h.dig_min[i])
+            and np.isfinite(h.dig_max[i])):
+        return SCALING_NONFINITE
+    if h.dig_max[i] - h.dig_min[i] == 0:
+        return SCALING_DIG_RANGE_ZERO
+    if h.phys_max[i] - h.phys_min[i] == 0:
+        return SCALING_PHYS_RANGE_ZERO
+    return SCALING_OK
+
+
 def read_edf(src, start_s: float = 0.0, duration_s: float | None = None, channels: list[str] | None = None,
              keep_nonstandard: bool = False, allow_discontinuous: bool = False) -> Recording:
     """Read an EDF interval as channels x samples in uV.
@@ -194,6 +241,8 @@ def read_edf(src, start_s: float = 0.0, duration_s: float | None = None, channel
         if h.discontinuous and not allow_discontinuous:
             raise EDFError("EDF+D (discontinuous) recording: time axis has gaps; pass allow_discontinuous=True")
         names: dict[int, str] = {}
+        invalid: list[str] = []          # channels dropped for a zero / non-finite calibration range
+        duplicates: list[str] = []       # a second signal mapping to an already-taken channel (first one wins)
         for i, lb in enumerate(h.labels):
             if h.is_annotation[i]:
                 continue
@@ -205,9 +254,16 @@ def read_edf(src, start_s: float = 0.0, duration_s: float | None = None, channel
             if channels is not None and c not in channels:
                 continue
             if c in names.values():
-                raise EDFError(f"two signals map to channel {c}")
+                duplicates.append(c)
+                continue
+            if channel_scaling_status(h, i) != SCALING_OK:
+                invalid.append(c)
+                continue
             names[i] = c
+        invalid = [c for c in invalid if c not in names.values()]      # a valid duplicate of the name is enough
         if not names:
+            if invalid:
+                raise EDFError("invalid channel scaling (zero physical or digital range) on every EEG channel")
             raise EDFError("no EEG channels found")
         total = h.duration_s
         t0 = min(max(0.0, start_s), total)
@@ -224,8 +280,8 @@ def read_edf(src, start_s: float = 0.0, duration_s: float | None = None, channel
         for i in names:
             dig = arr[:, bounds[i]:bounds[i + 1]].astype(np.float64).reshape(-1)
             span = h.dig_max[i] - h.dig_min[i]
-            if span == 0:
-                raise EDFError("digital min == max")
+            if span == 0:                                  # keep_nonstandard signals are not scaling-checked above
+                raise EDFError("invalid channel scaling (digital min == max)")
             gain = (h.phys_max[i] - h.phys_min[i]) / span
             phys = (dig - h.dig_min[i]) * gain + h.phys_min[i]
             sigs.append(phys * _uv_scale(h.phys_dim[i]))
@@ -248,7 +304,8 @@ def read_edf(src, start_s: float = 0.0, duration_s: float | None = None, channel
         n_want = data.shape[1] - s0 if duration_s is None else int(round((t1 - t0) * fs))
         data = data[:, s0: s0 + max(0, n_want)]
         return Recording(data=data, fs=fs, ch_names=list(names.values()), offset_s=t0,
-                         meta={"edf_duration_s": total, "discontinuous": h.discontinuous,
+                         meta={"edf_duration_s": total, "discontinuous": h.discontinuous, "edf_type": h.edf_type,
+                               "invalid_scaling_channels": invalid, "duplicate_channels": duplicates,
                                "phys_limits_uv": [float(max(abs(h.phys_min[i]), abs(h.phys_max[i]))
                                                         * _uv_scale(h.phys_dim[i])) for i in names]})
     finally:
@@ -296,3 +353,24 @@ def select_channels(rec: Recording, required=CANONICAL_19, fill_missing: bool = 
     meta = dict(rec.meta)
     meta["missing_channels"] = [c for c in required if c not in idx]
     return Recording(data, rec.fs, names, rec.offset_s, meta)
+
+
+def drop_dead_channels(rec: Recording) -> Recording:
+    """Remove channels whose samples are EXACTLY constant (or NaN) over the whole segment and report them as MISSING.
+
+    An amplifier output that is bit-for-bit constant for the full padded window (zero-filled placeholder for an
+    absent electrode, an unplugged input pinned at one code) carries no EEG at all; counting it as "flat data" hides
+    that the channel is missing. After this call such a channel is absent from ``ch_names`` (so the QC's
+    minimum-set rule sees a missing channel) and is listed in ``meta['dead_channels']`` (a list of canonical
+    names). Channels that are merely low-amplitude or flat for part of the window are NOT touched; the QC flags those.
+    """
+    if rec.data.size == 0:
+        return rec
+    x = rec.data
+    finite = np.isfinite(x)
+    const = np.where(finite, x, -np.inf).max(axis=1) == np.where(finite, x, np.inf).min(axis=1)
+    dead = ~finite.any(axis=1) | const
+    meta = dict(rec.meta)
+    meta["dead_channels"] = [c for c, d in zip(rec.ch_names, dead) if d]
+    keep = ~dead
+    return Recording(x[keep], rec.fs, [c for c, k in zip(rec.ch_names, keep) if k], rec.offset_s, meta)

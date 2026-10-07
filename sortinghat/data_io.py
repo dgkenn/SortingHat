@@ -398,7 +398,8 @@ def resolve_key(s3, table: str, site: str | None = None, *, bucket: str | None =
 
 
 def read_csv_table(table: str, site: str | None = None, *, s3=None, profile: str | None = None,
-                   usecols: Iterable[str] | None = None, dtype: Any = str) -> pd.DataFrame:
+                   usecols: Iterable[str] | None = None, dtype: Any = str,
+                   retry: RetryPolicy | None = None) -> pd.DataFrame:
     """Read one CSV table into a DataFrame. Every column is read as text unless ``dtype`` says otherwise.
 
     Text by default on purpose: the findings columns hold free labels, ``None``/``nan`` strings and
@@ -406,12 +407,13 @@ def read_csv_table(table: str, site: str | None = None, *, s3=None, profile: str
     """
     s3 = s3 or make_client(profile)
     key = resolve_key(s3, table, site)
-    body = s3.get_object(Bucket=access_point(), Key=key)["Body"].read()
+    body = read_object(s3, access_point(), key, policy=retry)         # chunked ranged GETs, each retried
     return pd.read_csv(io.BytesIO(body), dtype=dtype, usecols=None if usecols is None else list(usecols),
                        encoding="utf-8-sig", low_memory=False)
 
 
-def read_site_table(table: str, site: str, *, s3=None, profile: str | None = None, dtype: Any = str) -> pd.DataFrame:
+def read_site_table(table: str, site: str, *, s3=None, profile: str | None = None, dtype: Any = str,
+                    retry: RetryPolicy | None = None) -> pd.DataFrame:
     """Read one site's ``eeg_metadata`` / ``reports_findings`` CSV and map its columns onto CANONICAL names.
 
     Reads the header first and loads only the columns that are not on the site's never-load list
@@ -421,8 +423,8 @@ def read_site_table(table: str, site: str, *, s3=None, profile: str | None = Non
     s3 = s3 or make_client(profile)
     key = resolve_key(s3, table, site)
     skip = set(schema.never_load(table, site))
-    use = [c for c in csv_header(s3, key) if c not in skip]
-    body = s3.get_object(Bucket=access_point(), Key=key)["Body"].read()
+    use = [c for c in csv_header(s3, key, policy=retry) if c not in skip]
+    body = read_object(s3, access_point(), key, policy=retry)         # chunked ranged GETs, each retried
     df = pd.read_csv(io.BytesIO(body), dtype=dtype, usecols=use, encoding="utf-8-sig", low_memory=False)
     return normalise_site_table(table, site, df)
 
@@ -479,6 +481,193 @@ def bids_folder_for(site: str, bdsp_patient_id: str | int) -> str:
     return f"sub-{site}{bdsp_patient_id}"
 
 
+# ---------------------------------------------------------------------------------------------------------
+# Robust EDF key resolution (documented pattern first; then listing ONLY the recording's own folder)
+# ---------------------------------------------------------------------------------------------------------
+# Pattern NAMES are the only thing diagnostics may report (never keys).
+EDF_PATTERNS = ("documented", "alt_task", "no_task", "documented+sid_variant", "alt_task+sid_variant",
+                "no_task+sid_variant", "folder_listing", "patient_listing", "not_found")
+
+
+def _sid_variants(session_id) -> list[str]:
+    """The SessionID as given, then spellings a CSV round trip can produce (``12.0`` -> ``12``; padding stripped)."""
+    sid = str(session_id).strip()
+    out = [sid]
+    if re.fullmatch(r"\d+\.0+", sid):
+        out.append(sid.split(".")[0])
+    base = out[-1]
+    if base.isdigit() and base != base.lstrip("0") and base.lstrip("0"):
+        out.append(base.lstrip("0"))
+    return list(dict.fromkeys(out))
+
+
+def _bids_names(bids_folder) -> list[str]:
+    b = str(bids_folder).strip()
+    return [b] if b.startswith("sub-") else [b, "sub-" + b]
+
+
+def bids_edf_candidates(site: str, bids_folder: str, session_id, eeg_folder: str | None = None) -> list[tuple[str, str]]:
+    """Ordered ``(pattern name, key)`` candidates: the documented key (task token from ``EEGFolder``), the other task
+    token, and a task-less BIDS name; then the same with SessionID spelling variants (``12.0`` -> ``12``)."""
+    first = "cEEG" if (eeg_folder or "").lower().startswith("ceeg") else "EEG"
+    other = "EEG" if first == "cEEG" else "cEEG"
+    out: list[tuple[str, str]] = []
+    for bf in _bids_names(bids_folder):
+        for n, sid in enumerate(_sid_variants(session_id)):
+            base = f"{BIDS_PREFIX}{site}/{bf}/ses-{sid}/eeg/{bf}_ses-{sid}"
+            suffix = "" if n == 0 else "+sid_variant"
+            out += [("documented" + suffix, f"{base}_task-{first}_eeg.edf"),
+                    ("alt_task" + suffix, f"{base}_task-{other}_eeg.edf"),
+                    ("no_task" + suffix, f"{base}_eeg.edf")]
+    return list(dict.fromkeys(out))
+
+
+_NOT_FOUND_CODES = {"NoSuchKey", "NotFound", "404", "NoSuchBucket", "AccessDenied", "403", "Forbidden"}
+
+
+def key_exists(s3, key: str, *, bucket: str | None = None, policy: RetryPolicy | None = None) -> bool:
+    """Whether one exact key exists (HEAD, else an exact-prefix listing). Missing / denied is False; transient errors
+    are retried and then raised."""
+    bucket = bucket or access_point()
+    try:
+        if hasattr(s3, "head_object"):
+            with_retries(lambda: s3.head_object(Bucket=bucket, Key=key), policy)
+            return True
+        resp = with_retries(lambda: s3.list_objects_v2(Bucket=bucket, Prefix=key, MaxKeys=1), policy)
+        return any(o["Key"] == key for o in resp.get("Contents", []))
+    except FileNotFoundError:
+        return False
+    except Exception as exc:  # noqa: BLE001
+        resp = getattr(exc, "response", None)
+        if isinstance(resp, dict) and (str(resp.get("Error", {}).get("Code", "")) in _NOT_FOUND_CODES
+                                       or resp.get("ResponseMetadata", {}).get("HTTPStatusCode") in (403, 404)):
+            return False
+        raise
+
+
+def file_ext(name: str) -> str:
+    """Technical extension of a file name: everything after the first '.' of the last path segment, lower case
+    (``x_eeg.edf`` -> ``edf``, ``x.edf.gz`` -> ``edf.gz``); ``other`` when absent or odd."""
+    seg = name.rsplit("/", 1)[-1]
+    ext = seg.split(".", 1)[1].lower() if "." in seg else ""
+    return ext if re.fullmatch(r"[a-z0-9]{1,8}(\.[a-z0-9]{1,8})?", ext) else "other"
+
+
+@dataclass
+class FolderListing:
+    """One folder level (``Delimiter='/'``): whether it holds anything, file-extension counts, the .edf names."""
+    exists: bool = False
+    ext_counts: Counter = field(default_factory=Counter)
+    edf_keys: list[str] = field(default_factory=list)
+    subfolders: list[str] = field(default_factory=list)
+
+
+def list_folder(s3, prefix: str, *, bucket: str | None = None, policy: RetryPolicy | None = None) -> FolderListing:
+    """List ONE folder (``prefix`` ends with '/'), one level, paginated. Names stay in memory; callers report counts."""
+    bucket = bucket or access_point()
+    out = FolderListing()
+    token = None
+    while True:
+        kw: dict[str, Any] = {"Bucket": bucket, "Prefix": prefix, "Delimiter": "/", "MaxKeys": 1000}
+        if token:
+            kw["ContinuationToken"] = token
+        resp = with_retries(lambda kw=kw: s3.list_objects_v2(**kw), policy)
+        for o in resp.get("Contents", []):
+            if o["Key"] == prefix:
+                continue
+            out.exists = True
+            ext = file_ext(o["Key"])
+            out.ext_counts[ext] += 1
+            if ext == "edf":
+                out.edf_keys.append(o["Key"])
+        subs = [c["Prefix"] for c in resp.get("CommonPrefixes", [])]
+        out.subfolders += subs
+        out.exists = out.exists or bool(subs)
+        if not resp.get("IsTruncated"):
+            return out
+        token = resp.get("NextContinuationToken")
+
+
+def pick_edf(keys: list[str], bids_folder: str, session_id, task: str) -> str | None:
+    """The session's EDF among ``keys``: prefer a name starting ``<BidsFolder>_ses-<id>``, then the expected task."""
+    if not keys:
+        return None
+    sids = _sid_variants(session_id)
+
+    def score(k: str) -> tuple:
+        name = k.rsplit("/", 1)[-1]
+        starts = any(name.startswith(f"{b}_ses-{sid}") for b in _bids_names(bids_folder) for sid in sids)
+        return (not starts, f"task-{task}_" not in name, name)
+    return min(keys, key=score)
+
+
+@dataclass
+class EdfResolution:
+    key: str | None                      # NEVER print
+    pattern: str = "not_found"           # one of EDF_PATTERNS
+    folder_exists: bool | None = None    # session eeg/ folder (None = not listed)
+    n_edf: int | None = None             # .edf files in that folder (None = not listed)
+    ext_counts: Counter = field(default_factory=Counter)
+
+    @property
+    def found(self) -> bool:
+        return self.key is not None
+
+
+def resolve_edf_key(s3, site: str, bids_folder: str, session_id, eeg_folder: str | None = None, *,
+                    bucket: str | None = None, list_fallback: bool = True, patient_fallback: bool = False,
+                    always_list: bool = False, policy: RetryPolicy | None = None) -> EdfResolution:
+    """Resolve one session's EDF key robustly.
+
+    1. the documented key, the other task token and a task-less name (``bids_edf_candidates``), by exact-key HEAD;
+    2. ``list_fallback``: list ONLY the session's own folder ``EEG/bids/<site>/<BidsFolder>/ses-<id>/eeg/``
+       (``Delimiter='/'``) and take the ``.edf`` whose name matches the session (``pick_edf``);
+    3. ``patient_fallback`` (off by default): list the subject's own folder for a ``ses-`` folder whose id equals the
+       session id under a spelling variant, then list that session's ``eeg/``.
+    ``always_list`` also lists the session folder when step 1 already found the key, to fill ``folder_exists`` /
+    ``n_edf`` / ``ext_counts`` for diagnostics. Keys are returned, never printed or logged here.
+    """
+    bucket = bucket or access_point()
+    task = "cEEG" if (eeg_folder or "").lower().startswith("ceeg") else "EEG"
+    res = EdfResolution(None)
+    for pat, key in bids_edf_candidates(site, bids_folder, session_id, eeg_folder):
+        if key_exists(s3, key, bucket=bucket, policy=policy):
+            res.key, res.pattern = key, pat
+            break
+    if (res.key is None and list_fallback) or always_list:
+        listing = FolderListing()
+        for bf in _bids_names(bids_folder):
+            for sid in _sid_variants(session_id):
+                listing = list_folder(s3, f"{BIDS_PREFIX}{site}/{bf}/ses-{sid}/eeg/", bucket=bucket, policy=policy)
+                if listing.exists:
+                    break
+            if listing.exists:
+                break
+        res.folder_exists, res.n_edf, res.ext_counts = listing.exists, len(listing.edf_keys), listing.ext_counts
+        if res.key is None:
+            k = pick_edf(listing.edf_keys, bids_folder, session_id, task)
+            if k is not None:
+                res.key, res.pattern = k, "folder_listing"
+    if res.key is None and patient_fallback:
+        for bf in _bids_names(bids_folder):
+            top = list_folder(s3, f"{BIDS_PREFIX}{site}/{bf}/", bucket=bucket, policy=policy)
+            if not top.exists:
+                continue
+            want = set(_sid_variants(session_id)) | {v.lstrip("0") for v in _sid_variants(session_id)}
+            for cp in top.subfolders:
+                seg = cp.rstrip("/").rsplit("/", 1)[-1]
+                if seg.startswith("ses-") and (seg[4:] in want or seg[4:].lstrip("0") in want):
+                    lst = list_folder(s3, cp + "eeg/", bucket=bucket, policy=policy)
+                    k = pick_edf(lst.edf_keys, bids_folder, session_id, task)
+                    if k is not None:
+                        res.key, res.pattern = k, "patient_listing"
+                        res.folder_exists, res.n_edf, res.ext_counts = True, len(lst.edf_keys), lst.ext_counts
+                        break
+            if res.key is not None:
+                break
+    return res
+
+
 def parquet_parts(s3, prefix: str, *, bucket: str | None = None) -> list[str]:
     """Parquet part keys under any prefix (used for the ASSUMED ``Imaging/`` location)."""
     return list_keys(s3, prefix, bucket=bucket, suffix=".parquet")
@@ -495,11 +684,22 @@ class S3RangeFile(io.RawIOBase):
     """Seekable read-only file over an S3 object using HTTP range requests (from the source extractor).
 
     Lets pyarrow read just the footer, selected columns and row groups of a multi-GB parquet part,
-    so memory scales with a row group instead of the file.
+    so memory scales with a row group instead of the file. Every read is split into ranged GETs of at most
+    ``max_get_bytes``; each GET (body read included) is retried with jittered backoff on dropped streams
+    (``ResponseStreamingError``, ``IncompleteRead``), connection errors, read timeouts, throttling and 5xx, and a
+    short body is retried too (see ``get_bytes``).
     """
 
-    def __init__(self, s3, bucket: str, key: str, size: int):
+    def __init__(self, s3, bucket: str, key: str, size: int, *, policy: RetryPolicy | None = None,
+                 max_get_bytes: int = GET_CHUNK_BYTES):
         self._s3, self._bucket, self._key, self._size, self._pos = s3, bucket, key, size, 0
+        self._policy, self._max_get = policy, max(1, int(max_get_bytes))
+
+    @classmethod
+    def open(cls, s3, bucket: str, key: str, *, policy: RetryPolicy | None = None,
+             max_get_bytes: int = GET_CHUNK_BYTES) -> "S3RangeFile":
+        return cls(s3, bucket, key, head_size(s3, bucket, key, policy=policy), policy=policy,
+                   max_get_bytes=max_get_bytes)
 
     def readable(self) -> bool:
         return True
@@ -518,13 +718,18 @@ class S3RangeFile(io.RawIOBase):
     def read(self, n: int = -1) -> bytes:
         if n is None or n < 0:
             n = self._size - self._pos
-        if n <= 0 or self._pos >= self._size:
+        n = min(n, self._size - self._pos)
+        if n <= 0:
             return b""
-        end = min(self._pos + n, self._size) - 1
-        body = self._s3.get_object(Bucket=self._bucket, Key=self._key,
-                                   Range=f"bytes={self._pos}-{end}")["Body"].read()
-        self._pos += len(body)
-        return body
+        parts = []
+        while n > 0:
+            take = min(n, self._max_get)
+            body, _ = get_bytes(self._s3, self._bucket, self._key, self._pos, self._pos + take - 1, expected=take,
+                                policy=self._policy)
+            parts.append(body)
+            self._pos += take
+            n -= take
+        return parts[0] if len(parts) == 1 else b"".join(parts)
 
     def readinto(self, b) -> int:
         data = self.read(len(b))
@@ -532,37 +737,94 @@ class S3RangeFile(io.RawIOBase):
         return len(data)
 
 
+def _outer(policy: RetryPolicy | None) -> RetryPolicy:
+    """Policy for the row-group / open layer that wraps ``S3RangeFile``'s own per-GET retries: only a couple of
+    extra attempts, for failures that pyarrow re-raises after the per-GET retries are exhausted."""
+    p = policy or DEFAULT_RETRY
+    return RetryPolicy(min(3, p.max_attempts), p.backoff_s, p.max_backoff_s, p.sleep, p.rand)
+
+
+def open_parquet(s3, bucket: str, key: str, *, policy: RetryPolicy | None = None, buffer_size: int = 1 << 20,
+                 max_get_bytes: int = GET_CHUNK_BYTES):
+    """``pyarrow.parquet.ParquetFile`` over a retrying ranged-GET file."""
+    import pyarrow.parquet as pq
+    raw = S3RangeFile.open(s3, bucket, key, policy=policy, max_get_bytes=max_get_bytes)
+    return pq.ParquetFile(io.BufferedReader(raw, buffer_size=buffer_size))
+
+
+def _rowgroup_may_match(pf, rg: int, col: str, sorted_ids: list[int]) -> bool:
+    """False only when the row group's min/max statistics for ``col`` prove that none of ``sorted_ids`` is inside."""
+    try:
+        md = pf.metadata.row_group(rg)
+        for j in range(md.num_columns):
+            if md.column(j).path_in_schema == col:
+                st = md.column(j).statistics
+                if st is None or not st.has_min_max:
+                    return True
+                i = bisect.bisect_left(sorted_ids, int(st.min))
+                return i < len(sorted_ids) and sorted_ids[i] <= int(st.max)
+    except Exception:  # noqa: BLE001 - statistics are an optimisation only (e.g. string-typed ids)
+        pass
+    return True
+
+
 def iter_omop_batches(table: str, *, person_ids: Iterable[int] | None = None,
                       columns: list[str] | None = None, s3=None, profile: str | None = None,
                       batch_rows: int = 65536, prefix: str | None = None,
-                      on_error: Callable[[str, Exception], None] | None = None) -> Iterator[Any]:
+                      on_error: Callable[[str, Exception], None] | None = None,
+                      retry: RetryPolicy | None = None, max_get_bytes: int = GET_CHUNK_BYTES,
+                      buffer_size: int = 1 << 20) -> Iterator[Any]:
     """Stream a merged OMOP table part by part as pyarrow RecordBatches, optionally cohort-filtered.
 
+    Reading is by ROW GROUP over retrying ranged GETs (``S3RangeFile``): column-pruned, and with ``person_ids`` the
+    row group is skipped from its ``person_id`` min/max statistics, else only ``person_id`` is read first and the
+    other columns are fetched only if some id matches (then filtered to those rows in Arrow, before pandas).
     ``person_ids`` are integer OMOP ``person_id`` values; they equal ``int(BDSPPatientID)`` (source
-    ``heedb_bs_ascertainment.py``). The filter is applied inside Arrow before any Python object is
-    built. A part that fails is reported through ``on_error`` and skipped; the caller decides whether
-    a partial result is acceptable (source catalogue rule 5: empty is not absence).
+    ``heedb_bs_ascertainment.py``). A row-group read that fails is retried (``retry``); a part that still fails is
+    reported through ``on_error`` and skipped; the caller decides whether a partial result is acceptable (source
+    catalogue rule 5: empty is not absence).
     """
     import pyarrow as pa
     import pyarrow.compute as pc
-    import pyarrow.parquet as pq
 
     s3 = s3 or make_client(profile)
     bucket = access_point()
     want = columns or (schema.columns(table) if table in schema.SCHEMA else OMOP_COLUMNS[table])
-    pid_arr = pa.array(sorted(int(p) for p in person_ids), type=pa.int64()) if person_ids is not None else None
+    ids = sorted({int(p) for p in person_ids}) if person_ids is not None else None
+    pid_arr = pa.array(ids, type=pa.int64()) if ids is not None else None
     parts = parquet_parts(s3, prefix, bucket=bucket) if prefix else omop_parts(s3, table, bucket=bucket)
+    outer = _outer(retry)
     for key in parts:
         try:
-            size = s3.head_object(Bucket=bucket, Key=key)["ContentLength"]
-            pf = pq.ParquetFile(io.BufferedReader(S3RangeFile(s3, bucket, key, size), buffer_size=8 << 20))
+            pf = with_retries(lambda key=key: open_parquet(s3, bucket, key, policy=retry, max_get_bytes=max_get_bytes,
+                                                     buffer_size=buffer_size),
+                              outer)
             have = pf.schema_arrow.names
             use = [c for c in want if c in have]
-            for batch in pf.iter_batches(batch_size=batch_rows, columns=use):
-                if pid_arr is not None and "person_id" in use:
-                    batch = batch.filter(pc.is_in(batch.column("person_id"), value_set=pid_arr).fill_null(False))
-                if batch.num_rows:
-                    yield batch
+            if not use:
+                continue
+            filt = pid_arr is not None and "person_id" in use
+            rest = [c for c in use if c != "person_id"]
+            for rg in range(pf.num_row_groups):
+                if filt:
+                    if not ids or not _rowgroup_may_match(pf, rg, "person_id", ids):
+                        continue
+                    pid = with_retries(lambda rg=rg: pf.read_row_group(rg, columns=["person_id"]), outer)
+                    mask = pc.fill_null(pc.is_in(pc.cast(pid.column("person_id"), pa.int64(), safe=False),
+                                                 value_set=pid_arr), False)
+                    if not pc.any(mask).as_py():
+                        continue
+                    if rest:
+                        other = with_retries(lambda rg=rg: pf.read_row_group(rg, columns=rest), outer)
+                        tbl = pa.table({c: (pid.column(c) if c == "person_id" else other.column(c)) for c in use})
+                    else:
+                        tbl = pid
+                    tbl = tbl.filter(mask)
+                else:
+                    tbl = with_retries(lambda rg=rg: pf.read_row_group(rg, columns=use), outer)
+                for batch in tbl.to_batches(max_chunksize=batch_rows):
+                    if batch.num_rows:
+                        yield batch
         except Exception as exc:  # noqa: BLE001 - surfaced to the caller, never swallowed silently
             if on_error is None:
                 raise
@@ -653,13 +915,14 @@ def discover_sites(s3, *, bucket: str | None = None) -> list[str]:
     return sorted(sites)
 
 
-def csv_header(s3, key: str, *, bucket: str | None = None, max_bytes: int = 4 << 20) -> list[str]:
+def csv_header(s3, key: str, *, bucket: str | None = None, max_bytes: int = 4 << 20,
+               policy: RetryPolicy | None = None) -> list[str]:
     """Column names of a CSV object from its first line only (ranged read; values are never parsed)."""
     import csv as _csv
     bucket = bucket or access_point()
     n = 1 << 16
     while True:
-        chunk = s3.get_object(Bucket=bucket, Key=key, Range=f"bytes=0-{n - 1}")["Body"].read()
+        chunk, _ = get_bytes(s3, bucket, key, 0, n - 1, policy=policy)
         if b"\n" in chunk or len(chunk) < n or n >= max_bytes:
             break
         n *= 4
@@ -667,12 +930,12 @@ def csv_header(s3, key: str, *, bucket: str | None = None, max_bytes: int = 4 <<
     return next(_csv.reader([first]), [])
 
 
-def parquet_column_names(s3, key: str, *, bucket: str | None = None) -> list[str]:
+def parquet_column_names(s3, key: str, *, bucket: str | None = None, policy: RetryPolicy | None = None) -> list[str]:
     """Column names of one parquet part from its footer only (ranged reads; no row data)."""
     import pyarrow.parquet as pq
     bucket = bucket or access_point()
-    size = s3.head_object(Bucket=bucket, Key=key)["ContentLength"]
-    pf = pq.ParquetFile(io.BufferedReader(S3RangeFile(s3, bucket, key, size), buffer_size=1 << 20))
+    size = head_size(s3, bucket, key, policy=policy)
+    pf = pq.ParquetFile(io.BufferedReader(S3RangeFile(s3, bucket, key, size, policy=policy), buffer_size=1 << 20))
     return list(pf.schema_arrow.names)
 
 

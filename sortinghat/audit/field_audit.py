@@ -1028,7 +1028,8 @@ def main(argv: list[str] | None = None) -> int:
         # Real data: a message or traceback can quote a value (a bad cell, a key). Print the stage and the exception
         # CLASS only; reproduce on synthetic data to debug (CLAUDE.md rule 3).
         safe_print(f"field audit FAILED at stage '{stage}': {type(exc).__name__} (message withheld; reproduce on "
-                   "synthetic data)")
+                   f"synthetic data); S3 read retries before failing: {sum(data_io.RETRY_COUNTS.values())}"
+                   + (" " + str(dict(data_io.RETRY_COUNTS)) if data_io.RETRY_COUNTS else ""))
         return 2
     known = {str(p) for p in tables["eeg_metadata"]["person_id"].dropna().unique()}
 
