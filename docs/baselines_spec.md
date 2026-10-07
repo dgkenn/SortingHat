@@ -69,7 +69,7 @@ convulsion, and nonspecific encephalopathy codes (G92, G93.4) are not used anywh
 0 = non-reactive is **[ASSUMED]**.
 
 ### 2.3 Baseline C
-Per lexicon key (about 35 chemistry/heme/gas/CSF labs, 15 tox keys, 4 cultures, 4 imaging classes): latest result available in
+Per lexicon key (36 chemistry/heme/gas/CSF labs, 11 tox keys, 4 cultures, 4 imaging classes): latest result available in
 [t0-72 h, t0] **[OP]**; `value`+`miss` for labs/tox; cultures `resulted`, `positive` (1/0), `miss`; imaging `final_by_t0` and `n_by_t0`.
 "Every lab" is met by a frozen vocabulary: `BaselineConfig.extra_labs` adds data-discovered names; `baselines.vocab.discover_lab_vocabulary`
 (human-run, training sites only, counts suppressed, min 11 patients) lists candidates. Unmapped names are otherwise counted in the

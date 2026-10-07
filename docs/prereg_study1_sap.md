@@ -125,7 +125,7 @@ Notes.
 - **Leave-one-site-out (LOSO)** across adult sites (`metrics.splits.leave_one_site_out`). Each patient's prediction comes from a model trained on the other sites. Per-site and pooled results are both reported.
 - **Late-calendar temporal holdout within sites**: the latest 20% of cases in each site by calendar time are the test set; training uses earlier cases only, optionally with an embargo (`metrics.splits.late_temporal_holdout`). Fraction fixed at 0.20 **[OP]**.
   - HEEDB timestamps are date-shifted (`docs/heedb_schema.md`). The Phase 0a audit only requires that the shift is consistent **within patient**. If the shift does not preserve calendar order across patients within a site, the temporal holdout cannot be built and is dropped and recorded as such, not substituted with another construction.
-- Hyperparameters and model selection use inner folds grouped by site inside the training sites.
+- Hyperparameters and model selection use the gold development cases from the training sites only (D-098); the held-out site is never used. The selection grid includes a separate shrinkage penalty on the EEG feature block (D-099).
 
 ### 7.2 Paired, site-aware bootstrap for Delta
 

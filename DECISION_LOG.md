@@ -646,3 +646,15 @@
 - **Decision:** The 5 uV burst-suppression envelope threshold and the EEG QC thresholds (flat 0.5 uV, clipping 5%, extreme 500 uV, line-noise ratio 1.0, disconnected rule, 90% epoch-channel fraction) are provisional. They will be fixed from the Phase 0b pilot, using counts and distributions only and no outcome labels or model results, and frozen before any evaluation-set gold label or model output is opened.
 - **Rationale:** The values are untuned defaults; low-voltage traces read as suppressed at 5 uV, and the pilot is the first time real recordings are available. Fixing them from signal properties alone keeps them independent of outcomes.
 - **Source:** `docs/eeg_pipeline.md` (QC and features); SAP section 10, item 9 (freeze order).
+
+### D-098 Model selection on training-site gold development cases
+- **Date:** 2026-10-07 · **Area:** splits · **Outcome data seen?** No
+- **Decision:** Hyperparameters, model selection and recalibration use the gold development cases from the training sites of each leave-one-site-out fold, replacing the SAP's inner site-grouped folds.
+- **Rationale:** With three sites, each outer fold has only two training sites, so inner site-grouped folds would be two unstable folds. The held-out site still never influences any fitted parameter (tested in `tests/test_models_cv.py`).
+- **Source:** `docs/models_spec.md`; SAP section on model selection.
+
+### D-099 Separate shrinkage on the EEG feature block
+- **Date:** 2026-10-07 · **Area:** hypotheses · **Outcome data seen?** No
+- **Decision:** The shared multi-label head's selection grid includes a separate L2 penalty on the EEG feature block, so the baseline+EEG model can shrink toward the baseline-only model.
+- **Rationale:** Without it, many weak EEG features inflate variance and push null Δ above 0; with it, synthetic no-signal runs keep |Δ| < 0.02 while planted signals are recovered.
+- **Source:** `docs/models_spec.md`.
