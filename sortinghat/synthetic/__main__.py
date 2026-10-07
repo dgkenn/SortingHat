@@ -1,4 +1,6 @@
-"""python -m sortinghat.synthetic --out data/synthetic [--n 3000] [--seed N] [--fmt auto|csv|parquet]"""
+"""python -m sortinghat.synthetic --out data/synthetic [--n 3000] [--seed N]
+
+Writes the REAL HEEDB layout (EEG/..., OMOP/Merged/<table>/*.parquet) under ``--out``. Needs pyarrow."""
 
 import argparse
 
@@ -10,11 +12,10 @@ def main() -> int:
     ap.add_argument("--out", default="data/synthetic")
     ap.add_argument("--n", type=int, default=3000)
     ap.add_argument("--seed", type=int, default=20260101)
-    ap.add_argument("--fmt", default="auto", choices=["auto", "csv", "parquet"])
     a = ap.parse_args()
     tables, truth = generate(a.n, a.seed)
-    paths = write_tables(tables, a.out, truth, a.fmt)
-    print(f"wrote {len(paths)} synthetic tables to {a.out} (seed={a.seed})")
+    paths = write_tables(tables, a.out, truth)
+    print(f"wrote {len(paths)} synthetic table files to {a.out} (seed={a.seed})")
     return 0
 
 

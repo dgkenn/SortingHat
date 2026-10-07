@@ -45,7 +45,8 @@ from typing import Any, Callable, Iterable, Iterator
 
 import pandas as pd
 
-from .agent_safety import RestrictedDataError, in_agent_session
+from . import schema
+from .agent_safety import RestrictedDataError, assert_not_restricted_in_agent, in_agent_session
 
 # BDSP exposes ACCESS POINTS, not buckets: the full ARN goes in ``Bucket=`` (the bare name gives NoSuchBucket,
 # which reads like a permissions problem). Account 184438910517 is BDSP's, not yours. Each approved user can
@@ -102,30 +103,19 @@ HEEDB_METADATA_PREFIX = "EEG/HEEDB_Metadata/"
 BIDS_PREFIX = "EEG/bids/"
 OMOP_MERGED_PREFIX = "OMOP/Merged/"
 
-# Columns the source code confirmed per OMOP table (what its extractor kept). Other columns may exist.
+# Columns requested per OMOP table: the schema's list (CONFIRMED + NAMED + ASSUMED). A requested column that does
+# not exist is silently skipped by ``iter_omop_batches`` (as in the source extractor), so use
+# ``table_columns`` / the audit's ``--dry-run-schema`` to see what really exists.
 OMOP_COLUMNS: dict[str, list[str]] = {
-    "condition_occurrence": ["person_id", "condition_start_datetime", "condition_concept_id",
-                             "condition_source_value"],
-    "drug_exposure": ["person_id", "drug_exposure_start_datetime", "drug_exposure_end_datetime",
-                      "drug_concept_id", "drug_source_value", "quantity"],
-    "measurement": ["person_id", "measurement_datetime", "measurement_concept_id",
-                    "measurement_source_value", "value_as_number", "unit_source_value"],
-    "death": ["person_id", "death_datetime", "cause_source_value"],
-    "procedure_occurrence": ["person_id", "procedure_datetime", "procedure_date", "procedure_concept_id",
-                             "procedure_source_value"],
-    "visit_occurrence": ["person_id", "visit_start_datetime", "visit_end_datetime", "visit_concept_id",
-                         "discharge_to_concept_id", "discharge_to_source_value", "visit_source_value"],
-    "observation": ["person_id", "observation_datetime", "observation_date", "observation_concept_id",
-                    "observation_source_value", "value_as_string"],
-    "concept": ["concept_id", "concept_name", "domain_id", "vocabulary_id", "concept_class_id",
-                "standard_concept", "concept_code"],
-}
+    t[len("omop_"):]: schema.columns(t) for t in schema.SCHEMA if t.startswith("omop_")}
+
+IMAGING_PREFIX = "Imaging/imaging_metadata/"      # ASSUMED location: the Imaging/ layout is unknown
 
 
 @dataclass(frozen=True)
 class TableSpec:
     """Where a named table lives under the access point."""
-    kind: str                      # "csv_site", "csv_global" or "omop_parquet"
+    kind: str                      # "csv_site", "csv_global", "omop_parquet" or "parquet_dir"
     pattern: str                   # key / prefix; ``{site}`` and ``{table}`` are substituted
     fallbacks: tuple[str, ...] = ()
 
@@ -143,6 +133,8 @@ TABLES: dict[str, TableSpec] = {
 }
 for _t in OMOP_COLUMNS:
     TABLES["omop_" + _t] = TableSpec("omop_parquet", OMOP_MERGED_PREFIX + "{table}/")
+# ASSUMED location and layout (no source script reads Imaging/); parquet parts under one prefix
+TABLES["imaging"] = TableSpec("parquet_dir", IMAGING_PREFIX)
 
 _AWS_KEY_ID = re.compile(r"^(AKIA|ASIA)[A-Z0-9]{16}$")
 
@@ -215,7 +207,7 @@ def list_keys(s3, prefix: str, *, bucket: str | None = None, suffix: str | None 
 def resolve_key(s3, table: str, site: str | None = None, *, bucket: str | None = None) -> str:
     """Resolve a CSV table name (and site, for per-site tables) to one object key."""
     spec = TABLES[table]
-    if spec.kind == "omop_parquet":
+    if spec.kind in ("omop_parquet", "parquet_dir"):
         raise ValueError(f"{table} is a directory of parquet parts; use iter_omop_batches / omop_parts")
     if spec.kind == "csv_site" and not site:
         raise ValueError(f"table {table!r} is per-site; pass site= (e.g. 'S0001')")
@@ -262,6 +254,11 @@ def bids_edf_key(site: str, bids_folder: str, session_id: str, eeg_folder: str |
 def bids_folder_for(site: str, bdsp_patient_id: str | int) -> str:
     """``BidsFolder`` convention: ``sub-<SITE><BDSPPatientID>`` (the metadata BDSPPatientID can be blank)."""
     return f"sub-{site}{bdsp_patient_id}"
+
+
+def parquet_parts(s3, prefix: str, *, bucket: str | None = None) -> list[str]:
+    """Parquet part keys under any prefix (used for the ASSUMED ``Imaging/`` location)."""
+    return list_keys(s3, prefix, bucket=bucket, suffix=".parquet")
 
 
 def omop_parts(s3, table: str, *, bucket: str | None = None) -> list[str]:
@@ -314,7 +311,7 @@ class S3RangeFile(io.RawIOBase):
 
 def iter_omop_batches(table: str, *, person_ids: Iterable[int] | None = None,
                       columns: list[str] | None = None, s3=None, profile: str | None = None,
-                      batch_rows: int = 65536,
+                      batch_rows: int = 65536, prefix: str | None = None,
                       on_error: Callable[[str, Exception], None] | None = None) -> Iterator[Any]:
     """Stream a merged OMOP table part by part as pyarrow RecordBatches, optionally cohort-filtered.
 
@@ -329,9 +326,10 @@ def iter_omop_batches(table: str, *, person_ids: Iterable[int] | None = None,
 
     s3 = s3 or make_client(profile)
     bucket = access_point()
-    want = columns or OMOP_COLUMNS[table]
+    want = columns or (schema.columns(table) if table in schema.SCHEMA else OMOP_COLUMNS[table])
     pid_arr = pa.array(sorted(int(p) for p in person_ids), type=pa.int64()) if person_ids is not None else None
-    for key in omop_parts(s3, table, bucket=bucket):
+    parts = parquet_parts(s3, prefix, bucket=bucket) if prefix else omop_parts(s3, table, bucket=bucket)
+    for key in parts:
         try:
             size = s3.head_object(Bucket=bucket, Key=key)["ContentLength"]
             pf = pq.ParquetFile(io.BufferedReader(S3RangeFile(s3, bucket, key, size), buffer_size=8 << 20))
@@ -346,6 +344,121 @@ def iter_omop_batches(table: str, *, person_ids: Iterable[int] | None = None,
             if on_error is None:
                 raise
             on_error(key, exc)
+
+
+# ---------------------------------------------------------------------------------------------------------
+# Local directory mode (synthetic data, or a local mirror of the access-point layout) and schema probing
+# ---------------------------------------------------------------------------------------------------------
+class LocalStore:
+    """Read-only stand-in for the S3 client over a local directory laid out like the access point
+    (``EEG/eeg-metadata/...``, ``OMOP/Merged/<table>/*.parquet``). Implements only the calls this module
+    makes (``list_objects_v2``, ``get_object`` with ``Range``, ``head_object``), so every reader here
+    (``read_csv_table``, ``iter_omop_batches``, ``table_columns``) works unchanged on a directory.
+
+    Refuses restricted paths inside an agent session (CLAUDE.md rule 1).
+    """
+
+    def __init__(self, root: str | Path):
+        assert_not_restricted_in_agent(root)
+        self.root = Path(root).resolve()
+        if not self.root.is_dir():
+            raise FileNotFoundError(f"data root is not a directory: {root}")
+
+    def _path(self, key: str) -> Path:
+        p = (self.root / key).resolve()
+        if self.root not in p.parents and p != self.root:
+            raise ValueError("key escapes the data root")
+        return p
+
+    def list_objects_v2(self, Bucket=None, Prefix: str = "", MaxKeys: int = 1000, ContinuationToken=None):
+        base = self._path(Prefix.rsplit("/", 1)[0]) if "/" in Prefix else self.root
+        keys: list[str] = []
+        if base.is_dir():
+            for f in base.rglob("*"):
+                if f.is_file():
+                    k = f.relative_to(self.root).as_posix()
+                    if k.startswith(Prefix):
+                        keys.append(k)
+        return {"Contents": [{"Key": k} for k in sorted(keys)], "IsTruncated": False}
+
+    def get_object(self, Bucket=None, Key: str = "", Range: str | None = None):
+        p = self._path(Key)
+        if not p.is_file():
+            raise FileNotFoundError(Key)
+        data = p.read_bytes() if Range is None else self._ranged(p, Range)
+        return {"Body": io.BytesIO(data)}
+
+    @staticmethod
+    def _ranged(p: Path, rng: str) -> bytes:
+        a, b = rng.removeprefix("bytes=").split("-")
+        with open(p, "rb") as fh:
+            fh.seek(int(a))
+            return fh.read(int(b) - int(a) + 1)
+
+    def head_object(self, Bucket=None, Key: str = ""):
+        p = self._path(Key)
+        if not p.is_file():
+            raise FileNotFoundError(Key)
+        return {"ContentLength": p.stat().st_size}
+
+
+def open_store(data: str | Path | None = None, *, profile: str | None = None):
+    """``LocalStore`` for a directory, else the real S3 client (human-run only; ``make_client`` refuses
+    inside an agent session)."""
+    return LocalStore(data) if data else make_client(profile)
+
+
+def discover_sites(s3, *, bucket: str | None = None) -> list[str]:
+    """Site codes that have an ``eeg-metadata`` CSV (e.g. S0001, I0002), from key names only."""
+    keys = list_keys(s3, EEG_METADATA_PREFIX, bucket=bucket, suffix=".csv")
+    sites = {m.group(1) for k in keys if (m := re.match(r"^([A-Za-z]\d{4})_eeg_metadata_", k.rsplit("/", 1)[-1]))}
+    return sorted(sites)
+
+
+def csv_header(s3, key: str, *, bucket: str | None = None, max_bytes: int = 4 << 20) -> list[str]:
+    """Column names of a CSV object from its first line only (ranged read; values are never parsed)."""
+    import csv as _csv
+    bucket = bucket or access_point()
+    n = 1 << 16
+    while True:
+        chunk = s3.get_object(Bucket=bucket, Key=key, Range=f"bytes=0-{n - 1}")["Body"].read()
+        if b"\n" in chunk or len(chunk) < n or n >= max_bytes:
+            break
+        n *= 4
+    first = chunk.decode("utf-8-sig", "replace").split("\n", 1)[0].rstrip("\r")
+    return next(_csv.reader([first]), [])
+
+
+def parquet_column_names(s3, key: str, *, bucket: str | None = None) -> list[str]:
+    """Column names of one parquet part from its footer only (ranged reads; no row data)."""
+    import pyarrow.parquet as pq
+    bucket = bucket or access_point()
+    size = s3.head_object(Bucket=bucket, Key=key)["ContentLength"]
+    pf = pq.ParquetFile(io.BufferedReader(S3RangeFile(s3, bucket, key, size), buffer_size=1 << 20))
+    return list(pf.schema_arrow.names)
+
+
+def table_columns(s3, table: str, site: str | None = None, *, bucket: str | None = None) -> list[str] | None:
+    """Actual column names of a registered table (names only), or ``None`` when the table is not found.
+
+    CSV tables: header line of the resolved key. Parquet tables: footer of the first part.
+    """
+    spec = TABLES[table]
+    bucket = bucket or access_point()
+    try:
+        if spec.kind in ("csv_site", "csv_global"):
+            key = resolve_key(s3, table, site, bucket=bucket) if spec.kind == "csv_site" else None
+            if key is None:
+                cands = (spec.pattern, *spec.fallbacks)
+                key = next((c for c in cands if list_keys(s3, c, bucket=bucket)), None)
+                if key is None:
+                    return None
+            return csv_header(s3, key, bucket=bucket)
+        parts = (omop_parts(s3, table[len("omop_"):], bucket=bucket) if spec.kind == "omop_parquet"
+                 else parquet_parts(s3, spec.pattern, bucket=bucket))
+        return parquet_column_names(s3, parts[0], bucket=bucket) if parts else None
+    except FileNotFoundError:
+        return None
 
 
 def parse_heedb_time(value: str | None):

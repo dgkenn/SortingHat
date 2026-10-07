@@ -5,31 +5,167 @@ markdown + JSON report. Output is aggregate-only with small-cell suppression
 (n < 11 -> "<11"). The "20 hand-checked cases" sampling list is written ONLY to
 a private local file and is never printed or included in reports.
 
+Tables are read through ``sortinghat.data_io`` in the REAL HEEDB layout
+(``docs/heedb_schema_real.md``): per-site eeg-metadata / reports_findings CSVs and
+``OMOP/Merged/<table>/*.parquet``. Two sources, same code path:
+
+    # synthetic or a local mirror of the layout
     python -m sortinghat.audit.field_audit --data <dir> --out <dir>
+    # the real bucket (HUMAN-RUN ONLY, from your own terminal)
+    scripts/heedb_run.sh python -m sortinghat.audit.field_audit --s3 --out <dir>
+
+First thing to run on real data (names only, no values, no rows read):
+
+    scripts/heedb_run.sh python -m sortinghat.audit.field_audit --s3 --dry-run-schema [--out <dir>]
 """
 
 from __future__ import annotations
 
 import argparse
+import difflib
+import re
 import sys
 from pathlib import Path
 
 import numpy as np
 import pandas as pd
 
-from .. import agent_safety
+from .. import agent_safety, data_io, schema
 from ..safe_output import (SUPPRESSED, safe_print, safe_quantiles, safe_write_json,
                            safe_write_text, suppress_count, suppress_proportion,
                            write_local_only)
-from ..tableio import load_tables
 
 ACUTE_CLASSES = {"ICU", "Inpatient", "ED"}
 ADULT_AGE = 18
-SEDATION_CLASSES = {"sedative", "analgesic"}
+# Row filters. drug_source_value / measurement_source_value are free text in the real OMOP tables (no med_class,
+# no score_type column); classes are derived by regex, as the earlier research code did.
+SEDATION_RE = re.compile(r"propofol|midazolam|dexmedetomidine|precedex|fentanyl|ketamine|pentobarbital", re.I)
+SCORE_RE = re.compile(r"glasgow|\bgcs\b|rass|richmond|sedation scale|level of consciousness|eye opening|"
+                      r"best motor response|best verbal response|ramsay|arousal|\bfour score", re.I)
+LAB_RE = re.compile(r"lactate|ammonia|sodium|glucose|creatinine|\bbun\b|\bast\b|\balt\b|\bwbc\b|enolase", re.I)
 MISALIGN_DAYS = 30.0          # median |event - EEG start| above this => table misaligned
 MISALIGN_MAX_RATE = 0.05      # automated date-shift check tolerance (patients)
 MONOTONIC_MAX_RATE = 0.01     # within-record ordering violations tolerated
 HANDCHECK_N = 20
+
+OMOP_TIME = {"omop_drug_exposure": "drug_exposure_start_datetime", "omop_measurement": "measurement_datetime",
+             "omop_note": "note_datetime", "imaging": "study_datetime"}
+START, END = schema.START_EEG, schema.END_EEG
+
+
+# ---------------------------------------------------------------- loading (real layout, via data_io)
+def person_ids(meta: pd.DataFrame, site: str) -> pd.Series:
+    """Integer person_id: ``BDSPPatientID`` when non-blank, else parsed from ``BidsFolder`` (sub-<SITE><PID>)."""
+    direct = pd.to_numeric(meta["BDSPPatientID"], errors="coerce") if "BDSPPatientID" in meta else \
+        pd.Series(np.nan, index=meta.index)
+    from_bids = pd.to_numeric(meta["BidsFolder"].astype("string").str.replace(rf"^sub-{site}", "", regex=True),
+                              errors="coerce") if "BidsFolder" in meta else pd.Series(np.nan, index=meta.index)
+    return direct.fillna(from_bids).astype("Int64")
+
+
+def merge_eeg(meta: pd.DataFrame, findings: pd.DataFrame | None, site: str) -> pd.DataFrame:
+    """One site's analytic EEG frame: eeg_metadata joined to reports_findings on (person, SessionID).
+
+    Real start/end are ``StartTime(EEG)`` / ``EndTime(EEG)`` in the findings table (the metadata ones are
+    blank); age prefers the findings value, falling back to the sparse metadata value.
+    """
+    m = pd.DataFrame({"SiteID": site, "person_id": person_ids(meta, site),
+                      "SessionID": meta["SessionID"].astype("string")})
+    m["AgeAtVisit"] = pd.to_numeric(meta.get("AgeAtVisit"), errors="coerce")
+    m["PatientClass"] = meta["PatientClass"] if "PatientClass" in meta else None       # ASSUMED column
+    m[["StartTime", "EndTime"]] = meta[["StartTime", "EndTime"]] if {"StartTime", "EndTime"} <= set(meta) else pd.NaT
+    if findings is not None and len(findings):
+        f = pd.DataFrame({"person_id": person_ids(findings, site), "SessionID": findings["SessionID"].astype("string"),
+                          "f_start": findings.get(START), "f_end": findings.get(END),
+                          "f_age": pd.to_numeric(findings.get("AgeAtVisit"), errors="coerce")})
+        f = f.sort_values("f_start", na_position="last").drop_duplicates(["person_id", "SessionID"])
+        m = m.merge(f, on=["person_id", "SessionID"], how="left")
+        m["AgeAtVisit"] = m["f_age"].fillna(m["AgeAtVisit"])
+        m["StartTime"] = m["f_start"].fillna(m["StartTime"])
+        m["EndTime"] = m["f_end"].fillna(m["EndTime"])
+        m = m.drop(columns=["f_start", "f_end", "f_age"])
+    return m
+
+
+def filter_drugs(d: pd.DataFrame) -> pd.DataFrame:
+    if "drug_source_value" not in d:
+        return d.iloc[0:0]
+    return d[d["drug_source_value"].astype("string").str.contains(SEDATION_RE, na=False)]
+
+
+def filter_measurements(d: pd.DataFrame) -> pd.DataFrame:
+    """Keep score and lab rows; ``kind`` is derived from the free-text ``measurement_source_value``."""
+    if "measurement_source_value" not in d:
+        return d.iloc[0:0].assign(kind=pd.Series(dtype=object))
+    v = d["measurement_source_value"].astype("string")
+    score, lab = v.str.contains(SCORE_RE, na=False), v.str.contains(LAB_RE, na=False)
+    out = d[score | lab].copy()
+    out["kind"] = np.where(score[score | lab], "score", "lab")
+    return out
+
+
+def from_raw_tables(raw: dict[str, pd.DataFrame]) -> dict[str, pd.DataFrame]:
+    """Analytic tables from whole raw tables in the real layout (synthetic scale; same shapes as the
+    streaming loader produces)."""
+    meta, rf = raw["eeg_metadata"], raw.get("reports_findings")
+    parts = []
+    for site, g in meta.groupby("SiteID", sort=True):
+        sess = set(g["SessionID"].astype(str))
+        fg = rf[rf["SessionID"].astype(str).isin(sess)] if rf is not None else None
+        parts.append(merge_eeg(g, fg, str(site)))
+    out = {"eeg_metadata": pd.concat(parts, ignore_index=True),
+           "omop_drug_exposure": filter_drugs(raw["omop_drug_exposure"]),
+           "omop_measurement": filter_measurements(raw["omop_measurement"])}
+    for t in ("omop_note", "imaging"):
+        out[t] = raw.get(t, pd.DataFrame())
+    return out
+
+
+def load_audit_tables(s3, sites: list[str] | None = None, avail: dict | None = None) -> dict[str, pd.DataFrame]:
+    """Read what the audit needs from a store (S3 client or ``LocalStore``) in the real layout.
+
+    EEG tables are read whole (one row per session). OMOP/imaging parquet is streamed part by part,
+    filtered to the candidate cohort inside Arrow and by regex, so memory scales with the cohort.
+    """
+    sites = sites or data_io.discover_sites(s3)
+    parts = []
+    for site in sites:
+        try:
+            meta = data_io.read_csv_table("eeg_metadata", site, s3=s3)
+        except FileNotFoundError:
+            continue
+        try:
+            rf = data_io.read_csv_table("reports_findings", site, s3=s3)
+        except FileNotFoundError:
+            rf = None
+        meta = schema.coerce_types("eeg_metadata", meta)
+        rf = None if rf is None else schema.coerce_types("reports_findings", rf)
+        parts.append(merge_eeg(meta, rf, site))
+    if not parts:
+        raise FileNotFoundError("no eeg_metadata CSV found for any site")
+    eeg = pd.concat(parts, ignore_index=True)
+    cohort = [int(p) for p in build_candidates(eeg)["person_id"].dropna().unique()]
+    out = {"eeg_metadata": eeg}
+    result_cols = [c for a in schema.COLUMN_ALIASES["measurement.result_datetime"] for c in [a]]
+    for table in ("omop_drug_exposure", "omop_measurement", "omop_note", "imaging"):
+        spec = data_io.TABLES[table]
+        cols = schema.columns(table) + (result_cols if table == "omop_measurement" else [])
+        kw = {"prefix": spec.pattern} if spec.kind == "parquet_dir" else {}
+        tname = table[len("omop_"):] if spec.kind == "omop_parquet" else table
+        frames = []
+        for batch in data_io.iter_omop_batches(tname, person_ids=cohort, columns=cols, s3=s3, **kw):
+            frames.append(batch.to_pandas())
+        d = schema.coerce_types(table, pd.concat(frames, ignore_index=True)) if frames else pd.DataFrame(
+            columns=schema.columns(table))
+        if table == "omop_drug_exposure":
+            d = filter_drugs(d)
+        elif table == "omop_measurement":
+            d = filter_measurements(d)
+            for c in result_cols:
+                if c in d:
+                    d[c] = schema.parse_datetimes(d[c])
+        out[table] = d
+    return out
 
 
 # ---------------------------------------------------------------- helpers
