@@ -11,14 +11,15 @@ import pytest
 
 from sortinghat.eeg.io import (CANONICAL_19, DEFAULT_MINIMUM_CHANNELS, EDFError, channel_scaling_status,
                                drop_dead_channels, is_bipolar_label, normalize_channel_name, read_edf,
-                               read_edf_header, Recording)
+                               read_edf_header, Recording, select_channels)
 from sortinghat.eeg.pipeline import process_recording
 from sortinghat.eeg.stream import FailureReason, stream_features
 from sortinghat.eeg.synthetic import generate_eeg, write_edf_raw
-from sortinghat.eeg.window import WindowSpec, summarize_window_qc
+from sortinghat.eeg.window import WindowSpec, qc_recording, summarize_window_qc
 
 FS = 128.0
-DUR = 700
+DUR = 50                      # short on purpose: the QC / decode logic does not depend on the 60-660 s window
+SHORT = {"w": WindowSpec("w", 10.0, 20.0)}
 R = 3276.7
 KEY = "EEG/bids/SYN/sub-SYN1/ses-1/eeg/sub-SYN1_ses-1_task-EEG_eeg.edf"
 BUCKET = "fake-ap"
@@ -62,9 +63,9 @@ def test_label_styles_normalise_and_pass_qc(tmp_path, eeg_uv, style):
     labels = [STYLES[style](c) for c in CANONICAL_19]
     assert [normalize_channel_name(lb) for lb in labels] == list(CANONICAL_19)
     p = write(tmp_path, f"{style}.edf", eeg_uv, labels, annotation_channel=True)
-    out = process_recording(p)
+    out = process_recording(p, windows=SHORT)
     assert out.channel_status["n_channels"] == 19 and out.channel_status["n_missing_min"] == 0
-    prim = out.qc["primary"]
+    prim = out.qc["w"]
     assert prim.passes and prim.usable_fraction > 0.95 and prim.reasons == []
 
 
@@ -97,10 +98,10 @@ def _with_const(eeg_uv, names, value_code=None):
 def test_zero_filled_channel_is_missing_not_flat(tmp_path, eeg_uv, code):
     dig = _with_const(eeg_uv, ["O2"], code)
     p = write_edf_raw(tmp_path / "z.edf", dig, [f"EEG {c}-Ref" for c in CANONICAL_19], FS, phys_min=-R, phys_max=R)
-    out = process_recording(p)
+    out = process_recording(p, windows=SHORT)
     assert out.channel_status["dead"] == ["O2"] and out.channel_status["n_dead_min"] == 1
     assert out.channel_status["n_missing_min"] == 0 and out.channel_status["n_channels"] == 18
-    prim = out.qc["primary"]
+    prim = out.qc["w"]
     assert prim.n_dead_min == 1 and prim.n_min_present == 9 and not prim.passes
     assert "dead_minimum_channels" in prim.reasons and "missing_minimum_channels" in prim.reasons
     assert prim.flag_fraction["flat"] == 0.0                          # NOT counted as flat data
@@ -109,26 +110,28 @@ def test_zero_filled_channel_is_missing_not_flat(tmp_path, eeg_uv, code):
 def test_dead_optional_channel_is_dropped_but_does_not_fail_the_minimum_set(tmp_path, eeg_uv):
     dig = _with_const(eeg_uv, ["Pz", "Cz"])
     p = write_edf_raw(tmp_path / "zo.edf", dig, [f"EEG {c}-Ref" for c in CANONICAL_19], FS, phys_min=-R, phys_max=R)
-    out = process_recording(p)
-    prim = out.qc["primary"]
+    out = process_recording(p, windows=SHORT)
+    prim = out.qc["w"]
     assert sorted(out.channel_status["dead"]) == ["Cz", "Pz"] and out.channel_status["n_dead_min"] == 0
     assert prim.passes and "dead_minimum_channels" not in prim.reasons
 
 
 def test_quarter_of_recordings_constant_minimum_set_summary(tmp_path, eeg_uv):
     """A cohort where a quarter of the recordings have constant minimum-set channels: the aggregate names the reason."""
-    dig_ok = to_dig(eeg_uv)[:, : 90 * int(FS)]
+    dig_ok = to_dig(eeg_uv)
     qcs = []
-    for i in range(60):
+    for i in range(44):
         dig = dig_ok.copy()
         if i % 4 == 0:
             dig[CANONICAL_19.index("T4")] = zero_code()
             dig[CANONICAL_19.index("T6")] = zero_code()
         p = write_edf_raw(tmp_path / "q.edf", dig, [f"EEG {c}-Ref" for c in CANONICAL_19], FS, phys_min=-R, phys_max=R)
-        qcs.append(process_recording(p, windows={"w": WindowSpec("w", 10.0, 60.0)}).qc)
+        rec = drop_dead_channels(select_channels(read_edf(p)))        # the QC front half of process_recording
+        notes = {"dead": rec.meta["dead_channels"], "invalid_scaling": rec.meta["invalid_scaling_channels"]}
+        qcs.append(qc_recording(rec.data, rec.fs, rec.ch_names, 0.0, SHORT, channel_notes=notes)[0])
     summ = summarize_window_qc(qcs)["windows"]["w"]
-    assert summ["reason_counts"]["dead_minimum_channels"] == 15
-    assert summ["pass_proportion"] == pytest.approx(45 / 60, abs=1e-4)
+    assert summ["reason_counts"]["dead_minimum_channels"] == 11
+    assert summ["pass_proportion"] == pytest.approx(33 / 44, abs=1e-4)
 
 
 def test_drop_dead_channels_only_exact_constants():
@@ -149,8 +152,8 @@ def test_zero_physical_range_is_invalid_scaling_not_flat(tmp_path, eeg_uv):
     assert channel_scaling_status(h, 0) == "ok"
     rec = read_edf(p)
     assert "O1" not in rec.ch_names and rec.meta["invalid_scaling_channels"] == ["O1"]
-    out = process_recording(p)
-    prim = out.qc["primary"]
+    out = process_recording(p, windows=SHORT)
+    prim = out.qc["w"]
     assert out.channel_status["n_invalid_min"] == 1 and out.channel_status["n_missing_min"] == 0
     assert "invalid_scaling_minimum_channels" in prim.reasons and not prim.passes
     assert prim.flag_fraction["flat"] == 0.0
@@ -170,7 +173,7 @@ def test_all_channels_invalid_scaling_is_its_own_failure_reason(tmp_path, eeg_uv
                       phys_min=0, phys_max=0)
     with pytest.raises(EDFError, match="invalid channel scaling"):
         read_edf(p)
-    r = stream_features(FakeS3({KEY: p.read_bytes()}), KEY, bucket=BUCKET, sleep=lambda s: None)
+    r = stream_features(FakeS3({KEY: p.read_bytes()}), KEY, bucket=BUCKET, sleep=lambda s: None, windows=SHORT)
     assert r.reason == FailureReason.INVALID_SCALING and not r.retryable
     assert FailureReason.INVALID_SCALING in FailureReason.PERMANENT
 
@@ -178,7 +181,7 @@ def test_all_channels_invalid_scaling_is_its_own_failure_reason(tmp_path, eeg_uv
 # ---- EDF+ ----------------------------------------------------------------------------------------------
 def test_edf_plus_c_with_annotations_reads_and_edf_plus_d_is_refused(tmp_path, eeg_uv):
     labels = [f"EEG {c}-Ref" for c in CANONICAL_19]
-    short = eeg_uv[:, : 90 * int(FS)]
+    short = eeg_uv
     pc_ = write(tmp_path, "c.edf", short, labels, annotation_channel=True, reserved="EDF+C")
     pd_ = write(tmp_path, "d.edf", short, labels, annotation_channel=True, reserved="EDF+D")
     pp = write(tmp_path, "plain.edf", short, labels)
@@ -197,10 +200,10 @@ def test_stream_reports_dead_and_missing_counts(tmp_path, eeg_uv):
     labels = [f"EEG {c}-Ref" for c in CANONICAL_19 if c != "O2"]
     p = write_edf_raw(tmp_path / "s.edf", np.delete(dig, CANONICAL_19.index("O2"), axis=0), labels, FS,
                       phys_min=-R, phys_max=R)
-    r = stream_features(FakeS3({KEY: p.read_bytes()}), KEY, bucket=BUCKET, sleep=lambda s: None)
+    r = stream_features(FakeS3({KEY: p.read_bytes()}), KEY, bucket=BUCKET, sleep=lambda s: None, windows=SHORT)
     assert r.ok and (r.n_dead_min, r.n_missing_min, r.n_invalid_min) == (1, 1, 0)
     assert DEFAULT_MINIMUM_CHANNELS == ("Fp1", "Fp2", "F7", "F8", "T3", "T4", "T5", "T6", "O1", "O2")
-    prim = next(x for x in r.rows if x["window"] == "primary")
+    prim = next(x for x in r.rows if x["window"] == "w")
     assert prim["qc_pass"] is False or prim["qc_pass"] == False  # noqa: E712
 
 

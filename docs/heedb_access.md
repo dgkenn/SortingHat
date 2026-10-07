@@ -58,6 +58,10 @@ names ("TO-CONFIRM"). Report files and `DateOfDeath` were only ever used for `S0
 
 Task token in the EDF name: `cEEG` when the metadata `EEGFolder` value starts with `ceeg` (any case),
 otherwise `EEG` (`heedb_bs_calibrate.bids_key`, "the working one"). `BidsFolder` is `sub-<SITE><BDSPPatientID>`.
+Real-data finding (7 of 20 streamed recordings `not_found`): the documented name is not always the object name.
+`data_io.resolve_edf_key` therefore tries the documented key, the other task token, a task-less name and SessionID spellings
+(`12.0` -> `12`), then lists ONLY that recording's own `ses-<id>/eeg/` folder (`Delimiter='/'`) and takes the `.edf` whose name
+starts with `<BidsFolder>_ses-<id>`. `scripts/diag_eeg_paths.py` reports, as aggregates, which pattern resolved how many recordings.
 
 `OMOP person_id` equals `int(BDSPPatientID)`. The source verified a 100 percent match of all 34,620 `S0001`
 EEG patients against a 15M-row `person` table (`heedb_omop_extract.py` docstring), and every aetiology
