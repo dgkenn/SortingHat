@@ -201,7 +201,7 @@ def severity(index: pd.DataFrame, scores: pd.DataFrame, window_h: float, gcs_max
     j = index[["person_id", "t0"]].reset_index().merge(scores, on="person_id")
     key = j.columns[0]
     j["dt_h"] = (j["t"] - j["t0"]).dt.total_seconds() / 3600.0
-    j = j[j["dt_h"] <= window_h]
+    j = j[j["dt_h"].abs() <= window_h]
     out["n_score_obs_window"] = j.groupby(key).size().reindex(idx).fillna(0).astype(int)
     for ins, col in (("gcs", "gcs_min_window"), ("four", "four_min_window")):
         out[col] = j[j["instrument"] == ins].groupby(key)["value"].min().reindex(idx)
