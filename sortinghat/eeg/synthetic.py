@@ -200,3 +200,54 @@ def write_edf(path, data_uv: np.ndarray, fs: float, ch_names: Sequence[str], lab
             if annotation_channel:
                 fh.write(b"+0\x14\x14")      # 2 int16 samples = 4 bytes (empty TAL)
     return p
+
+
+def write_edf_raw(path, dig: np.ndarray, labels: Sequence[str], fs: float, *, phys_min, phys_max, dig_min=None,
+                  dig_max=None, phys_dim: str | Sequence[str] = "uV", record_s: float = 1.0, reserved: str = "",
+                  annotation_channel: bool = False) -> Path:
+    """Write int16 digital samples ``dig`` (C, N) with EXPLICIT per-channel header fields, so tests can reproduce
+    real-world EDF quirks the calibrated ``write_edf`` cannot: arbitrary label styles, ``pmin == pmax`` (zero physical
+    range), ``dmin == dmax``, zero-filled placeholder channels, EDF+C / EDF+D markers. ``phys_min`` / ``phys_max`` /
+    ``dig_min`` / ``dig_max`` / ``phys_dim`` are scalars or one value per channel. No signal is generated here."""
+    C, N = dig.shape
+    spr = int(round(fs * record_s))
+    n_rec = N // spr
+    ns = C + (1 if annotation_channel else 0)
+
+    def per(v, default):
+        v = default if v is None else v
+        return [v] * C if np.isscalar(v) or isinstance(v, str) else list(v)
+
+    pmin, pmax = per(phys_min, 0), per(phys_max, 0)
+    dmin, dmax = per(dig_min, -32768), per(dig_max, 32767)
+    dims = per(phys_dim, "uV")
+    hdr = bytearray()
+    hdr += _asc("0", 8) + _asc("X X X X", 80) + _asc("Startdate X X X X", 80)
+    hdr += _asc("01.01.20", 8) + _asc("00.00.00", 8) + _asc(str(256 * (ns + 1)), 8)
+    hdr += _asc(reserved, 44) + _asc(str(n_rec), 8) + _asc(_fmt(record_s, 8).strip(), 8) + _asc(str(ns), 4)
+    labs = list(labels) + (["EDF Annotations"] if annotation_channel else [])
+    ann = annotation_channel
+
+    def field(vals, w):
+        return b"".join(_asc(str(v), w) for v in vals)
+
+    hdr += field(labs, 16) + field(["AgCl"] * ns, 80)
+    hdr += field(dims + ([""] if ann else []), 8)
+    hdr += field([_fmt(v, 8).strip() for v in pmin] + (["-1"] if ann else []), 8)
+    hdr += field([_fmt(v, 8).strip() for v in pmax] + (["1"] if ann else []), 8)
+    hdr += field([_fmt(v, 8).strip() for v in dmin] + (["-32768"] if ann else []), 8)
+    hdr += field([_fmt(v, 8).strip() for v in dmax] + (["32767"] if ann else []), 8)
+    hdr += field([""] * ns, 80)
+    hdr += field([str(spr)] * C + (["2"] if ann else []), 8)
+    hdr += field([""] * ns, 32)
+    assert len(hdr) == 256 * (ns + 1), len(hdr)
+    d16 = np.asarray(dig, dtype="<i2")
+    p = Path(path)
+    with open(p, "wb") as fh:
+        fh.write(hdr)
+        for r in range(n_rec):
+            for i in range(C):
+                fh.write(d16[i, r * spr:(r + 1) * spr].tobytes())
+            if ann:
+                fh.write(b"+0\x14\x14")
+    return p

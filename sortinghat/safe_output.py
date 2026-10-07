@@ -32,6 +32,24 @@ def suppress_count(n: int | float, k: int = SUPPRESS_BELOW) -> int | str:
     return SUPPRESSED if n < k else n
 
 
+TECHNICAL_MIN_TOTAL = 50
+
+
+def technical_count(n: int | float, total: int | float, k: int = SUPPRESS_BELOW,
+                    min_total: int = TECHNICAL_MIN_TOTAL) -> int | str:
+    """Count of a TECHNICAL FILE property (number of EDF files with a given header quirk, folders with no ``.edf``,
+    signals sharing a label), shown EXACTLY when the sampled total is at least ``min_total`` (default 50), else
+    small-cell suppressed like ``suppress_count``.
+
+    Documented exception to the n<11 rule, for the file-structure diagnostics only (``scripts/diag_eeg_paths.py``,
+    ``scripts/diag_eeg_signals.py``): a count such as "7 of 60 sampled recordings have no .edf in their folder" is a
+    fact about storage layout, is needed to debug it, and with N >= 50 does not single out a person. It must NEVER be
+    used for clinical or demographic counts, and ``total`` is the sample size the count is out of.
+    """
+    n, total = int(n), int(total)
+    return n if total >= min_total else suppress_count(n, k)
+
+
 def suppress_proportion(num: int | float, den: int | float, k: int = SUPPRESS_BELOW,
                         ndigits: int = 4) -> float | str:
     """Proportion, suppressed if either cell (num, den-num) or den is < k.

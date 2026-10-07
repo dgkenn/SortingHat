@@ -55,13 +55,14 @@ class FailureReason:
     DISCONTINUOUS = "edf_discontinuous"
     NO_EEG_CHANNELS = "no_eeg_channels"
     UNSUPPORTED_UNITS = "edf_unsupported_units"
+    INVALID_SCALING = "edf_invalid_scaling"      # every EEG channel has a zero physical / digital range
     DECODE_ERROR = "edf_decode_error"
     TOO_SHORT = "recording_too_short"        # no data records at or after the window start
     TOO_LARGE = "fetch_too_large"
     PROCESSING_ERROR = "processing_error"
 
     PERMANENT = frozenset({NOT_FOUND, ACCESS_DENIED, AUTH_ERROR, S3_CLIENT_ERROR, HEADER_INVALID, DISCONTINUOUS,
-                           NO_EEG_CHANNELS, UNSUPPORTED_UNITS, DECODE_ERROR, TOO_SHORT, TOO_LARGE})
+                           NO_EEG_CHANNELS, UNSUPPORTED_UNITS, INVALID_SCALING, DECODE_ERROR, TOO_SHORT, TOO_LARGE})
 
 
 ALL_REASONS = tuple(v for k, v in vars(FailureReason).items() if k.isupper() and isinstance(v, str))
@@ -96,6 +97,9 @@ class StreamResult:
     rows: list[dict] = field(default_factory=list)     # one dict per window (pipeline rows + qc_* columns)
     qc: dict[str, WindowQC] = field(default_factory=dict)
     n_channels: int = 0
+    n_missing_min: int = 0                   # minimum-set channels not found after label normalisation
+    n_dead_min: int = 0                      # minimum-set channels exactly constant for the whole segment (reported missing)
+    n_invalid_min: int = 0                   # minimum-set channels with a zero calibration range (reported missing)
     bytes_fetched: int = 0
     n_requests: int = 0
     n_retries: int = 0
@@ -198,6 +202,8 @@ def classify_edf_error(exc: EDFError) -> str:
     m = str(exc).lower()
     if "discontinuous" in m:
         return FailureReason.DISCONTINUOUS
+    if "invalid channel scaling" in m:
+        return FailureReason.INVALID_SCALING
     if "no eeg channels" in m:
         return FailureReason.NO_EEG_CHANNELS
     if "physical dimension" in m:
@@ -346,13 +352,33 @@ def _patch_n_records(header: bytes, n: int) -> bytes:
     return bytes(b)
 
 
-def fetch_window(s3, key: str, start_s: float, duration_s: float, *, bucket: str | None = None,
-                 deadline: Deadline | None = None, stats: FetchStats | None = None,
-                 max_attempts: int = DEFAULT_MAX_ATTEMPTS, backoff_s: float = 1.0, max_backoff_s: float = 30.0,
-                 sleep=time.sleep, rand=random.random, chunk_bytes: int = CHUNK_BYTES,
-                 max_fetch_bytes: int = MAX_FETCH_BYTES, channels=CANONICAL_19) -> Recording:
-    """Ranged-read one EDF window and decode it to a ``Recording`` (uV) in memory. Raises ``_StreamError`` /
-    ``RecordingTimeout`` only (the caller turns them into a ``StreamResult``)."""
+@dataclass
+class RawWindow:
+    """Header plus the raw bytes of the data records covering a window, as fetched (nothing decoded yet)."""
+    hdr: EDFHeader
+    header_seg: bytes
+    data: bytes
+    plan: DataPlan
+    n_records_effective: int
+    stats: FetchStats
+
+    def sparse(self) -> SparseEDF:
+        return SparseEDF([(0, self.header_seg), (self.plan.byte_start, self.data)],
+                         size=self.hdr.header_bytes + self.n_records_effective * self.hdr.record_bytes)
+
+    def records(self) -> np.ndarray:
+        """(n_records, samples_per_record_total) int16 digital values of the fetched records."""
+        n = len(self.data) // self.hdr.record_bytes
+        return np.frombuffer(self.data[: n * self.hdr.record_bytes], dtype="<i2").reshape(n, -1)
+
+
+def fetch_raw_window(s3, key: str, start_s: float, duration_s: float, *, bucket: str | None = None,
+                     deadline: Deadline | None = None, stats: FetchStats | None = None,
+                     max_attempts: int = DEFAULT_MAX_ATTEMPTS, backoff_s: float = 1.0, max_backoff_s: float = 30.0,
+                     sleep=time.sleep, rand=random.random, chunk_bytes: int = CHUNK_BYTES,
+                     max_fetch_bytes: int = MAX_FETCH_BYTES, allow_discontinuous: bool = False) -> RawWindow:
+    """Ranged-read the EDF header and the data records covering ``[start_s, start_s + duration_s)``. Raises
+    ``_StreamError`` / ``RecordingTimeout`` only. ``allow_discontinuous`` is for diagnostics (header counts)."""
     if bucket is None:
         from ..data_io import access_point
         bucket = access_point()
@@ -375,7 +401,7 @@ def fetch_window(s3, key: str, start_s: float, duration_s: float, *, bucket: str
         hdr = read_edf_header(io.BytesIO(head))
     except EDFError as exc:
         raise _StreamError(classify_edf_error(exc)) from None
-    if hdr.discontinuous:
+    if hdr.discontinuous and not allow_discontinuous:
         raise _StreamError(FailureReason.DISCONTINUOUS)
     if hdr.header_bytes > len(head) or hdr.record_bytes <= 0:
         raise _StreamError(FailureReason.HEADER_INVALID)
@@ -400,11 +426,23 @@ def fetch_window(s3, key: str, start_s: float, duration_s: float, *, bucket: str
         pos = end + 1
     data = b"".join(parts)
     del parts
-    sparse = SparseEDF([(0, header_seg), (plan.byte_start, data)],
-                       size=hdr.header_bytes + n_eff * hdr.record_bytes)
+    return RawWindow(hdr, header_seg, data, plan, n_eff, stats)
+
+
+def fetch_window(s3, key: str, start_s: float, duration_s: float, *, bucket: str | None = None,
+                 deadline: Deadline | None = None, stats: FetchStats | None = None,
+                 max_attempts: int = DEFAULT_MAX_ATTEMPTS, backoff_s: float = 1.0, max_backoff_s: float = 30.0,
+                 sleep=time.sleep, rand=random.random, chunk_bytes: int = CHUNK_BYTES,
+                 max_fetch_bytes: int = MAX_FETCH_BYTES, channels=CANONICAL_19) -> Recording:
+    """Ranged-read one EDF window and decode it to a ``Recording`` (uV) in memory. Raises ``_StreamError`` /
+    ``RecordingTimeout`` only (the caller turns them into a ``StreamResult``)."""
+    deadline = deadline or Deadline(None)
+    raw = fetch_raw_window(s3, key, start_s, duration_s, bucket=bucket, deadline=deadline, stats=stats,
+                           max_attempts=max_attempts, backoff_s=backoff_s, max_backoff_s=max_backoff_s, sleep=sleep,
+                           rand=rand, chunk_bytes=chunk_bytes, max_fetch_bytes=max_fetch_bytes)
     deadline.check()
     try:
-        return read_edf(sparse, start_s=start_s, duration_s=duration_s, channels=list(channels))
+        return read_edf(raw.sparse(), start_s=start_s, duration_s=duration_s, channels=list(channels))
     except EDFError as exc:
         raise _StreamError(classify_edf_error(exc)) from None
 
@@ -455,6 +493,9 @@ def stream_features(s3, key: str, *, bucket: str | None = None, windows=None, qc
         res.rows = _augment_rows(out.rows, out.qc)
         res.qc = out.qc
         res.n_channels = int(out.channel_status.get("n_channels", 0))
+        res.n_missing_min = int(out.channel_status.get("n_missing_min", 0))
+        res.n_dead_min = int(out.channel_status.get("n_dead_min", 0))
+        res.n_invalid_min = int(out.channel_status.get("n_invalid_min", 0))
         res.ok = True
     except RecordingTimeout:
         res.reason = FailureReason.TIMEOUT

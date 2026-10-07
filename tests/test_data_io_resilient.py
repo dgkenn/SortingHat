@@ -344,11 +344,11 @@ def test_always_list_fills_folder_stats_even_when_resolved_by_pattern():
     assert r.pattern == "documented" and r.folder_exists and r.n_edf == 1 and r.ext_counts == {"edf": 1, "json": 1}
 
 
-def test_patient_listing_is_opt_in():
+def test_parent_listing_is_opt_in():
     objs = {f"EEG/bids/{S}/{BF}/ses-007/eeg/{BF}_ses-007_task-EEG_eeg.edf": b"x"}
-    assert not _res(objs, patient_fallback=False).found
-    r = _res(objs, patient_fallback=True)
-    assert r.found and r.pattern == "patient_listing"
+    assert not _res(objs, parent_fallback=False).found
+    r = _res(objs, parent_fallback=True)
+    assert r.found and r.pattern == "parent_listing"
 
 
 def test_file_ext():

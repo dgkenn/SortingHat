@@ -55,7 +55,7 @@ Known weakness: the proxy is not the clinical onset. A patient admitted for anot
 | File | Content | Mode |
 |---|---|---|
 | `out/local_only/cohort_study1.csv` | one row per patient: ids, t0, age, service, visit class, acute basis, duration, onset, onset basis, hours since onset, `onset_le_*h`, lowest GCS/FOUR in the window, `severity_strict`, `phenotype`, `in_strict`, `in_broad`, `n_unstamped_sessions` | 0600 (dir 0700) |
-| `out/local_only/recording_keys.csv` | `SiteID, person_id, SessionID, BidsFolder, EEGFolder, edf_key, task_token_assumed, window_start_s, window_duration_s, in_strict, in_broad`; read with `cohort.read_key_list`; `edf_key` is the BIDS EDF key under the access point | 0600 |
+| `out/local_only/recording_keys.csv` | `SiteID, person_id, SessionID, BidsFolder, EEGFolder, edf_key, task_token_assumed, window_start_s, window_duration_s, in_strict, in_broad`; read with `cohort.read_key_list`; `edf_key` is the documented BIDS EDF key under the access point (first candidate of `data_io.bids_edf_candidates`; the extractor can rebuild the others from the same row's `SiteID, BidsFolder, SessionID, EEGFolder`) | 0600 |
 | `out/cohort/flow.md`, `flow.json` | aggregate flow, suppressed | normal |
 
 The key list holds every table row (the 24-48 h rows are needed for the 48 h sensitivity analysis). The extractor reads `edf_key` and the window columns; the cohort table is never needed by it. `task_token_assumed` is True where `EEGFolder` does not exist (all I-sites): the task token defaults to `EEG` there, unverified for continuous EEG.

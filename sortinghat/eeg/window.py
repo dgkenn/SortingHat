@@ -162,6 +162,8 @@ class WindowQC:
     coverage_fraction: float                    # share of the window inside the recording
     reasons: list[str] = field(default_factory=list)
     disconnected_channels: int = 0              # minimum-set channels disconnected for the whole window
+    n_dead_min: int = 0                         # minimum-set channels exactly constant for the whole segment (missing)
+    n_invalid_min: int = 0                      # minimum-set channels with a zero calibration range (missing)
 
     def to_row(self) -> dict:
         """Scalar summary (no per-epoch arrays); safe to aggregate."""
@@ -172,8 +174,12 @@ class WindowQC:
         return d
 
 
-def window_qc(ef: EpochFlags, spec: WindowSpec, rec_duration_s: float, cfg: QCConfig | None = None) -> WindowQC:
-    """Usable-data fraction for ``spec`` from epoch flags (grid must contain the window)."""
+def window_qc(ef: EpochFlags, spec: WindowSpec, rec_duration_s: float, cfg: QCConfig | None = None,
+              channel_notes: Mapping[str, Sequence[str]] | None = None) -> WindowQC:
+    """Usable-data fraction for ``spec`` from epoch flags (grid must contain the window).
+
+    ``channel_notes`` (``dead`` / ``invalid_scaling``: canonical names already removed from the data) only explains
+    WHY minimum-set channels are missing; they are not in ``ef`` and count as bad cells either way."""
     cfg = cfg or QCConfig()
     e0 = int(round((spec.start_s - ef.start_s) / ef.epoch_s))
     n = int(round(spec.duration_s / ef.epoch_s))
@@ -185,8 +191,15 @@ def window_qc(ef: EpochFlags, spec: WindowSpec, rec_duration_s: float, cfg: QCCo
     coverage = max(0.0, min(spec.end_s, rec_duration_s) - spec.start_s) / spec.duration_s
     if coverage < 1.0:
         reasons.append("window_exceeds_recording")
+    notes = channel_notes or {}
+    n_dead = len(set(cfg.minimum_channels) & set(notes.get("dead", ())))
+    n_inv = len(set(cfg.minimum_channels) & set(notes.get("invalid_scaling", ())))
     if len(present) < len(cfg.minimum_channels):
         reasons.append("missing_minimum_channels")
+    if n_dead:
+        reasons.append("dead_minimum_channels")
+    if n_inv:
+        reasons.append("invalid_scaling_minimum_channels")
     rows = [idx[c] for c in present]
     sl = slice(e0, e0 + n)
     cells = {k: v[rows][:, sl] for k, v in ef.flags.items()}
@@ -209,12 +222,13 @@ def window_qc(ef: EpochFlags, spec: WindowSpec, rec_duration_s: float, cfg: QCCo
     if uf < cfg.usable_threshold:
         reasons.append("usable_below_threshold")
     return WindowQC(spec.name, n, uf, bool(passes), usable, ffrac, float((~bad).mean()) if bad.size else 0.0,
-                    len(present), n_req, coverage, reasons, disc_ch)
+                    len(present), n_req, coverage, reasons, disc_ch, n_dead, n_inv)
 
 
 def qc_recording(data: np.ndarray, fs: float, ch_names: Sequence[str], offset_s: float = 0.0,
                  windows: Mapping[str, WindowSpec] | None = None, cfg: QCConfig | None = None,
-                 rec_duration_s: float | None = None) -> tuple[dict[str, WindowQC], EpochFlags]:
+                 rec_duration_s: float | None = None,
+                 channel_notes: Mapping[str, Sequence[str]] | None = None) -> tuple[dict[str, WindowQC], EpochFlags]:
     """Run QC for every window in one pass. ``data`` starts at ``offset_s`` of the recording."""
     cfg = cfg or QCConfig()
     windows = dict(windows or all_windows())
@@ -227,7 +241,7 @@ def qc_recording(data: np.ndarray, fs: float, ch_names: Sequence[str], offset_s:
     seg = data[:, s0:s1]
     ef = epoch_artifact_flags(seg, fs, ch_names, start_s=span0, cfg=cfg, span_s=span1 - span0)
     total = rec_duration_s if rec_duration_s is not None else offset_s + data.shape[1] / fs
-    return {k: window_qc(ef, w, total, cfg) for k, w in windows.items()}, ef
+    return {k: window_qc(ef, w, total, cfg, channel_notes) for k, w in windows.items()}, ef
 
 
 def extract_window(data: np.ndarray, fs: float, spec: WindowSpec, offset_s: float = 0.0) -> np.ndarray:
@@ -256,7 +270,9 @@ def summarize_window_qc(qcs: Sequence[Mapping[str, WindowQC]], threshold: float 
         entry = {"n": suppress_count(n),
                  "pass_proportion": suppress_proportion(npass, n),
                  "usable_fraction_quantiles": safe_quantiles([r.usable_fraction for r in rows]),
-                 "flag_prevalence": {}}
+                 "flag_prevalence": {},
+                 "reason_counts": {r: suppress_count(sum(r in x.reasons for x in rows))
+                                   for r in sorted({r for x in rows for r in x.reasons})}}
         for k in FLAG_NAMES:
             entry["flag_prevalence"][k] = suppress_proportion(sum(r.flag_fraction.get(k, 0) > 0.05 for r in rows), n)
         out["windows"][w] = entry

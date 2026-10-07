@@ -22,7 +22,7 @@ import numpy as np
 from ..agent_safety import assert_not_restricted_in_agent
 from ..safe_output import safe_print
 from .features import FeatureConfig, extract_features
-from .io import CANONICAL_19, Recording, read_edf, select_channels
+from .io import CANONICAL_19, Recording, drop_dead_channels, read_edf, select_channels
 from .preprocess import PreprocessConfig, common_average_masked, preprocess
 from .window import (QCConfig, WindowQC, all_windows, extract_window, qc_recording, summarize_window_qc,
                      window_clean_mask, write_qc_summary)
@@ -54,9 +54,11 @@ def process_recording(src, windows=None, qc_cfg: QCConfig | None = None, pre_cfg
         t0 = max(0.0, min(w.start_s for w in windows.values()) - PAD_S)
         t1 = max(w.end_s for w in windows.values()) + PAD_S
         rec = read_edf(src, start_s=t0, duration_s=t1 - t0, channels=list(CANONICAL_19))
-    rec = select_channels(rec)
+    rec = drop_dead_channels(select_channels(rec))      # exactly-constant (zero-filled) channels are MISSING, not flat
     total = rec.meta.get("edf_duration_s", rec.offset_s + rec.duration_s)
-    qcs, ef = qc_recording(rec.data, rec.fs, rec.ch_names, rec.offset_s, windows, qc_cfg, rec_duration_s=total)
+    notes = {"dead": rec.meta.get("dead_channels", []), "invalid_scaling": rec.meta.get("invalid_scaling_channels", [])}
+    qcs, ef = qc_recording(rec.data, rec.fs, rec.ch_names, rec.offset_s, windows, qc_cfg, rec_duration_s=total,
+                           channel_notes=notes)
 
     x, fs = preprocess(rec.data, rec.fs, pre_cfg)
     disc = ef.flags["disconnected"].all(axis=1) if ef.flags["disconnected"].size else None
@@ -71,7 +73,13 @@ def process_recording(src, windows=None, qc_cfg: QCConfig | None = None, pre_cfg
             seg = extract_window(x, fs, w, rec.offset_s)
             row.update(extract_features(seg, fs, rec.ch_names, window_clean_mask(ef, w, rec.ch_names), feat_cfg))
         rows.append(row)
-    status = {"n_channels": len(rec.ch_names), "missing": rec.meta.get("missing_channels", [])}
+    minimum = set((qc_cfg or QCConfig()).minimum_channels)
+    miss = [c for c in rec.meta.get("missing_channels", [])]
+    status = {"n_channels": len(rec.ch_names), "missing": miss, "dead": notes["dead"],
+              "invalid_scaling": notes["invalid_scaling"],
+              "n_missing_min": len(minimum & set(miss)) - len(minimum & set(notes["invalid_scaling"])),
+              "n_dead_min": len(minimum & set(notes["dead"])),
+              "n_invalid_min": len(minimum & set(notes["invalid_scaling"]))}
     return RecordingResult(rows, qcs, status)
 
 

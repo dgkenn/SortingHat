@@ -486,7 +486,7 @@ def bids_folder_for(site: str, bdsp_patient_id: str | int) -> str:
 # ---------------------------------------------------------------------------------------------------------
 # Pattern NAMES are the only thing diagnostics may report (never keys).
 EDF_PATTERNS = ("documented", "alt_task", "no_task", "documented+sid_variant", "alt_task+sid_variant",
-                "no_task+sid_variant", "folder_listing", "patient_listing", "not_found")
+                "no_task+sid_variant", "folder_listing", "parent_listing", "not_found")
 
 
 def _sid_variants(session_id) -> list[str]:
@@ -615,14 +615,14 @@ class EdfResolution:
 
 
 def resolve_edf_key(s3, site: str, bids_folder: str, session_id, eeg_folder: str | None = None, *,
-                    bucket: str | None = None, list_fallback: bool = True, patient_fallback: bool = False,
+                    bucket: str | None = None, list_fallback: bool = True, parent_fallback: bool = False,
                     always_list: bool = False, policy: RetryPolicy | None = None) -> EdfResolution:
     """Resolve one session's EDF key robustly.
 
     1. the documented key, the other task token and a task-less name (``bids_edf_candidates``), by exact-key HEAD;
     2. ``list_fallback``: list ONLY the session's own folder ``EEG/bids/<site>/<BidsFolder>/ses-<id>/eeg/``
        (``Delimiter='/'``) and take the ``.edf`` whose name matches the session (``pick_edf``);
-    3. ``patient_fallback`` (off by default): list the subject's own folder for a ``ses-`` folder whose id equals the
+    3. ``parent_fallback`` (off by default): list the subject's own folder for a ``ses-`` folder whose id equals the
        session id under a spelling variant, then list that session's ``eeg/``.
     ``always_list`` also lists the session folder when step 1 already found the key, to fill ``folder_exists`` /
     ``n_edf`` / ``ext_counts`` for diagnostics. Keys are returned, never printed or logged here.
@@ -648,7 +648,7 @@ def resolve_edf_key(s3, site: str, bids_folder: str, session_id, eeg_folder: str
             k = pick_edf(listing.edf_keys, bids_folder, session_id, task)
             if k is not None:
                 res.key, res.pattern = k, "folder_listing"
-    if res.key is None and patient_fallback:
+    if res.key is None and parent_fallback:
         for bf in _bids_names(bids_folder):
             top = list_folder(s3, f"{BIDS_PREFIX}{site}/{bf}/", bucket=bucket, policy=policy)
             if not top.exists:
@@ -660,7 +660,7 @@ def resolve_edf_key(s3, site: str, bids_folder: str, session_id, eeg_folder: str
                     lst = list_folder(s3, cp + "eeg/", bucket=bucket, policy=policy)
                     k = pick_edf(lst.edf_keys, bids_folder, session_id, task)
                     if k is not None:
-                        res.key, res.pattern = k, "patient_listing"
+                        res.key, res.pattern = k, "parent_listing"
                         res.folder_exists, res.n_edf, res.ext_counts = True, len(lst.edf_keys), lst.ext_counts
                         break
             if res.key is not None:
