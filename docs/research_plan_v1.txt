@@ -1,0 +1,548 @@
+
+Sorting Hat — Research Plan
+EEG-based probabilistic etiologic differential for acute impaired consciousness
+ · 
+Executive summary
+The project is worth pursuing, and the master handoff (v1.0, 29 Sep 2026) is already a strong retrospective protocol. This plan keeps its spine and fixes the problems most likely to sink it: label circularity, sedation inflating the result, unverified timestamps, an unbudgeted adjudication workload, and a commercial path that ignores the rapid-EEG hardware it depends on.
+The question. Does the first 10 minutes of scalp EEG add calibrated, cross-site information about why an adult is acutely unconscious, beyond how deeply unconscious they are and what the team already knows at that moment?
+The sequence. Phase 0 feasibility gates → Study 1 HEEDB discovery (site-held-out, research-only) → Study 2 external stress tests and deployable-montage simulation → commercial track (clean encoder plus a licensed proprietary etiologic cohort) → prospective silent validation → human-in-the-loop study → utility RCT → FDA. Nothing commercial gets built until Study 1 passes Gate 2.
+The five changes that matter most:
+Split toxic/pharmacologic into exogenous intoxication (an etiology) and iatrogenic sedation (a known state modifier), and put t0 sedative exposure into the Study 1A baseline. Otherwise EEG "wins" by detecting propofol the team already gave.
+Ban EEG-contaminated evidence from silver labels: EEG reports, note sentences citing EEG, and nonspecific encephalopathy codes. Otherwise the model learns to imitate the EEG reader's guess, not the cause.
+Make Phase 0 a field-level audit of HEEDB timestamps (result availability, medication administration, imaging finalization, ACI onset). Study 1B is impossible without them.
+Budget adjudication honestly. As written it is roughly 4,500 chart reviews and 1,100–1,900 physician-hours; dual review moves to the evaluation set only, and packets are pre-assembled locally.
+Treat rapid EEG as the deployment reality. Simulate real rapid-headset electrode geometries rather than generic 12/8/6/4-channel subsets, and run prospective work where rapid EEG is already standard care.
+Critical evaluation of the source material
+The science is well framed: multi-label etiology, a frozen t0, site-held-out evaluation, proper scoring rules, and STARD-AI/TRIPOD+AI reporting are all correct choices. The weaknesses are in what the model can cheat on, what the labels secretly contain, and what the plan assumes about data, labor and the market.
+Element in the source material
+Problem
+Fix in this plan
+Toxic/pharmacologic label includes iatrogenic sedation
+Study 1A's severity-only baseline has no drug data, so EEG gains log loss by recognizing propofol or benzodiazepine signatures the team already knows about
+Split into E4a exogenous intoxication and E4b iatrogenic sedation; add t0 sedative exposure to the 1A baseline; exclude E4b from the primary endpoint
+Silver labels from ICD codes, clinical attribution and notes
+Discharge diagnoses like "toxic-metabolic encephalopathy" are often written off the EEG report, so the model learns to imitate the reader
+Hard exclusion list for EEG-derived evidence, plus a circularity audit (Study 1 §6)
+"Result-availability time" predictor rule
+Correct, but nobody has confirmed HEEDB carries result, administration and finalization times in a date-shifted release
+Phase 0 field audit with explicit pass/fail; Study 1B is cut if it fails
+~800 development + ~1,000 evaluation + enriched gold cases, all dual-reviewed
+About 4,500 reviews; at 15–25 min each, 1,100–1,900 physician-hours with no one assigned
+Dual review on the evaluation set only; locally pre-assembled packets; named adjudicator pool
+Study 1B comparator = everything known at t0
+Clinical EEGs often start hours after CT and labs return, so this measures value at the wrong moment for an early-triage device
+Add an early-EEG subgroup (t0 before head CT result) and a referral-indication baseline
+Leave-one-site-out across 3 adult sites
+Three folds is thin, two sites may share a system or EEG vendor, and a within-site bootstrap hides between-site variance
+Require a favorable effect at every held-out site; report each separately
+Generic 19→12→8→6→4-channel ablation
+Not what will be deployed; rapid-EEG hardware fixes the geometry
+Simulate the actual rapid-headset electrode sets from the 19-channel recordings
+TUSZ, TUAB, TUEV listed as extra hours
+They are subsets drawn from TUEG and were inside CBraMod's pretraining; they add labels, not hours
+Count TUEG once; treat subsets as label sources and as contaminated benchmarks
+Commercial encoder retraining runs in parallel now
+Weeks of GPU and engineering off the critical path, before anyone knows the signal exists
+Defer retraining to after Gate 2; do only provenance work now
+"Published scientific knowledge" may cross the firewall
+You are the conduit between tracks, and employer IP policy is unaddressed
+Commercial track uses only preprinted Study 1 results; IP review with current and future employers first
+No competitive landscape
+Ceribell already sells rapid EEG with FDA-cleared seizure and delirium indications, added epileptiform detection in August 2026, and cites over 1 million hours of EEG (Ceribell)
+Treat Ceribell as the default competitor, partner or acquirer; design for its hardware
+510(k) vs De Novo left open
+The only adjunctive interpretive EEG classification, 21 CFR 882.1450, is limited to structural injury in trauma (eCFR)
+Plan for De Novo, using BrainScope's DEN140025 history as the template
+Consecutive enrollment with EEG in 30–60 min
+Impossible with conventional EEG at most hospitals; research-only EEG on incapacitated patients needs surrogate consent
+Prospective sites must already use rapid EEG as standard care, so research is data capture only
+No novelty check
+The BDSP group built HEEDB, MORGOTH, NESI and the TME cohort and is the likeliest group to run this analysis
+Literature sweep plus an early collaboration offer (Phase 0)
+Several citations in the source documents came from another assistant and could not all be confirmed here: the January 2026 CDS guidance, the August 2026 human-factors guidance, the CLEF preprint, and the claim that one BDSP restricted DUA now covers every restricted dataset. Re-verify each before it goes into a protocol, grant or Pre-Sub.
+Core question, claims and hypotheses
+Two claims are tested, in order, and the second is the one a product depends on.
+Scientific claim (Study 1A). Etiologic families of acute impaired consciousness leave reproducible, site-transportable EEG signatures beyond severity and known sedative exposure.
+Translational claim (Study 1B). Adding a short EEG to everything the team knows at t0 improves the calibrated, multi-label etiologic differential.
+Primary endpoint (both studies). Change in mean masked multi-label log loss on site-held-out predictions, negative meaning EEG helps:
+Here L_i is patient i's set of assessable labels and ℓ is binary log loss. Change from the handoff: the primary label set excludes E3 (epileptic contributor) and E4b (iatrogenic sedation). E3 is partly defined by EEG, so including it guarantees a win; it becomes the pipeline's positive control instead. E4b is known to the team at t0 and is not a diagnostic question.
+Preregistered hypotheses
+ID
+Hypothesis
+Success criterion
+Role
+H1
+EEG improves on severity + t0 sedative exposure
+95% CI for Δ below 0, and point estimate below 0 at every held-out site
+Primary, 1A
+H2
+EEG improves on the full t0 clinical model
+Same as H1
+Primary, 1B
+H3
+H1 survives severity matching (GCS/FOUR/NESI strata)
+Δ below 0 within at least 2 of 3 severity strata
+Key secondary
+H4
+Identifiability ranking: E3 > E2 > E1 > E4a > E5 > E6, with E6 vs E5 near chance
+Recorded before unblinding; reported whichever way it falls
+Boundary map
+H5
+The 1B gain is larger when t0 precedes the head CT result
+Interaction estimate with 95% CI
+Intended-use proxy
+H6
+At least 70% of the 10-minute gain is present by 2 minutes
+Ratio of Δ(2 min) to Δ(10 min) with CI
+Device design, exploratory
+Writing H4 down before unblinding matters. It turns a messy per-label result into a test of a stated prediction rather than a story told afterward.
+Not claimed: exact metabolic subtypes, a single cause per patient, superiority to a neurologist reading the full record, or any performance on reduced montages until Study 2.
+Program architecture
+The program runs as two legally separate lineages, and the only thing allowed across is what has been published. That makes the firewall auditable: anyone can check that a commercial design decision traces to a public document.
+The research track answers whether the signal exists; the commercial track builds the product from green data once it does.
+Firewall rules (additions to handoff section 1.2)
+The commercial track may use Study 1 and 2 conclusions only after they are preprinted. File any provisional patent before the preprint.
+Keep a dated log of every commercial design decision and the public source it rests on.
+You are the conduit between tracks, so the boundary needs institutional counsel's sign-off, not just your own judgment.
+Settle IP ownership with your current employer and incoming residency institution before forming an entity, filing an invention disclosure, or signing a data license. If a BDSP-affiliated collaborator joins Study 1, agree in writing how their institution's IP interests are handled before work starts.
+Phase 0: feasibility gates before any modeling
+Phase 0 decides whether Study 1B is possible at all, and it costs weeks, not months. Nothing is trained until the field audit and the 200-case pilot pass.
+0a. HEEDB field audit (metadata only, no waveforms). Each row must pass or the listed fallback applies.
+Field
+Needed for
+Pass criterion
+If it fails
+EEG start date and time of day
+t0, every analysis
+Present for ≥95% of acute-care EEGs
+Stop; no study
+Consistent within-patient date shift
+All timing logic
+Note, lab and EEG times line up on 20 hand-checked cases
+Stop
+Medication administration times (not just orders)
+Sedation baseline, E4a/E4b
+Administration times for ≥80% of candidates
+Use orders; label 1B "approximate"
+Lab result or verification time
+Study 1B
+Result time present
+Collection time plus assay lag; label 1B "approximate"
+Imaging report finalization time
+Study 1B, H5
+Present
+Drop H5
+GCS, FOUR or RASS near EEG
+Inclusion, 1A baseline
+Score within ±6 h for ≥50% of candidates
+BDSP GCS-from-EHR tool; broad cohort only
+Site identifier
+Leave-one-site-out
+≥3 adult sites with ≥300 candidates each
+Grouped split; weaker claim
+Timestamped notes
+ACI onset, silver labels
+Present
+Stop
+0b. Label feasibility pilot. The handoff's 200-case blinded sample stays, with three added outputs: measured minutes per case, per-label kappa, and the share of positive silver labels whose only evidence was EEG-derived. That last number tells you how badly circularity would have hurt.
+0c. Novelty sweep and collaboration decision. Search 2024–2026 literature and preprints for EEG-based etiologic classification of encephalopathy or coma. Then decide whether to offer the BDSP group a collaboration; they know HEEDB's quirks, have adjudicators, and are the likeliest group to publish this first.
+0d. IP and employer review. Read the IP clauses in your current house-staff agreement and the incoming residency contract before any invention disclosure. Ask who owns work done on personal time with externally licensed data.
+0e. Agent safety for restricted data. This is a real risk in a Claude Code workflow. An agent that runs df.head() on a HEEDB table sends record-level data into a hosted model's context, which the BDSP terms prohibit.
+Agents develop against a synthetic dataset with HEEDB's schema, never the real tables.
+Scripts that touch restricted data print only aggregates with small-cell suppression (n < 11 shown as "<11").
+Run restricted-data jobs from a plain terminal or scheduler, not from inside an agent session.
+Any LLM used to read notes is an open-weight model running on approved compute.
+Gate 0 passes when every "Stop" row passes, pilot kappa is ≥0.6 for at least four primary families, and the pilot shows at least 3 families with ≥10% prevalence.
+Study 1: HEEDB retrospective discovery
+Study 1 keeps the handoff's cohort, window, preprocessing and representation ladder. It changes the label set, the silver-label rules, the adjudication design and the baselines.
+Population and index time
+Adults, acute-care encounter, first qualifying EEG per patient; strict cohort GCS ≤11 or FOUR ≤12, broad EHR-phenotype cohort reported separately.
+t0 = EEG start. Primary window is minutes 1–11; at least 60% usable data on the minimum channel set.
+EEG within 24 h of documented ACI onset, with time since onset as a covariate and ≤6/12/48 h sensitivity analyses.
+New: record the EEG referral indication as a category (e.g. "rule out NCSE", "post-arrest", "unexplained AMS"). It defines spectrum and powers Baseline D.
+Revised ontology
+Label
+Content
+Role
+E1 Acute structural
+Stroke, ICH, SAH, SDH/EDH, TBI, mass effect; sublabels focal vs diffuse
+Primary
+E2 Global hypoxic-ischemic
+Post-arrest, asphyxia, profound shock
+Primary
+E3 Epileptic contributor
+Seizure, NCSE, causally relevant postictal state
+Positive control; separate EEG-based adjudication
+E4a Exogenous intoxication
+Overdose, drug or toxin exposure that brought the patient in or arose unintentionally
+Primary
+E4b Iatrogenic sedation
+Planned ICU sedatives sufficient to depress the exam
+Covariate and secondary label
+E5 Metabolic/physiologic
+Hepatic, uremic, glucose, sodium, hypercapnia, endocrine, acid-base
+Primary
+E6 Systemic infection/inflammation
+Sepsis-associated encephalopathy without CNS infection
+Primary
+E7 CNS infection/inflammation
+Meningitis, encephalitis, autoimmune encephalitis
+Primary only with ≥100 gold positives across ≥2 sites; otherwise exploratory via an enriched set
+Reference standard
+Gold labels use the handoff's ordinal states (absent / possible / probable / definite / unassessable), blinded to EEG, reports and model outputs.
+Change: dual independent review plus third-reader resolution on the evaluation set only. Development cases get one reviewer, with a random 20% double-read to track agreement.
+Packets are assembled by deterministic extraction plus an open-weight summarizer on approved compute. A sentence filter strips anything mentioning EEG before the reviewer sees it. Validate the summarizer against full charts on 50 cases before relying on it.
+Silver labels: the circularity rules
+Silver labels train models; they never score them. Three kinds of evidence are banned as positive evidence for E1, E2, E4a, E5, E6 and E7:
+EEG reports, and any note sentence mentioning EEG, cEEG, LTM, slowing, triphasic waves, burst suppression, LPDs/GPDs/LRDA.
+Nonspecific encephalopathy diagnosis codes (the G92 and G93.4 families) and free-text "toxic-metabolic encephalopathy" without an objective anchor.
+Post-t0 neurology impressions, unless the sentence filter has removed EEG content.
+Each positive needs an objective anchor: a lab value with timing, an imaging finding, a culture or CSF result, an arrest event, a toxicology result, or an antidote response. Circularity audit: if a silver-trained model agrees more with EEG-report impressions than with gold labels, the silver labels are leaking and get rebuilt.
+Clinical baselines
+Baseline
+Contents
+Used in
+A Severity + sedation
+Age, sex, GCS/FOUR/RASS, NESI, t0 sedative and opioid exposure
+H1 (changed: sedation added)
+B Bedside
+A + vitals, pupils, witnessed convulsion, arrest/trauma history, point-of-care glucose
+Secondary
+C Full t0
+B + every lab, toxicology, imaging and culture result available before t0
+H2
+D Referral question
+C + the EEG indication category (indication field only)
+Sensitivity; a proxy for the clinician's prior
+Representations and models
+The handoff's ladder stands: prior → qEEG → connectivity → MORGOTH findings → frozen embeddings → dynamics → combined, all with the same shallow multi-label head. Change: run frozen CBraMod embeddings on HEEDB alongside MORGOTH. The difference in Δ between them is the "commercial-clean gap", the single most useful number for the commercial decision.
+Splits and analyses
+Leave-one-site-out across adult sites; every held-out site must show a favorable Δ. Add a late-calendar temporal holdout within sites.
+Mandatory controls from the handoff: severity matching, sedative-excluded subset, site/duration/channel leakage probes, MORGOTH exposure accounting, negative controls.
+Added: the early-EEG subgroup (t0 before head CT result) for H5, and per-label risk–coverage curves.
+Evaluation size: about 1,000 consecutive gold cases, recalculated after the pilot with formal external-validation sample-size methods.
+Optional Study 1D: retrospective reader study
+Run only if H2 succeeds. Three clinicians (ED, ICU, neurology) give a probabilistic differential on 150 evaluation packets, then revise after seeing the model output. This yields the first human-plus-AI evidence and a direct clinician comparator two years before any prospective study.
+Study 2: external stress tests and deployable-hardware simulation
+Study 2 runs only after Gate 2, on a model frozen at the end of Study 1. It answers two questions: does the signal survive other hospitals, and does it survive the hardware that would actually be used.
+External stress tests
+Each dataset tests one thing. None is pooled into training or used as the source of a class.
+Dataset
+What it tests
+Key readout
+CERTA (if investigators share it)
+True external multi-label validation on the original 14 etiologies
+Δ log loss and calibration on the frozen model; the strongest external result available
+I-CARE 2.0
+E2 behavior across 7 hospitals
+E2 probability vs time from ROSC and background category
+2024 Korean NCSE / metabolic / benzodiazepine cohort
+Replication of the E3 vs E5 vs E4a branch
+Per-class AUROC vs the published 0.905 connectivity result
+BDSP toxic-metabolic encephalopathy cohort
+The E5 vs E3 overlap on the ictal-interictal continuum
+False-positive E3 rate in E5 patients
+SPaRCNet, TUSZ
+E3 positive control
+Seizure/IIC detection is intact; if not, the pipeline is broken
+Duration
+Prespecified nested windows from the start of the primary window: 20 s, 1, 2, 5 and 10 min. Report Δ at each and the time at which 70% of the 10-minute gain appears (H6).
+Montage: simulate real hardware, not channel counts
+Change from the handoff: each reduced montage is a specific deployable geometry, rebuilt from the 19-channel recordings with that device's referencing.
+Full 19-channel 10–20 (reference).
+Rapid-EEG hairline headband: a frontal-temporal-occipital ring with no central or parietal coverage. Confirm the exact electrode list and referencing from vendor documentation before simulating.
+Rapid-EEG full-coverage headcap, where the vendor's layout differs from standard 10–20.
+Forehead-only array, the geometry used by handheld EEG triage devices.
+A data-driven 4–8 electrode set, selected entirely inside training folds.
+If geometry 2 keeps most of the gain, the product can ride on hardware already deployed in US EDs and ICUs. Simulated deletion still ignores impedance, placement error and real artifact, so any reduced montage needs the paired prospective recording described in the prospective program.
+Commercial track
+The commercial bottleneck is etiologic labels with commercial rights, not EEG representations. The source audit is right that TUEG-based encoders solve "what does EEG look like"; nothing public solves "why is this patient unconscious" with rights you can ship.
+Now, before Gate 2 (low cost)
+Stand up the data-rights ledger and the production-build refusal rule from the handoff.
+Pull TUEG under your existing access and hash the manifest.
+Hash the public CBraMod checkpoint and trace its training data; have counsel confirm that the TUH terms cover derivative weights in a regulated product.
+Keep NMT (share-alike) and VitalDB (conflicting license statements) at yellow until written clarification arrives.
+Do not retrain encoders yet. The Study 1 commercial-clean gap decides whether that work is needed at all.
+After Gate 2: encoder decision
+Option
+When to choose it
+C1 Public CBraMod checkpoint, frozen
+Commercial-clean gap is small and counsel clears the checkpoint
+C2 CBraMod architecture retrained by you on TUEG
+Gap is small but checkpoint provenance is unclear
+C3 C2 plus continued pretraining on licensed acute-care EEG
+Gap is large; the deployment distribution differs from TUEG
+The proprietary etiologic dataset
+This answers the open question at the end of the commercial audit: yes, the cheapest first proprietary dataset is retrospective.
+Route
+Speed
+Cost
+What it gives
+Main obstacle
+1 Licensed hospital EEG archive + EHR
+Months
+Moderate
+Training labels for the commercial model
+Needs a legal entity and a commercial data license
+2 Rapid-EEG vendor partnership
+Variable
+Low cash, high leverage cost
+Deployment-hardware EEG at scale
+No etiologic labels; partner controls terms
+3 Prospective commercial cohort
+2–3 years
+High
+Regulatory-grade validation
+Funding, sites, consent
+Use route 1 for training, route 3 for validation, and keep route 2 as a strategic option. Every agreement must grant commercial model training, derivative weights, regulatory submission, continued improvement, sublicensing or spinout, and audit access. Your future residency health system is a natural first archive to approach, which makes the employer-IP review in Phase 0 more urgent, not less.
+Entity and funding
+A company entity is needed to sign route-1 licenses and hold IP, but only after the employer-IP review. NIH SBIR/STTR funding fits this program; STTR in particular pairs a small business with an academic partner, which matches a company licensing an academic collaborator's cohort.
+Prospective and regulatory program
+The source sequence is right: prospective diagnostic validation first, human-in-the-loop second, utility trial third. The changes are where it runs, how consent works, and what FDA pathway to expect.
+Stage
+Size
+Purpose
+Exit criterion
+Change from source
+P0 FDA Pre-Sub
+—
+Agree intended use, reference standard, pivotal design
+Written FDA feedback
+Expect De Novo; HEEDB results can be cited as literature but not submitted as data
+P1 Silent run-in
+100–200 consecutive, 1–2 sites
+Prove enrollment, timing, QC, adjudication and latency work
+≥80% of eligible patients captured with usable EEG
+Sites must already use rapid EEG for AMS as standard care
+P2 Multicenter silent validation
+1,500–3,000 consecutive, 5–10 sites
+Decisive test: frozen model, clinician differential captured at t0, posteriors at 20 s to 10 min
+H2-style Δ below 0 at sites never used in training; calibration slope 0.8–1.2
+Embed a paired rapid-vs-conventional EEG substudy in a subset
+P3 Human-in-the-loop
+100–300
+Display, anchoring, abstention use, safety events (DECIDE-AI)
+No signal of harmful anchoring; usability findings resolved
+Human-factors work counts as regulatory evidence
+P4 Utility RCT
+Powered on endpoint
+Indication-specific benefit (SPIRIT-AI / CONSORT-AI)
+Prespecified clinical endpoint met
+Endpoint chosen from P2's strongest actionable signal
+Why rapid-EEG sites. Consecutive enrollment with EEG inside 30–60 minutes is not achievable with conventional EEG at most hospitals. Where rapid EEG is already ordered for AMS, the research adds only data capture and a hidden model. That makes a waiver or alteration of consent far more plausible than research-only EEG on incapacitated patients, which needs surrogate consent and biases who gets enrolled.
+Regulatory framing. The nearest classification, 21 CFR 882.1450, covers only structural injury in trauma, so a multi-etiology aid is likely a new De Novo classification. Frame the first claim narrowly as an adjunctive aid that estimates probabilities of predefined etiologic families, never as a diagnosis. Use a Predetermined Change Control Plan if the model will update after authorization, and run design controls under the QMSR from the first commercial line of code.
+De-risked means P2 shows four things at once: it works in consecutive patients, at hospitals never used in training, beyond what clinicians already know, with probabilities calibrated well enough to say both "likely" and "I don't know".
+Data acquisition manifest
+Access is no longer the bottleneck; corpus assembly is. Pull metadata first for every dataset, record exact version and size in the Phase 0 inventory, and never run a recursive sync of the HEEDB or BIND root.
+Dataset
+Version
+Lineage
+Role in this plan
+Access
+Next action
+HEEDB
+v4.1
+Research-only
+Study 1 discovery cohort
+Verify in BDSP
+Metadata pull; Phase 0 field audit
+BIND
+v1.0
+Research-only
+Imaging evidence for E1 labels and packets
+Verify in BDSP
+Pull pathology labels and report metadata for candidates only
+MORGOTH
+1.0.0
+Research-only
+Representation ladder; exposure split files
+Verify in BDSP
+Download weights and splits; build exposure ledger
+NESI
+1.0.0
+Research-only
+Severity covariate in Baseline A
+Verify in BDSP
+Confirm DUA; extract severity scores for candidates
+GCS-from-EHR tools
+1.0.0
+Research-only
+Severity phenotype where GCS is unstructured
+Verify in BDSP
+Confirm access; test on pilot cases
+Toxic-metabolic encephalopathy cohort
+1.0.0
+Research-only
+Study 2 E5 vs E3 test
+Verify in BDSP
+Confirm DUA; keep untouched until model freeze
+I-CARE
+2.0
+Research-only (restricted)
+Study 2 E2 stress test
+Verify in BDSP
+Confirm restricted DUA is active
+SPaRCNet
+1.1
+Research-only (restricted)
+E3 positive control
+Verify in BDSP
+Confirm restricted DUA is active
+PROPHET
+1.0
+Research-only
+Optional EHR phenotyping aid for silver labels
+Hold
+Low priority; only if silver labeling stalls
+TUEG + TUAB, TUSZ, TUEV, TUAR
+Record at download
+Commercial candidate (counsel review)
+Encoder corpus; E3 control; contaminated for CBraMod benchmarks
+Have access
+Inventory sizes; rsync subsets before full TUEG
+TDBRAIN
+V3.1
+Commercial candidate
+Out-of-domain robustness
+Have access
+Download; log DUA version
+CBraMod public checkpoint
+Record hash
+Commercial candidate (review)
+Study 1 frozen embeddings; option C1
+Have access
+Hash; trace training data; counsel review
+CERTA EEG + 14 original etiologies
+—
+Terms to negotiate
+Study 2 external validation
+Outreach
+Outreach package from handoff §23.3
+2024 Korean NCSE / metabolic / benzodiazepine cohort
+—
+Terms to negotiate
+Study 2 replication
+Outreach
+Email corresponding authors
+NMT
+NEMAR release
+Yellow (share-alike)
+Possible encoder diversity
+Hold
+Hold until counsel review
+VitalDB
+PhysioNet 1.0.0
+Yellow (conflicting terms)
+Not needed for this project
+Hold
+Hold
+MIMIC and eICU stay off the list: they lack the raw clinical EEG pairing this project needs. CLEF stays off until its weights are confirmed to exist and be obtainable under BDSP terms.
+Team, labor budget and timeline
+Study 1 needs a small team and roughly 570–850 physician-hours of adjudication. That is not a solo project during residency, so the plan puts the labor with collaborators and keeps the protocol, data engineering and analysis with you.
+Gates sit between phases, and the commercial set-up row does not start unless G2/G3 passes. Treat the dates as a proposal to reset after Phase 0.
+Adjudication budget
+Design
+Gold cases
+Reviews
+Physician-hours
+Handoff as written
+~2,100 (800 development, 1,000 evaluation, ~300 enriched)
+~4,725
+1,180–1,970 at 15–25 min
+This plan
+~1,700 (400 development, 1,000 evaluation, ~300 enriched)
+~3,405
+850–1,420 at 15–25 min
+This plan with pre-assembled packets
+~1,700
+~3,405
+570–850 at 10–15 min
+Assumptions: an enriched set of ~300, a 25% third-reader rate, and development cases single-read with 20% double-read. The development set shrinks because silver labels do the training; gold development cases only calibrate and select models. The pilot replaces every assumed minute with a measured one.
+Team
+Role
+Owns
+Commitment
+Lead (you)
+Protocol, data engineering, analysis, writing
+Ongoing
+Senior EEG or neurocritical-care co-investigator, ideally BDSP-affiliated
+Ontology, E3 adjudication, credibility with reviewers
+Advisory
+Biostatistician
+Sample size, proper scoring, bootstrap design, preregistration
+Part-time
+Adjudicator pool: 6–10 neurology, neurocritical-care, EM or IM trainees and fellows
+Gold labels, about 60–140 h each
+Authorship
+Counsel and tech transfer
+Rights ledger, IP, entity formation
+As needed
+Go/no-go gates and risk register
+Every gate has a defined fallback, so a "no" still produces a publishable result rather than a dead end.
+Gate
+Passes when
+If it fails
+G0 Feasibility
+All "Stop" rows of the field audit pass; pilot kappa ≥0.6 in ≥4 families; ≥3 families at ≥10% prevalence
+Redesign around a smaller cohort or CERTA collaboration; no full study
+G2 Etiologic information
+H1 met; survives severity matching and sedative adjustment; ≥3 primary families improve individually
+1–2 families: narrow product (e.g. E1/E2 triage). None: publish the boundary map and stop the commercial track
+G3 Clinical increment
+H2 met at every held-out site
+Academic paper only, unless H5 shows a clear early-EEG gain worth a narrower prospective test
+G4 Deployable EEG
+Hairline geometry keeps ≥70% of full-montage Δ, and ≤2 minutes keeps ≥70% of the 10-minute Δ
+Conventional-EEG software product only
+G5 Prospective (P2)
+The four de-risking conditions in the prospective program
+No FDA submission; reassess indication
+Risk
+Early signal
+Mitigation
+HEEDB lacks result and administration timestamps
+Phase 0 field audit
+Approximate-time fallback; 1B labeled approximate; prospective study answers it properly
+Adjudication labor never materializes
+Pilot minutes per case; adjudicator sign-ups
+Authorship-based adjudicator pool; pre-assembled packets; evaluation N set by formal sample-size calculation, not habit
+Silver labels leak EEG interpretation
+Circularity audit
+Exclusion rules; rebuild labels on objective anchors
+Signal is depth and sedation only
+H3 severity-matched result
+That is the boundary-map paper; still publishable
+Restricted data reaches a hosted model
+Any agent session touching real tables
+Phase 0e rules; synthetic schema; aggregate-only outputs
+Scooped by the group that built HEEDB
+Novelty sweep; conference abstracts
+Offer collaboration early
+Employer claims the IP
+Contract review in Phase 0
+Resolve before any disclosure, entity or license
+A rapid-EEG vendor builds this first
+New clearances in acute-care EEG AI
+Position as software on their hardware; partner rather than race
+Large commercial-clean gap
+Study 1 CBraMod vs MORGOTH
+Option C3: continued pretraining on licensed acute-care EEG
+Clinical training schedule stalls the work
+Missed milestones
+Scope to Studies 1A and 1B first; collaborators own adjudication
+Next 30 days
+The next month is about proving the data can support Study 1B and protecting future options; no modeling yet.
+In BDSP, confirm which project DUAs are active: HEEDB, BIND, MORGOTH, NESI, TME cohort, GCS-from-EHR, and the restricted DUA for I-CARE and SPaRCNet.
+Set up the agent-safety rules: a synthetic HEEDB-schema dataset for Claude Code, aggregate-only outputs, restricted jobs run outside agent sessions.
+Pull HEEDB metadata and run the Phase 0 field audit.
+Read the IP clauses in your current and incoming residency agreements; send one question to the incoming institution's tech-transfer office.
+Run the 2024–2026 novelty sweep.
+Draft three outreach emails: a collaboration note to the BDSP group, the CERTA package from handoff §23.3, and the Korean cohort authors.
+Recruit a biostatistician and two pilot adjudicators.
+Pull TUEG subsets under your existing access; hash the CBraMod checkpoint.
+Issue handoff v1.1 with this plan's changes, each logged in DECISION_LOG.md as decided before any outcome was seen.
+Sources
+Sorting Hat master handoff v1.0 (29 Sep 2026) and the four source research notes provided with it.
+Ceribell: FDA clearance for epileptiform abnormality detection and artifact reduction, 10 Aug 2026
+eCFR, 21 CFR Part 882 Subpart B, including §882.1450
+FDA product classification PIW, brain injury adjunctive interpretive EEG assessment aid
