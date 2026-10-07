@@ -173,7 +173,7 @@ def test_all_channels_invalid_scaling_is_its_own_failure_reason(tmp_path, eeg_uv
                       phys_min=0, phys_max=0)
     with pytest.raises(EDFError, match="invalid channel scaling"):
         read_edf(p)
-    r = stream_features(FakeS3({KEY: p.read_bytes()}), KEY, bucket=BUCKET, sleep=lambda s: None, windows=SHORT)
+    r = stream_features(FakeS3({KEY: p.read_bytes()}), KEY, bucket=BUCKET, sleep=lambda s: None, windows=SHORT, onset_search=False)
     assert r.reason == FailureReason.INVALID_SCALING and not r.retryable
     assert FailureReason.INVALID_SCALING in FailureReason.PERMANENT
 
@@ -200,7 +200,7 @@ def test_stream_reports_dead_and_missing_counts(tmp_path, eeg_uv):
     labels = [f"EEG {c}-Ref" for c in CANONICAL_19 if c != "O2"]
     p = write_edf_raw(tmp_path / "s.edf", np.delete(dig, CANONICAL_19.index("O2"), axis=0), labels, FS,
                       phys_min=-R, phys_max=R)
-    r = stream_features(FakeS3({KEY: p.read_bytes()}), KEY, bucket=BUCKET, sleep=lambda s: None, windows=SHORT)
+    r = stream_features(FakeS3({KEY: p.read_bytes()}), KEY, bucket=BUCKET, sleep=lambda s: None, windows=SHORT, onset_search=False)
     assert r.ok and (r.n_dead_min, r.n_missing_min, r.n_invalid_min) == (1, 1, 0)
     assert DEFAULT_MINIMUM_CHANNELS == ("Fp1", "Fp2", "F7", "F8", "T3", "T4", "T5", "T6", "O1", "O2")
     prim = next(x for x in r.rows if x["window"] == "w")

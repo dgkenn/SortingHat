@@ -159,7 +159,7 @@ def test_recording_ending_before_window_is_too_short(tmp_path):
     x = generate_eeg(40, background="normal", seed=2)
     p = write_edf(tmp_path / "t.edf", x, 200, CANONICAL_19)
     s3 = FakeS3({KEY: p.read_bytes()})
-    r = stream_features(s3, KEY, bucket=BUCKET, sleep=_no_sleep)
+    r = stream_features(s3, KEY, bucket=BUCKET, sleep=_no_sleep, onset_search=False)     # 40 s: no 60-s live segment either
     assert (not r.ok) and r.reason == FailureReason.TOO_SHORT and not r.retryable
 
 

@@ -131,17 +131,20 @@ an optional `numba` step is a possible later optimisation. Install the optional 
 * **Streaming summary** now also prints counts of recordings with a missing / dead / zero-calibration minimum-set channel and the
   number recovered by the key fallback (by pattern name).
 
-### t0 = EEG signal onset (D-108)
+### t0 = start of the first sustained live segment (D-109, supersedes D-108)
 
-HEEDB files can start with constant padding (setup / gap), so the file start is not the EEG start. `stream.find_signal_onset`
-finds the first 10-s block (grid from the file start) with >= 8 of the 10 required electrodes non-constant (digital samples),
-within the first 120 min. It fetches one block per minute with ranged GETs and scans the minute before the first hit in full, so
-long padding costs about a sixth of its bytes (a burst shorter than 50 s lying entirely between two probes in the padding would be
-missed). No onset -> failure `no_signal_onset` (permanent). `stream_features` places every window relative to the onset
-(primary = onset + 1 to onset + 11 min); `StreamResult.onset_s` and the `onset_offset_s` column of the local_only feature parts
-hold the offset in seconds from the FILE start (per recording, never printed; stdout shows quantiles). **The cohort / feature join
-must use t0 = metadata start + onset offset**; `stream.onset_offset_s(s3, key)` returns the offset alone (None = excluded).
-`--no-onset` on the extractor restores file-start windows.
+HEEDB files can start with constant padding or a short live blip followed by a hold, so the file start is not the EEG start
+(a pyedflib cross-check on real data showed the reader is exact; the constant epochs are genuine). `stream.find_signal_onset`
+returns the first 60-s period (10-s grid from the file start) in which at least 8 of the 10 required electrodes are non-constant
+(digital samples) in at least 90% of their 2-s epochs (27 of 30), searched within the first 120 min. The search is exact and cheap:
+every window contains exactly one probe block (one 10-s block per minute), and a qualifying channel has at most 3 constant epochs,
+so a probe block with fewer than 8 channels having >= 2 non-constant epochs (of 5) cannot belong to a qualifying window. Only a probe
+that passes is refined (its 6 candidate windows are fetched once and tested exactly, in order), so long padding costs about a sixth
+of its bytes. None -> failure `no_sustained_signal` (permanent). `stream_features` places every window relative to t0 (primary =
+t0 + 1 to t0 + 11 min); `StreamResult.onset_s` and the `onset_offset_s` column of the local_only feature parts hold the offset in
+seconds from the FILE start (per recording, never printed; stdout shows quantiles). **The cohort / feature join must use
+t0 = metadata start + onset offset**; `stream.onset_offset_s(s3, key)` returns the offset alone (None = excluded). `--no-onset`
+on the extractor restores file-start windows.
 
 ### Diagnostics (human-run, aggregates only)
 
@@ -150,15 +153,15 @@ HEEDB_AWS_PROFILE=<profile> python3 scripts/diag_eeg_paths.py   --site S0001 --n
 HEEDB_AWS_PROFILE=<profile> python3 scripts/diag_eeg_signals.py --site S0001 --n 60 --seed 0
 ```
 
-`diag_eeg_signals.py` reports both the file-start window and the window after the signal onset: onset-offset quantiles (minutes),
-the number with no onset within 120 min, the exactly-constant epoch share per electrode after onset, and for recordings whose
+`diag_eeg_signals.py` reports both the file-start window and the window after t0: t0-offset quantiles (minutes), the number with
+no sustained segment within 120 min, the post-fix usable-fraction quantiles and pass count, the exactly-constant epoch share per electrode after onset, and for recordings whose
 usable fraction is still below 0.6 a breakdown by QC rule (flat / clipping / extreme > 500 uV / line noise / disconnected, as the
 mean share of minimum-set cells), required-channel amplitude (std, 99th percentile of |x - median|, uV) and line-noise-ratio
 quantiles. Everything is aggregate-only.
 
 It also reports reader cross-checks: the number of recordings with heterogeneous samples per record, with an EDF+ annotation
 signal, the required channels' calibration strings (dimension, pmin, pmax, dmin, dmax), the share of constant epochs sitting at the
-header digital rail vs zero vs another value, whether the onset is sustained (share of the next six 10-s blocks active), and
+header digital rail vs zero vs another value, and
 `pyedflib_crosscheck`: our ranged decode vs pyedflib on the same in-memory records (an anonymous memfd, never a disk file), as
 quantiles of max |difference| (uV) and correlation. `tests/test_edf_multirate.py` proves exact agreement on synthetic EDFs with
 EEG 256 Hz, ECG 512 Hz, osat 1/record, DC 8 Hz and an annotation signal, record duration 1 s and 0.5 s.

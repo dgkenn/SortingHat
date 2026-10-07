@@ -254,7 +254,7 @@ def write_edf_raw_bytes(dig, _cache={}):
 def onset_bucket():
     blobs = {
         0: _padded_blob([("sig", 760)]),
-        1: _padded_blob([("pad", 120), ("sig", 760)]),
+        1: _padded_blob([("sig", 15), ("pad", 105), ("sig", 760)]),     # a short live blip, a hold, then the recording
         2: _padded_blob([("pad", 300), ("sig", 100), ("pad", 400), ("sig", 200)]),    # signal, then a mid-file gap
         3: _padded_blob([("pad", 400)]),                                              # never any signal
     }
