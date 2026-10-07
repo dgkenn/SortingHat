@@ -55,6 +55,7 @@ class FailureReason:
     DISCONTINUOUS = "edf_discontinuous"
     NO_EEG_CHANNELS = "no_eeg_channels"
     UNSUPPORTED_UNITS = "edf_unsupported_units"
+    NO_SIGNAL_ONSET = "no_signal_onset"          # no 10-s block with >= 8 of the 10 required electrodes non-constant
     INVALID_SCALING = "edf_invalid_scaling"      # every EEG channel has a zero physical / digital range
     DECODE_ERROR = "edf_decode_error"
     TOO_SHORT = "recording_too_short"        # no data records at or after the window start
@@ -62,7 +63,7 @@ class FailureReason:
     PROCESSING_ERROR = "processing_error"
 
     PERMANENT = frozenset({NOT_FOUND, ACCESS_DENIED, AUTH_ERROR, S3_CLIENT_ERROR, HEADER_INVALID, DISCONTINUOUS,
-                           NO_EEG_CHANNELS, UNSUPPORTED_UNITS, INVALID_SCALING, DECODE_ERROR, TOO_SHORT, TOO_LARGE})
+                           NO_EEG_CHANNELS, UNSUPPORTED_UNITS, INVALID_SCALING, NO_SIGNAL_ONSET, DECODE_ERROR, TOO_SHORT, TOO_LARGE})
 
 
 ALL_REASONS = tuple(v for k, v in vars(FailureReason).items() if k.isupper() and isinstance(v, str))
@@ -372,20 +373,8 @@ class RawWindow:
         return np.frombuffer(self.data[: n * self.hdr.record_bytes], dtype="<i2").reshape(n, -1)
 
 
-def fetch_raw_window(s3, key: str, start_s: float, duration_s: float, *, bucket: str | None = None,
-                     deadline: Deadline | None = None, stats: FetchStats | None = None,
-                     max_attempts: int = DEFAULT_MAX_ATTEMPTS, backoff_s: float = 1.0, max_backoff_s: float = 30.0,
-                     sleep=time.sleep, rand=random.random, chunk_bytes: int = CHUNK_BYTES,
-                     max_fetch_bytes: int = MAX_FETCH_BYTES, allow_discontinuous: bool = False) -> RawWindow:
-    """Ranged-read the EDF header and the data records covering ``[start_s, start_s + duration_s)``. Raises
-    ``_StreamError`` / ``RecordingTimeout`` only. ``allow_discontinuous`` is for diagnostics (header counts)."""
-    if bucket is None:
-        from ..data_io import access_point
-        bucket = access_point()
-    deadline = deadline or Deadline(None)
-    stats = stats if stats is not None else FetchStats()
-    rg = _Ranged(s3, bucket, key, deadline, stats, max_attempts, backoff_s, max_backoff_s, sleep, rand)
-
+def _read_header(rg: "_Ranged", stats: FetchStats, allow_discontinuous: bool = False) -> tuple[EDFHeader, bytes, int]:
+    """Ranged-read and parse the EDF header: ``(header, header bytes, record count actually present)``."""
     head = rg.get(0, HEADER_PROBE_BYTES - 1)
     if len(head) < 256:
         raise _StreamError(FailureReason.HEADER_INVALID)
@@ -412,6 +401,23 @@ def fetch_raw_window(s3, key: str, start_s: float, duration_s: float, *, bucket:
             raise _StreamError(FailureReason.HEADER_INVALID)
         hdr.n_records = avail
     n_eff = hdr.n_records if avail is None else min(hdr.n_records, avail)
+    return hdr, head, n_eff
+
+
+def fetch_raw_window(s3, key: str, start_s: float, duration_s: float, *, bucket: str | None = None,
+                     deadline: Deadline | None = None, stats: FetchStats | None = None,
+                     max_attempts: int = DEFAULT_MAX_ATTEMPTS, backoff_s: float = 1.0, max_backoff_s: float = 30.0,
+                     sleep=time.sleep, rand=random.random, chunk_bytes: int = CHUNK_BYTES,
+                     max_fetch_bytes: int = MAX_FETCH_BYTES, allow_discontinuous: bool = False) -> RawWindow:
+    """Ranged-read the EDF header and the data records covering ``[start_s, start_s + duration_s)``. Raises
+    ``_StreamError`` / ``RecordingTimeout`` only. ``allow_discontinuous`` is for diagnostics (header counts)."""
+    if bucket is None:
+        from ..data_io import access_point
+        bucket = access_point()
+    deadline = deadline or Deadline(None)
+    stats = stats if stats is not None else FetchStats()
+    rg = _Ranged(s3, bucket, key, deadline, stats, max_attempts, backoff_s, max_backoff_s, sleep, rand)
+    hdr, head, n_eff = _read_header(rg, stats, allow_discontinuous)
     plan = plan_window(hdr, start_s, duration_s, n_eff)
     if plan is None:
         raise _StreamError(FailureReason.TOO_SHORT)
