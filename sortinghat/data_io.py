@@ -204,6 +204,43 @@ def list_keys(s3, prefix: str, *, bucket: str | None = None, suffix: str | None 
     return sorted(keys)
 
 
+# A name is "id-like" when it could be a patient/session/date identifier. Such names are never printed.
+_ID_LIKE_RE = re.compile(r"(^|[^A-Za-z])(sub|ses)-|\d{5,}|^\d+/?$|[0-9a-f]{12,}|\d{4}[-_]\d{2}[-_]\d{2}", re.I)
+ID_LIKE = "<id-like name>"
+MAX_LEVEL_ITEMS = 40          # a level with more prefixes than this is not listed at all (population-like)
+
+
+_PART_RE = re.compile(r"^part-\d{5}(\.\w+)?$")      # generic parquet part numbering is not an identifier
+
+
+def looks_id_like(name: str) -> bool:
+    return not _PART_RE.match(name) and bool(_ID_LIKE_RE.search(name))
+
+
+def list_level(s3, prefix: str = "", *, bucket: str | None = None, max_items: int = MAX_LEVEL_ITEMS) -> dict:
+    """One metadata level under ``prefix`` (``Delimiter='/'``): names of child prefixes and files, NAMES ONLY.
+
+    Id-like names are replaced by ``<id-like prefix>`` / ``<id-like file>``. A level with more than
+    ``max_items`` prefixes (or files) is reported as ``overflow`` with NO names (it looks like a population
+    of per-patient folders), and nothing beneath it is ever listed. No counts are returned.
+    """
+    bucket = bucket or access_point()
+    resp = s3.list_objects_v2(Bucket=bucket, Prefix=prefix, Delimiter="/", MaxKeys=1000)
+    cps = [c["Prefix"] for c in resp.get("CommonPrefixes", [])]
+    files = [o["Key"] for o in resp.get("Contents", []) if o["Key"] != prefix]
+    out: dict[str, Any] = {"prefix": prefix, "prefixes": [], "files": [], "prefixes_overflow": False,
+                           "files_overflow": False}
+    if len(cps) > max_items or (resp.get("IsTruncated") and len(cps) >= max_items):
+        out["prefixes_overflow"] = True
+    else:
+        out["prefixes"] = [c if not looks_id_like(c[len(prefix):]) else prefix + "<id-like prefix>/" for c in cps]
+    if len(files) > max_items or resp.get("IsTruncated") and len(files) >= max_items:
+        out["files_overflow"] = True
+    else:
+        out["files"] = [f if not looks_id_like(f[len(prefix):]) else prefix + "<id-like file>" for f in files]
+    return out
+
+
 def resolve_key(s3, table: str, site: str | None = None, *, bucket: str | None = None) -> str:
     """Resolve a CSV table name (and site, for per-site tables) to one object key."""
     spec = TABLES[table]
@@ -370,7 +407,22 @@ class LocalStore:
             raise ValueError("key escapes the data root")
         return p
 
-    def list_objects_v2(self, Bucket=None, Prefix: str = "", MaxKeys: int = 1000, ContinuationToken=None):
+    def list_objects_v2(self, Bucket=None, Prefix: str = "", MaxKeys: int = 1000, ContinuationToken=None,
+                        Delimiter: str | None = None):
+        if Delimiter:                                     # one level only, like S3 (CommonPrefixes + Contents)
+            base = self._path(Prefix.rstrip("/")) if Prefix.endswith("/") else self._path(Prefix.rsplit("/", 1)[0]) \
+                if "/" in Prefix else self.root
+            cps, files = [], []
+            if base.is_dir():
+                for f in sorted(base.iterdir()):
+                    k = f.relative_to(self.root).as_posix()
+                    if not k.startswith(Prefix):
+                        continue
+                    if f.is_dir():
+                        cps.append({"Prefix": k + "/"})
+                    else:
+                        files.append({"Key": k})
+            return {"CommonPrefixes": cps, "Contents": files, "IsTruncated": False}
         base = self._path(Prefix.rsplit("/", 1)[0]) if "/" in Prefix else self.root
         keys: list[str] = []
         if base.is_dir():

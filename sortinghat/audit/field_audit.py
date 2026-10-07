@@ -482,7 +482,16 @@ def to_markdown(report: dict) -> str:
 
 
 # ---------------------------------------------------------------- schema dry run (names only)
-def probe_schema(s3, sites: list[str] | None = None) -> dict:
+MAX_UNLISTED_NAMES = 300
+
+
+def _safe_names(names: list[str]) -> list[str]:
+    """Column names safe to print: id-like names are masked, the list is capped (names only, never values)."""
+    out = [n if not data_io.looks_id_like(n) else "<id-like column>" for n in names[:MAX_UNLISTED_NAMES]]
+    return out + (["<more columns not listed>"] if len(names) > MAX_UNLISTED_NAMES else [])
+
+
+def probe_schema(s3, sites: list[str] | None = None, *, list_unlisted: bool = False) -> dict:
     """Which expected tables/columns exist, by NAME ONLY (CSV header line / parquet footer; no values, no
     rows). One unit per table (per site for per-site CSV tables). Safe to emit: contains table, site and
     column names only."""
@@ -509,6 +518,9 @@ def probe_schema(s3, sites: list[str] | None = None) -> dict:
                                     "closest_actual_name": (difflib.get_close_matches(c, actual, 1, 0.6) or [None])[0]}
                                    for c, _, prov, _ in exp if c not in have]
                 unit["n_unlisted_columns"] = len(have - {c for c, *_ in exp})
+                if list_unlisted:                 # names in file order, names only
+                    known = {c for c, *_ in exp}
+                    unit["unlisted_columns"] = _safe_names([c for c in actual if c not in known])
             units.append(unit)
     def _n(prov):
         return sum(1 for u in units for m in u.get("missing", []) if m["provenance"] == prov)
@@ -516,6 +528,56 @@ def probe_schema(s3, sites: list[str] | None = None) -> dict:
             "n_tables_not_found": sum(1 for u in units if not u["found"]),
             "n_missing_confirmed": _n(schema.CONFIRMED), "n_missing_named": _n(schema.NAMED),
             "n_missing_assumed": _n(schema.ASSUMED), "still_unknown": schema.UNKNOWN_FIELDS}
+
+
+PREFIX_PROBES = (("", 2), ("Imaging/", 2))      # (start prefix, levels to list); root => depth <= 2 overall
+NEVER_DESCEND = {"bids"}                       # per-patient BIDS data folders: never list inside
+
+
+def probe_prefixes(s3, *, bucket: str | None = None) -> list[dict]:
+    """Metadata-level prefix names (``Delimiter='/'``) at the access point root (depth <= 2) and under
+    ``Imaging/`` (first two levels). NAMES ONLY: no per-patient folder is ever listed (id-like names are masked
+    and not descended into, a level with too many prefixes is reported as overflow without names, and
+    ``bids`` folders are never entered). Returns one entry per listed prefix."""
+    out: list[dict] = []
+
+    def walk(prefix: str, levels: int):
+        lvl = data_io.list_level(s3, prefix, bucket=bucket)
+        out.append(lvl)
+        if levels <= 1 or lvl["prefixes_overflow"]:
+            return
+        for child in lvl["prefixes"]:
+            name = child[len(prefix):].rstrip("/")
+            if "<id-like" in child or name.lower() in NEVER_DESCEND:
+                continue
+            walk(child, levels - 1)
+
+    for start, levels in PREFIX_PROBES:
+        walk(start, levels)
+    seen, uniq = set(), []
+    for e in out:
+        if e["prefix"] not in seen:
+            seen.add(e["prefix"])
+            uniq.append(e)
+    return uniq
+
+
+def prefix_markdown(levels: list[dict]) -> list[str]:
+    L = ["", "## Access point prefixes (names only; Delimiter='/', depth <= 2; per-patient folders never listed)", ""]
+    for e in levels:
+        L.append(f"- `{e['prefix'] or '<root>'}`")
+        if e["prefixes_overflow"]:
+            L.append("    - <more than %d child prefixes: looks like a population of folders, not listed or descended>"
+                     % data_io.MAX_LEVEL_ITEMS)
+        for c in e["prefixes"]:
+            L.append(f"    - prefix `{c[len(e['prefix']):]}`")
+        if e["files_overflow"]:
+            L.append("    - <too many files at this level to list>")
+        for f in e["files"]:
+            L.append(f"    - file `{f[len(e['prefix']):]}`")
+        if not (e["prefixes"] or e["files"] or e["prefixes_overflow"] or e["files_overflow"]):
+            L.append("    - (empty)")
+    return L
 
 
 def dry_run_markdown(rep: dict) -> str:
@@ -542,6 +604,14 @@ def dry_run_markdown(rep: dict) -> str:
             any_missing = True
     if not any_missing:
         L.append("- none")
+    if any("unlisted_columns" in u for u in rep["units"]):
+        L += ["", "## Unlisted columns (present in the real header, not in schema.py; names only)", ""]
+        for u in rep["units"]:
+            if u.get("unlisted_columns"):
+                L.append(f"- {u['table']}{' / ' + u['site'] if u['site'] else ''}: "
+                         + ", ".join(f"`{c}`" for c in u["unlisted_columns"]))
+    if rep.get("prefixes") is not None:
+        L += prefix_markdown(rep["prefixes"])
     L += ["", "## Still unknown (no column named anywhere in the source)", ""] + [f"- {x}" for x in rep["still_unknown"]]
     return "\n".join(L) + "\n"
 
@@ -557,6 +627,11 @@ def main(argv: list[str] | None = None) -> int:
     ap.add_argument("--out", help="output directory (required unless --dry-run-schema)")
     ap.add_argument("--dry-run-schema", action="store_true",
                     help="report which expected tables/columns exist vs missing (names only) and exit")
+    ap.add_argument("--list-unlisted", action="store_true",
+                    help="with --dry-run-schema: also print the NAMES of columns present but not in schema.py")
+    ap.add_argument("--probe-prefixes", action="store_true",
+                    help="with --dry-run-schema: also list metadata-level prefix names (Delimiter='/') at the "
+                         "access point root and under Imaging/ (names only; per-patient folders never listed)")
     ap.add_argument("--seed", type=int, default=0, help="seed for the hand-check sample")
     ap.add_argument("--handcheck-n", type=int, default=HANDCHECK_N)
     ap.add_argument("--strict", action="store_true",
@@ -564,13 +639,17 @@ def main(argv: list[str] | None = None) -> int:
     a = ap.parse_args(argv)
     if not a.dry_run_schema and not a.out:
         ap.error("--out is required unless --dry-run-schema")
+    if (a.list_unlisted or a.probe_prefixes) and not a.dry_run_schema:
+        ap.error("--list-unlisted / --probe-prefixes are options of --dry-run-schema")
 
     if a.data:
         agent_safety.assert_not_restricted_in_agent(a.data)
     s3 = data_io.open_store(a.data, profile=a.profile)       # make_client refuses inside an agent session
 
     if a.dry_run_schema:
-        rep = probe_schema(s3, a.sites)
+        rep = probe_schema(s3, a.sites, list_unlisted=a.list_unlisted)
+        if a.probe_prefixes:
+            rep["prefixes"] = probe_prefixes(s3)
         text = dry_run_markdown(rep)
         if a.out:
             safe_write_json(Path(a.out) / "schema_dry_run.json", rep)
