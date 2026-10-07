@@ -2,8 +2,8 @@
 
 On disk the layout mirrors the BDSP access point (see ``sortinghat.data_io.TABLES``)::
 
-    EEG/eeg-metadata/<SITE>_eeg_metadata_2026_04_30.csv
-    EEG/HEEDB_Metadata/<SITE>_EEG__reports_findings.csv
+    EEG/eeg-metadata/<SITE>_eeg_metadata_2026_04_30.csv          (header = that site's REAL variant)
+    EEG/HEEDB_Metadata/<SITE>_EEG__reports_findings.csv          (not written for I0008 / I0009)
     EEG/HEEDB_Metadata/{HEEDB_patients,HEEDB_ICD10_for_Neurology,HEEDB_Medication_ATC}.csv
     OMOP/Merged/<table>/part-0000N.parquet
     Imaging/imaging_metadata/part-00000.parquet     (ASSUMED location)
@@ -67,10 +67,15 @@ def write_tables(tables: dict[str, pd.DataFrame], outdir: str | Path, fmt: str =
         df = _as_text(name, raw)
         if name == "eeg_metadata":
             for site, g in df.groupby("SiteID", sort=True):
+                g = data_io.denormalise_site_table(name, str(site), g)        # the site's real header, real names
                 paths.append(_write_csv(g, root / f"{data_io.EEG_METADATA_PREFIX}{site}_eeg_metadata_{RELEASE}.csv"))
         elif name == "reports_findings":
             sites = df["SessionID"].map(site_of_session)
             for site, g in df.groupby(sites, sort=True):
+                v = schema.variant_for(str(site))
+                if v is not None and v.reports_findings is None:
+                    continue                                                  # this site has no reports_findings file
+                g = data_io.denormalise_site_table(name, str(site), g)
                 paths.append(_write_csv(g, root / spec.pattern.format(site=site)))
         elif spec.kind == "csv_global":
             paths.append(_write_csv(df, root / spec.pattern))
@@ -103,7 +108,7 @@ def load_tables(data_dir: str | Path, sites: list[str] | None = None) -> dict[st
             frames = []
             for site in sites:
                 try:
-                    frames.append(data_io.read_csv_table(name, site, s3=s3))
+                    frames.append(data_io.read_site_table(name, site, s3=s3))
                 except FileNotFoundError:
                     continue
             if not frames:

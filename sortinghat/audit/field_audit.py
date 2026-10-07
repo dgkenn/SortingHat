@@ -63,6 +63,67 @@ def person_ids(meta: pd.DataFrame, site: str) -> pd.Series:
     return direct.fillna(from_bids).astype("Int64")
 
 
+def meta_age(meta: pd.DataFrame) -> pd.Series:
+    """Age in years from a site's eeg_metadata, whichever of the real variants it is: ``AgeAtVisit`` (S-sites, I0002,
+    I0003; largely empty), else ``AgeInDaysAtVisit / 365.25`` (I0003), else ``StartTime - DateOfBirth`` (I0008 and
+    I0009 have no AgeAtVisit column; their dates are shifted per patient, assumed consistently with DateOfBirth)."""
+    age = pd.to_numeric(meta["AgeAtVisit"], errors="coerce") if "AgeAtVisit" in meta else \
+        pd.Series(np.nan, index=meta.index, dtype=float)
+    if "AgeInDaysAtVisit" in meta:
+        age = age.fillna(pd.to_numeric(meta["AgeInDaysAtVisit"], errors="coerce") / 365.25)
+    if {"DateOfBirth", "StartTime"} <= set(meta):
+        age = age.fillna((meta["StartTime"] - meta["DateOfBirth"]).dt.total_seconds() / (365.25 * 86400.0))
+    return age
+
+
+VISIT_CLASS = {32037: "ICU", 9201: "Inpatient", 9203: "ED", 9202: "Outpatient"}      # standard OMOP visit concepts
+_VISIT_TEXT = ((re.compile(r"\bicu\b|intensive|critical", re.I), "ICU"),
+               (re.compile(r"emerg|\bed\b|\ber\b", re.I), "ED"),
+               (re.compile(r"outpat|ambul|clinic|office", re.I), "Outpatient"),
+               (re.compile(r"inpat|admit|hospital", re.I), "Inpatient"))
+
+
+def visit_class(concept_id, source_value) -> str | None:
+    """Care setting of a visit: from ``visit_concept_id`` when it is a known OMOP concept (it can be zero-filled),
+    else by keyword from ``visit_source_value``; ``None`` when neither says."""
+    if pd.notna(concept_id) and int(concept_id) in VISIT_CLASS:
+        return VISIT_CLASS[int(concept_id)]
+    if isinstance(source_value, str):
+        for pat, label in _VISIT_TEXT:
+            if pat.search(source_value):
+                return label
+    return None
+
+
+def derive_patient_class(eeg: pd.DataFrame, visits: pd.DataFrame) -> pd.Series:
+    """``PatientClass`` for each EEG session, derived from ``omop_visit_occurrence`` (no real eeg_metadata header has
+    PatientClass): the visit of the same person with the latest ``visit_start_datetime`` <= the EEG start, kept
+    only if it has not ended before the EEG started. Index = ``eeg`` index; unmatched sessions are ``None``."""
+    out = pd.Series(None, index=eeg.index, dtype=object)
+    need = {"person_id", "visit_start_datetime"}
+    if not len(visits) or not need <= set(visits):
+        return out
+    e = eeg[["person_id", "StartTime"]].dropna().assign(_i=lambda d: d.index)
+    v = visits.dropna(subset=["person_id", "visit_start_datetime"]).copy()
+    if not len(e) or not len(v):
+        return out
+    pairs = v[["visit_concept_id", "visit_source_value"]].drop_duplicates() if {"visit_concept_id",
+                                                                                 "visit_source_value"} <= set(v) else None
+    if pairs is None:
+        return out
+    pairs = pairs.assign(_cls=[visit_class(a, b) for a, b in zip(pairs["visit_concept_id"], pairs["visit_source_value"])])
+    v = v.merge(pairs, on=["visit_concept_id", "visit_source_value"], how="left")
+    if "visit_end_datetime" not in v:
+        v["visit_end_datetime"] = pd.NaT
+    e["person_id"], v["person_id"] = e["person_id"].astype("int64"), v["person_id"].astype("int64")
+    mrg = pd.merge_asof(e.sort_values("StartTime"), v.sort_values("visit_start_datetime")[
+        ["person_id", "visit_start_datetime", "visit_end_datetime", "_cls"]],
+        left_on="StartTime", right_on="visit_start_datetime", by="person_id", direction="backward")
+    ok = mrg["visit_end_datetime"].isna() | (mrg["visit_end_datetime"] >= mrg["StartTime"])
+    out.loc[mrg.loc[ok, "_i"].to_numpy()] = mrg.loc[ok, "_cls"].to_numpy()
+    return out
+
+
 def merge_eeg(meta: pd.DataFrame, findings: pd.DataFrame | None, site: str) -> pd.DataFrame:
     """One site's analytic EEG frame: eeg_metadata joined to reports_findings on (person, SessionID).
 
@@ -71,8 +132,8 @@ def merge_eeg(meta: pd.DataFrame, findings: pd.DataFrame | None, site: str) -> p
     """
     m = pd.DataFrame({"SiteID": site, "person_id": person_ids(meta, site),
                       "SessionID": meta["SessionID"].astype("string")})
-    m["AgeAtVisit"] = pd.to_numeric(meta.get("AgeAtVisit"), errors="coerce")
-    m["PatientClass"] = meta["PatientClass"] if "PatientClass" in meta else None       # ASSUMED column
+    m["AgeAtVisit"] = meta_age(meta)
+    m["PatientClass"] = meta["PatientClass"] if "PatientClass" in meta else None       # ASSUMED column (derived on disk)
     m[["StartTime", "EndTime"]] = meta[["StartTime", "EndTime"]] if {"StartTime", "EndTime"} <= set(meta) else pd.NaT
     if findings is not None and len(findings):
         f = pd.DataFrame({"person_id": person_ids(findings, site), "SessionID": findings["SessionID"].astype("string"),
@@ -114,6 +175,8 @@ def from_raw_tables(raw: dict[str, pd.DataFrame]) -> dict[str, pd.DataFrame]:
         fg = rf[rf["SessionID"].astype(str).isin(sess)] if rf is not None else None
         parts.append(merge_eeg(g, fg, str(site)))
     eeg = pd.concat(parts, ignore_index=True)
+    if not eeg["PatientClass"].notna().any() and "omop_visit_occurrence" in raw:     # real files have no PatientClass
+        eeg["PatientClass"] = derive_patient_class(eeg, raw["omop_visit_occurrence"])
     cohort = set(build_candidates(eeg)["person_id"])         # same cohort filter as the streaming loader
     out = {"eeg_metadata": eeg,
            "omop_drug_exposure": filter_drugs(raw["omop_drug_exposure"]),
@@ -134,11 +197,11 @@ def load_audit_tables(s3, sites: list[str] | None = None, avail: dict | None = N
     parts = []
     for site in sites:
         try:
-            meta = data_io.read_csv_table("eeg_metadata", site, s3=s3)
+            meta = data_io.read_site_table("eeg_metadata", site, s3=s3)         # site variant -> canonical names
         except FileNotFoundError:
             continue
         try:
-            rf = data_io.read_csv_table("reports_findings", site, s3=s3)
+            rf = data_io.read_site_table("reports_findings", site, s3=s3)       # absent at I0008 / I0009
         except FileNotFoundError:
             rf = None
         meta = schema.coerce_types("eeg_metadata", meta)
@@ -147,6 +210,16 @@ def load_audit_tables(s3, sites: list[str] | None = None, avail: dict | None = N
     if not parts:
         raise FileNotFoundError("no eeg_metadata CSV found for any site")
     eeg = pd.concat(parts, ignore_index=True)
+    if not eeg["PatientClass"].notna().any():
+        # No real eeg_metadata header has PatientClass: derive it from visit_occurrence for the adult sessions that
+        # have a start time (the acute-care cohort is a subset of these), then apply the acute-care filter.
+        e0 = eeg[(eeg["AgeAtVisit"] >= ADULT_AGE) & eeg["StartTime"].notna() & eeg["person_id"].notna()]
+        pids = [int(p) for p in e0["person_id"].unique()]
+        vcols = ["person_id", "visit_start_datetime", "visit_end_datetime", "visit_concept_id", "visit_source_value"]
+        vb = [b.to_pandas() for b in data_io.iter_omop_batches("visit_occurrence", person_ids=pids, columns=vcols, s3=s3)]
+        if vb:
+            visits = schema.coerce_types("omop_visit_occurrence", pd.concat(vb, ignore_index=True))
+            eeg["PatientClass"] = derive_patient_class(eeg, visits)
     cohort = [int(p) for p in build_candidates(eeg)["person_id"].dropna().unique()]
     out = {"eeg_metadata": eeg}
     result_cols = schema.COLUMN_ALIASES["measurement.result_datetime"]
@@ -173,9 +246,10 @@ def load_audit_tables(s3, sites: list[str] | None = None, avail: dict | None = N
 
 # ---------------------------------------------------------------- helpers
 def acute_adult(eeg: pd.DataFrame) -> tuple[pd.DataFrame, bool]:
-    """Adult EEG sessions in acute care. PatientClass is ASSUMED (not seen in the real tables): when the
-    column is absent or empty the acute-care filter cannot be applied and all adult sessions are used
-    (second return value False; the report says so)."""
+    """Adult EEG sessions in acute care. PatientClass is in NO real eeg_metadata header; the loaders derive it from
+    omop_visit_occurrence (``derive_patient_class``). When the column is absent or empty (no visit matched) the
+    acute-care filter cannot be applied and all adult sessions are used (second return value False; the report
+    says so)."""
     adult = eeg[eeg["AgeAtVisit"] >= ADULT_AGE]
     have_class = "PatientClass" in eeg and bool(eeg["PatientClass"].notna().any())
     return (adult[adult["PatientClass"].isin(ACUTE_CLASSES)] if have_class else adult), have_class
@@ -506,9 +580,12 @@ def probe_schema(s3, sites: list[str] | None = None, *, list_unlisted: bool = Fa
                 actual, err = None, type(exc).__name__
             else:
                 err = None
-            exp = schema.SCHEMA[table]
+            exp = schema.expected_columns(table, site)             # the site's REAL variant (actual header names)
             unit = {"table": table, "site": site, "location": spec.pattern, "found": actual is not None,
                     "n_expected": len(exp)}
+            v = schema.variant_for(site) if table == "reports_findings" else None
+            if actual is None and v is not None and v.reports_findings is None:
+                unit["expected_absent"] = True                     # the variant says this site has no such file
             if err:
                 unit["error"] = err
             if actual is not None:
@@ -525,7 +602,7 @@ def probe_schema(s3, sites: list[str] | None = None, *, list_unlisted: bool = Fa
     def _n(prov):
         return sum(1 for u in units for m in u.get("missing", []) if m["provenance"] == prov)
     return {"audit": "Phase 0a schema dry run (names only)", "sites": sites, "units": units,
-            "n_tables_not_found": sum(1 for u in units if not u["found"]),
+            "n_tables_not_found": sum(1 for u in units if not u["found"] and not u.get("expected_absent")),
             "n_missing_confirmed": _n(schema.CONFIRMED), "n_missing_named": _n(schema.NAMED),
             "n_missing_assumed": _n(schema.ASSUMED), "still_unknown": schema.UNKNOWN_FIELDS}
 
@@ -590,12 +667,14 @@ def dry_run_markdown(rep: dict) -> str:
          f"- Missing ASSUMED columns (placeholders to remap): {rep['n_missing_assumed']}", "",
          "| Table | Site | Found | Expected | Present | Missing | Unlisted cols |", "|---|---|---|---|---|---|---|"]
     for u in rep["units"]:
-        L.append(f"| {u['table']} | {u['site'] or ''} | {'yes' if u['found'] else 'NO'} | {u['n_expected']} | "
+        L.append(f"| {u['table']} | {u['site'] or ''} | {'yes' if u['found'] else ('absent (expected)' if u.get('expected_absent') else 'NO')} | {u['n_expected']} | "
                  f"{len(u.get('present', []))} | {len(u.get('missing', []))} | {u.get('n_unlisted_columns', '')} |")
     L += ["", "## Missing columns", ""]
     any_missing = False
     for u in rep["units"]:
-        if not u["found"]:
+        if not u["found"] and u.get("expected_absent"):
+            L.append(f"- {u['table']} / {u['site']}: no file at `{u['location']}` (the site variant has none; expected)")
+        elif not u["found"]:
             L.append(f"- **{u['table']}**{' / ' + u['site'] if u['site'] else ''}: NOT FOUND at `{u['location']}`")
             any_missing = True
         for m in u.get("missing", []):

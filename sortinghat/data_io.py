@@ -109,7 +109,9 @@ OMOP_MERGED_PREFIX = "OMOP/Merged/"
 OMOP_COLUMNS: dict[str, list[str]] = {
     t[len("omop_"):]: schema.columns(t) for t in schema.SCHEMA if t.startswith("omop_")}
 
-IMAGING_PREFIX = "Imaging/imaging_metadata/"      # ASSUMED location: the Imaging/ layout is unknown
+# ASSUMED placeholder location. The dry run (2026-10-07) found NOTHING here; the real prefixes are
+# Imaging/<SITE>/{BIDS,Clinical,Non-BIDS}/ for I0001 and I0004 (schema.IMAGING_REAL_LAYOUT), not listed deeper.
+IMAGING_PREFIX = "Imaging/imaging_metadata/"
 
 
 @dataclass(frozen=True)
@@ -133,7 +135,7 @@ TABLES: dict[str, TableSpec] = {
 }
 for _t in OMOP_COLUMNS:
     TABLES["omop_" + _t] = TableSpec("omop_parquet", OMOP_MERGED_PREFIX + "{table}/")
-# ASSUMED location and layout (no source script reads Imaging/); parquet parts under one prefix
+# ASSUMED location and layout (see IMAGING_PREFIX); parquet parts under one prefix
 TABLES["imaging"] = TableSpec("parquet_dir", IMAGING_PREFIX)
 
 _AWS_KEY_ID = re.compile(r"^(AKIA|ASIA)[A-Z0-9]{16}$")
@@ -275,6 +277,53 @@ def read_csv_table(table: str, site: str | None = None, *, s3=None, profile: str
                        encoding="utf-8-sig", low_memory=False)
 
 
+def read_site_table(table: str, site: str, *, s3=None, profile: str | None = None, dtype: Any = str) -> pd.DataFrame:
+    """Read one site's ``eeg_metadata`` / ``reports_findings`` CSV and map its columns onto CANONICAL names.
+
+    Reads the header first and loads only the columns that are not on the site's never-load list
+    (``DeidentifiedName(Reports)`` is name-like text and is never read into memory), then applies
+    ``normalise_site_table``. Raises ``FileNotFoundError`` when the site has no such file (I0008/I0009 have no
+    reports_findings)."""
+    s3 = s3 or make_client(profile)
+    key = resolve_key(s3, table, site)
+    skip = set(schema.never_load(table, site))
+    use = [c for c in csv_header(s3, key) if c not in skip]
+    body = s3.get_object(Bucket=access_point(), Key=key)["Body"].read()
+    df = pd.read_csv(io.BytesIO(body), dtype=dtype, usecols=use, encoding="utf-8-sig", low_memory=False)
+    return normalise_site_table(table, site, df)
+
+
+def normalise_site_table(table: str, site: str, df: pd.DataFrame) -> pd.DataFrame:
+    """Map a site's REAL columns onto the canonical names of ``schema.SCHEMA`` (``schema.SITE_VARIANTS``).
+
+    * renames each site's header names (I0008/I0009: ``StartDateTime``->``StartTime``, ``EndDateTime``->``EndTime``,
+      ``RecordingDuration``->``DurationInSeconds``; reports_findings ``CreationTime(EEG)``->``ReportCreationTime``...);
+    * drops never-load columns (``DeidentifiedName(Reports)``) and unmapped duplicates (``N1``);
+    * fills ``SiteID`` from the site code where the header has none (I0008/I0009 have ``InstituteID`` instead);
+    * leaves canonical columns the site does not have ABSENT (never invents values). A site with no known variant
+      is returned unchanged.
+    Names only are touched; no value is interpreted except the SiteID fill (from the file name, not the data).
+    """
+    m = schema._variant_map(table, site)
+    if m is None:
+        return df
+    out = df.drop(columns=[c for c in df.columns if m.get(c, c) is None], errors="ignore")
+    out = out.rename(columns={a: c for a, c in m.items() if c is not None and a in out.columns and a != c})
+    if table == "eeg_metadata" and ("SiteID" not in out.columns or out["SiteID"].isna().all()):
+        out["SiteID"] = site
+    return out
+
+
+def denormalise_site_table(table: str, site: str, df: pd.DataFrame) -> pd.DataFrame:
+    """Inverse of ``normalise_site_table`` for the synthetic writer: emit exactly the site's real header (in the
+    variant's order). Skipped header names (``DeidentifiedName(Reports)``, ``N1``) are written empty."""
+    m = schema._variant_map(table, site)
+    if m is None:
+        return df
+    return pd.DataFrame({a: (df[c] if c is not None and c in df.columns else None) for a, c in m.items()},
+                        index=df.index)
+
+
 def finding_present(series: pd.Series) -> pd.Series:
     """A reports_findings label cell is 'asserted' when non-empty and not the strings None/nan."""
     s = series.fillna("").astype(str).str.strip()
@@ -282,7 +331,10 @@ def finding_present(series: pd.Series) -> pd.Series:
 
 
 def bids_edf_key(site: str, bids_folder: str, session_id: str, eeg_folder: str | None) -> str:
-    """Key of a session's EDF. Task is 'cEEG' when ``EEGFolder`` starts with 'ceeg' (any case), else 'EEG'."""
+    """Key of a session's EDF. Task is 'cEEG' when ``EEGFolder`` starts with 'ceeg' (any case), else 'EEG'.
+
+    ``EEGFolder`` exists only in the S0001/S0002 headers (the I-sites have none), so for other sites ``eeg_folder``
+    is None and the task token defaults to 'EEG' (UNVERIFIED for cEEG sessions there)."""
     task = "cEEG" if (eeg_folder or "").lower().startswith("ceeg") else "EEG"
     return (f"{BIDS_PREFIX}{site}/{bids_folder}/ses-{session_id}/eeg/"
             f"{bids_folder}_ses-{session_id}_task-{task}_eeg.edf")

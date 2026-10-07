@@ -1,14 +1,20 @@
 """Synthetic HEEDB-shaped dataset (numpy/pandas only). Entirely fake.
 
-Emits the REAL layout (``docs/heedb_schema_real.md``): per-site ``eeg_metadata`` and ``reports_findings`` CSVs
-(real column names, including ``DurationInSeconds`` and the parenthesised ``StartTime(EEG)`` / ``EndTime(EEG)``;
-``eeg_metadata.StartTime``/``EndTime`` blank; ``BDSPPatientID`` blank at S0001/S0002), the three wide
-per-patient CSVs, and OMOP parquet tables (``person_id`` = int(BDSPPatientID); OMOP CDM column names; datetimes
-as text). Columns that are ASSUMED in ``sortinghat/schema.py`` (PatientClass, note timestamps, imaging
-finalization, ...) are filled so the audit logic can run on them.
+Emits the REAL layout (``docs/heedb_schema_real.md``) INCLUDING the per-site header variants that the first
+names-only dry run found (``schema.SITE_VARIANTS``): S0001/S0002 (EEGFolder, DateOfDeath, ServiceName; blank
+``BDSPPatientID``, blank eeg_metadata ``StartTime``/``EndTime``), I0002 (no ServiceName / DateOfDeath / EEGFolder),
+I0003 (adds ``AgeInDaysAtVisit``), and I0008/I0009 (no ``SiteID`` but ``InstituteID``; ``StartDateTime`` /
+``EndDateTime`` / ``RecordingDuration`` / ``DateOfBirth`` and no ``AgeAtVisit``; and NO reports_findings file).
+The in-memory ``tables`` use CANONICAL names, with every column a site does not have blanked, so they equal what
+``data_io.read_site_table`` returns after the files are written. ``PatientClass`` / ``ReferralIndication`` exist in
+memory only (in no real header); the on-disk audit derives PatientClass from ``omop_visit_occurrence``.
+
+Also written: the three wide per-patient CSVs and OMOP parquet tables (``person_id`` = int(BDSPPatientID); OMOP CDM
+column names; datetimes as text). Columns that are still ASSUMED in ``sortinghat/schema.py`` (imaging finalization,
+...) are filled so the audit logic can run on them.
 
 Deliberately injected defects so the field audit has something to find:
-  * StartTime(EEG) missing for ~2-5% of EEGs (site dependent).
+  * StartTime(EEG) missing for ~2-5% of EEGs (site dependent; at I0008/I0009 the metadata StartDateTime).
   * drug_exposure_end_datetime (the administration-record proxy) absent for patients without a MAR feed.
   * Imaging report finalization time missing (worse at one site).
   * No lab result-time column (as in the real measurement table).
@@ -30,13 +36,18 @@ import pandas as pd
 from .. import schema
 from ..tableio import write_tables as _write_tables
 
-SITE_WEIGHTS = {"S0001": 0.40, "S0002": 0.30, "I0003": 0.20, "I0002": 0.10}
+SITE_WEIGHTS = {"S0001": 0.36, "S0002": 0.27, "I0003": 0.18, "I0002": 0.10, "I0008": 0.05, "I0009": 0.04}
 PEDIATRIC_SITE = "I0002"
 BLANK_PATIENT_ID_SITES = {"S0001", "S0002"}      # eeg_metadata.BDSPPatientID blank on some real releases
-START_MISSING = {"S0001": 0.02, "S0002": 0.05, "I0003": 0.02, "I0002": 0.02}
-MAR_COVERAGE = {"S0001": 0.93, "S0002": 0.55, "I0003": 0.85, "I0002": 0.70}
-IMG_FINAL_MISSING = {"S0001": 0.04, "S0002": 0.06, "I0003": 0.20, "I0002": 0.08}
-SCORE_NEAR = {"S0001": 0.75, "S0002": 0.60, "I0003": 0.35, "I0002": 0.50}
+START_MISSING = {"S0001": 0.02, "S0002": 0.05, "I0003": 0.02, "I0002": 0.02, "I0008": 0.03, "I0009": 0.03}
+MAR_COVERAGE = {"S0001": 0.93, "S0002": 0.55, "I0003": 0.85, "I0002": 0.70, "I0008": 0.60, "I0009": 0.60}
+IMG_FINAL_MISSING = {"S0001": 0.04, "S0002": 0.06, "I0003": 0.20, "I0002": 0.08, "I0008": 0.10, "I0009": 0.10}
+SCORE_NEAR = {"S0001": 0.75, "S0002": 0.60, "I0003": 0.35, "I0002": 0.50, "I0008": 0.40, "I0009": 0.40}
+METADATA_START_SITES = {"I0008", "I0009"}        # real start/end live in eeg_metadata (StartDateTime/EndDateTime); no reports_findings
+# canonical names mapped by ANY site variant: a site that lacks one gets it blanked (it has no such header column)
+_MAPPED = {t: {c for v in schema.SITE_VARIANTS.values() for c in ((v.eeg_metadata if t == "eeg_metadata"
+                                                               else (v.reports_findings or {})).values()) if c}
+           for t in ("eeg_metadata", "reports_findings")}
 TABLE_SHIFT_RATE = 0.03
 ID_BASE = 50_000_000                             # synthetic BDSPPatientID / OMOP person_id range
 SESSION_BASE = 900_000_000
@@ -59,23 +70,33 @@ SCORES = [("Glasgow Coma Scale Score", 0.5, (3, 16)), ("FOUR Score", 0.15, (0, 1
 MODALITIES = ["CT head", "MRI brain", "CTA head"]
 NOTE_TYPES = [(1, "physician"), (2, "nursing"), (3, "eeg_report"), (4, "other")]   # ids are placeholders
 ICD = ["I63.9", "G40.909", "G93.41", "R40.2", "I46.9", "E11.9", "I10", "N17.9", "A41.9"]
-FLAGS_ALL = schema.FINDING_FLAGS_CONFIRMED + schema.FINDING_FLAGS_NAMED
+FLAGS_ALL = schema.FINDING_FLAGS_ALL
+DRUG_TYPE_ORDER, DRUG_TYPE_ADMIN = 38000177, 32818    # OMOP drug-type concept ids (placeholders for the synthetic data)
+MEAS_TYPE_LAB, MEAS_TYPE_EXAM = 44818702, 44818701
 SHIFTABLE = ["omop_note", "omop_measurement", "imaging", "omop_drug_exposure"]
 TIME_COLS = {"omop_note": ["note_datetime"], "omop_measurement": ["measurement_datetime"],
              "imaging": ["study_datetime", "report_final_datetime"],
              "omop_drug_exposure": ["drug_exposure_start_datetime", "drug_exposure_end_datetime"]}
-DATE_COLS = {"omop_note": "note_date", "omop_measurement": "measurement_date"}   # date twin of a datetime
+
+
+def _only_available(table: str, site: str, row: dict) -> dict:
+    """Drop canonical columns that the site's real header does not have (they stay NaN in the frame)."""
+    have = schema.canonical_to_actual(table, site)
+    return {k: v for k, v in row.items() if k in have or k not in _MAPPED[table] or k == "SiteID"}
 
 
 def _ts(base: pd.Timestamp, hours: float) -> pd.Timestamp:
     return (base + pd.Timedelta(minutes=float(hours) * 60.0)).round("us")   # microsecond precision, like the real text
 
 
+DATE_TWINS = {"omop_note": {"note_date": "note_datetime"}, "omop_measurement": {"measurement_date": "measurement_datetime"},
+              "omop_drug_exposure": {"drug_exposure_start_date": "drug_exposure_start_datetime",
+                                     "drug_exposure_end_date": "drug_exposure_end_datetime"}}
+
+
 def _dates(rows, tbl):
-    """Recompute the *_date twin of a shifted datetime column."""
-    dc = DATE_COLS.get(tbl)
-    if dc:
-        col = TIME_COLS[tbl][0]
+    """Recompute the *_date twins of shifted datetime columns."""
+    for dc, col in DATE_TWINS.get(tbl, {}).items():
         for r in rows:
             r[dc] = pd.NaT if pd.isna(r[col]) else r[col].normalize()
 
@@ -88,7 +109,7 @@ def generate(n_patients: int = 3000, seed: int = 20260101):
 
     R: dict[str, list] = {t: [] for t in schema.TABLE_NAMES}
     truth = {"table_shift_ids": [], "table_shift_table": {}, "no_start_sessions": 0}
-    note_counter = sess_counter = 0
+    note_counter = sess_counter = visit_counter = 0
 
     for i in range(n_patients):
         site = str(sites[i])
@@ -123,46 +144,68 @@ def generate(n_patients: int = 3000, seed: int = 20260101):
                 rng.choice(["Routine", "LTM"], p=[0.5, 0.5]))
             dur = float(rng.uniform(1200, 3600)) if svc == "Routine" else float(rng.uniform(12, 72) * 3600)
             st, miss = starts[k], start_missing[k]
-            R["eeg_metadata"].append({
-                "SiteID": site, "BDSPPatientID": None if site in BLANK_PATIENT_ID_SITES else str(pid),
+            md_start = site in METADATA_START_SITES
+            dob = (anchor.normalize() - pd.Timedelta(days=int(round(age * 365.25)))) if md_start else pd.NaT
+            row = {
+                "SiteID": site, "InstituteID": site if md_start else None,
+                "BDSPPatientID": None if site in BLANK_PATIENT_ID_SITES else str(pid),
                 "BidsFolder": f"sub-{site}{pid}", "SessionID": sid,
                 "EEGFolder": "ceeg" if svc == "LTM" else "eeg",
                 "DurationInSeconds": round(dur, 1), "ServiceName": svc,
                 "AgeAtVisit": round(age, 2) if rng.random() < 0.1 else np.nan,       # largely empty
+                "AgeInDaysAtVisit": float(round(age * 365.25)),
                 "SexDSC": sex if rng.random() < 0.3 else None,                         # often empty
+                "DateOfBirth": dob,
                 "DateOfDeath": (st + pd.Timedelta(days=int(rng.integers(1, 60))) if died and site in
                                 BLANK_PATIENT_ID_SITES and k == n_sess - 1 else pd.NaT),
-                "StartTime": pd.NaT, "EndTime": pd.NaT,                               # blank in the real table
+                # S-sites: blank in the real table (real start is reports_findings StartTime(EEG)); I0008/I0009 have it
+                "StartTime": (pd.NaT if miss else st) if md_start else pd.NaT,
+                "EndTime": (st + pd.Timedelta(seconds=dur)) if md_start else pd.NaT,
                 "CreationTime": pd.NaT if miss else st - pd.Timedelta(minutes=int(rng.integers(0, 6))),
                 "HasXLTEKAnnotations": str(bool(rng.random() < 0.5)),
                 "HasPersystAnnotations": str(bool(rng.random() < 0.3)),
                 "BDSPLastModifiedDTS": pd.Timestamp("2026-04-30 06:00:00"),
+                "BidsFlag": "True",
+                # analytic only: in NO real eeg_metadata header (PatientClass is derived from visit_occurrence on disk)
                 "PatientClass": classes[k], "ReferralIndication": str(rng.choice(INDICATIONS)),
-            })
+            }
+            R["eeg_metadata"].append(_only_available("eeg_metadata", site, row))
             truth["no_start_sessions"] += int(miss)
-            rf = {"BDSPPatientID": str(pid), "SessionID": sid,
-                  schema.START_EEG: pd.NaT if miss else st,
-                  schema.END_EEG: st + pd.Timedelta(seconds=dur),
-                  "AgeAtVisit": round(age, 2), "SexDSC": sex, schema.SERVICE_EEG: svc}
-            for f in FLAGS_ALL:
-                v = rng.random()
-                rf[f] = "1" if v < 0.08 else ("None" if v < 0.12 else None)
-            R["reports_findings"].append(rf)
+            if not md_start:                                    # I0008/I0009 have no reports_findings file
+                end = st + pd.Timedelta(seconds=dur)
+                rf = {"BDSPPatientID": str(pid), "SessionID": sid,
+                      schema.START_EEG: pd.NaT if miss else st, schema.END_EEG: end,
+                      "AgeAtVisit": round(age, 2), "AgeInDaysAtVisit": float(round(age * 365.25)), "SexDSC": sex,
+                      schema.SERVICE_EEG: svc, "SiteID": site,
+                      "ReportCreationTime": end + pd.Timedelta(hours=float(rng.uniform(1, 30))),
+                      "ReportEEGDateTime": st.normalize() if site == "I0002" else st,
+                      "ReportProcedureDate": st.normalize(),
+                      "ReportEncounterDTS": st - pd.Timedelta(hours=float(rng.uniform(0, 6))),
+                      "ReportBeginDTS": st, "ReportExamEndDTS": end,
+                      "ReportProcedureDSC": "EEG ROUTINE" if svc == "Routine" else "EEG LONG TERM MONITORING"}
+                for f in FLAGS_ALL:
+                    v = rng.random()
+                    rf[f] = "1" if v < 0.08 else ("None" if v < 0.12 else None)
+                R["reports_findings"].append(_only_available("reports_findings", site, rf))
             vc = 0 if site == "I0003" else VISIT_CONCEPT[classes[k]]     # concept ids can be zero-filled (rule 6)
+            visit_counter += 1
             R["omop_visit_occurrence"].append({
-                "person_id": pid, "visit_start_datetime": st - pd.Timedelta(hours=float(rng.uniform(0, 6))),
+                "person_id": pid, "visit_occurrence_id": visit_counter,
+                "visit_start_datetime": st - pd.Timedelta(hours=float(rng.uniform(0, 6))),
                 "visit_end_datetime": st + pd.Timedelta(hours=float(rng.uniform(6, 240))),
-                "visit_concept_id": vc, "discharge_to_concept_id": 0,
-                "discharge_to_source_value": None, "visit_source_value": classes[k]})
+                "visit_concept_id": vc, "visit_type_concept_id": 0, "visit_source_value": classes[k],
+                "admitted_from_concept_id": 0, "admitted_from_source_value": None,
+                "discharged_to_concept_id": 0, "discharged_to_source_value": None})
 
         # --- cohort-level tables
         R["omop_person"].append({
             "person_id": pid, "gender_concept_id": 8532 if sex == "Female" else 8507,
             "year_of_birth": int(true_anchor.year - age), "birth_datetime": pd.NaT,
-            "race_concept_id": 0, "ethnicity_concept_id": 0})
+            "race_concept_id": 0, "ethnicity_concept_id": 0, "gender_source_value": sex[0],
+            "race_source_value": None, "ethnicity_source_value": None})
         R["heedb_patients"].append({
             "SiteID": site, "BDSPPatientID": str(pid), "Sex": sex, "AgeAtVisitAvg": round(age, 2),
-            "Race": None, "VisitCount": n_sess, "HasEEG": "True", "HasReports": "True",
+            "RaceAndEthnicity": None, "RaceAndEthnicityDSC": None, "VisitCount": n_sess, "HasEEG": "True", "HasReports": "True",
             "MatchedEEGReports": n_sess, "ICD10Count": int(rng.poisson(4)), "MedicationCount": int(rng.poisson(6))})
         R["icd10_neurology"].append({
             "BDSPPatientID": str(pid), "Cerebrovascular Diseases": "I63.9 G45.9" if rng.random() < 0.15 else None,
@@ -171,8 +214,9 @@ def generate(n_patients: int = 3000, seed: int = 20260101):
         R["medication_atc"].append({
             "BDSPPatientID": str(pid), "Nervous System Drugs": int(rng.poisson(2))})
         if died:
-            R["omop_death"].append({"person_id": pid, "death_datetime": starts[-1] + pd.Timedelta(
-                days=int(rng.integers(1, 60))), "cause_source_value": None})
+            dd = starts[-1] + pd.Timedelta(days=int(rng.integers(1, 60)))
+            R["omop_death"].append({"person_id": pid, "death_datetime": dd, "death_date": dd.normalize(),
+                                    "cause_source_value": None})
         for _ in range(int(rng.integers(0, 4))):
             R["omop_condition_occurrence"].append({
                 "person_id": pid, "condition_start_datetime": _ts(anchor, rng.uniform(-24 * 30, 24 * 30)),
@@ -198,29 +242,38 @@ def generate(n_patients: int = 3000, seed: int = 20260101):
         for _ in range(int(rng.poisson(2.5))):
             name, _sed = DRUGS[int(rng.integers(len(DRUGS)))]
             order = _ts(t0, rng.uniform(-48, 12))
-            if has_mar and rng.random() < 0.9:
+            admin = has_mar and rng.random() < 0.9
+            if admin:
                 start = order + pd.Timedelta(minutes=float(5 + rng.exponential(40)))
                 end = start + pd.Timedelta(minutes=float(30 + rng.exponential(240)))
             else:
                 start, end = order, pd.NaT
             p["omop_drug_exposure"].append({
                 "person_id": pid, "drug_exposure_start_datetime": start, "drug_exposure_end_datetime": end,
-                "drug_source_value": name, "quantity": round(float(rng.exponential(2)), 2), "drug_concept_id": 0})
+                "drug_source_value": name, "quantity": round(float(rng.exponential(2)), 2), "drug_concept_id": 0,
+                "drug_type_concept_id": DRUG_TYPE_ADMIN if admin else DRUG_TYPE_ORDER,
+                "route_source_value": "IV" if "IV" in name or "INJ" in name else "PO",
+                "drug_exposure_start_date": start.normalize(),
+                "drug_exposure_end_date": pd.NaT if pd.isna(end) else end.normalize(), "visit_occurrence_id": None})
         # --- measurement: labs (no result-time column exists) and scores
         for _ in range(int(2 + rng.poisson(3))):
             col = _ts(t0, rng.uniform(-48, 24))
             name, unit = LABS[int(rng.integers(len(LABS)))]
             p["omop_measurement"].append({
                 "person_id": pid, "measurement_datetime": col, "measurement_date": col.normalize(),
+                "measurement_time": col.strftime("%H:%M:%S"),
                 "measurement_source_value": name, "value_as_number": round(float(rng.normal(10, 4)), 2),
-                "unit_source_value": unit, "measurement_concept_id": 0})
+                "unit_source_value": unit, "measurement_concept_id": 0,
+                "measurement_type_concept_id": MEAS_TYPE_LAB, "visit_occurrence_id": None})
 
         def score_row(tm):
             j = int(rng.choice(len(SCORES), p=[x[1] for x in SCORES]))
             nm, _, (lo, hi) = SCORES[j]
             return {"person_id": pid, "measurement_datetime": tm, "measurement_date": tm.normalize(),
+                    "measurement_time": tm.strftime("%H:%M:%S"),
                     "measurement_source_value": nm, "value_as_number": float(rng.integers(lo, hi)),
-                    "unit_source_value": None, "measurement_concept_id": 0}
+                    "unit_source_value": None, "measurement_concept_id": 0,
+                    "measurement_type_concept_id": MEAS_TYPE_EXAM, "visit_occurrence_id": None}
         if rng.random() < SCORE_NEAR[site]:
             for _ in range(int(rng.integers(1, 4))):
                 p["omop_measurement"].append(score_row(_ts(t0, rng.uniform(-5.5, 5.5))))
