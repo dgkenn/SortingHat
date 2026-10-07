@@ -74,10 +74,22 @@ items:           # item -> LOINC (confident only) and canonical unit
   imaging_infarct:     {loinc: [], unit: "flag"}
   imaging_tbi_contusion: {loinc: [], unit: "flag"}
   imaging_mass_effect: {loinc: [], unit: "flag"}                # herniation/midline shift/tumour with edema
+  # E1 STRUCTURED ALTERNATIVE (project-lead decision 2026-10-07, via coordinator): imaging exists only at sites
+  # I0001/I0004 (no EEG), so for the Study 1 cohort E1 is anchored on acute structural ICD-10 diagnosis codes and
+  # neurosurgical/thrombectomy procedure codes recorded in [-72, +24] h of t0. Imaging items above stay for future sites.
+  # Diagnosis timing is approximate (condition_start_datetime, else visit start; flagged timing_approximate upstream).
+  # ICD-10 lists verified against the ICD-10-CM / ICD-10-PCS FY2027 MCP server 2026-10-07 (configs/anchor_concepts.yaml).
+  dx_ich:          {loinc: [], unit: "flag"}     # I61.*
+  dx_sah:          {loinc: [], unit: "flag"}     # I60.* nontraumatic, S06.6* traumatic
+  dx_sdh_edh:      {loinc: [], unit: "flag"}     # I62.0* nontraumatic subdural (not chronic I62.03), S06.4* epidural, S06.5* subdural
+  dx_infarct:      {loinc: [], unit: "flag"}     # I63.*
+  dx_tbi:          {loinc: [], unit: "flag"}     # S06.2* diffuse TBI, S06.3* focal TBI/contusion
+  dx_mass_effect:  {loinc: [], unit: "flag"}     # G93.5 compression of brain, G93.6 cerebral edema; ONLY with another structural dx in the window (upstream)
+  proc_neurosurgical: {loinc: [], unit: "flag"}  # craniotomy/craniectomy, EVD placement, intracranial thrombectomy, IV thrombolysis
 
 labels:
   E1:
-    description: "Acute structural: imaging finding (ACUTE/SUBACUTE findings only)"
+    description: "Acute structural: imaging finding (ACUTE/SUBACUTE findings only) OR, where imaging is unavailable, acute structural ICD-10 dx / neurosurgical procedure code"
     note: "Imaging flags must be ACUTE/SUBACUTE findings: report qualifiers acute, new, hyperacute, subacute count; chronic, old, remote, sequela do not. Enforced via the optional `acute` column when present."
     acuity_required: true
     any_of:
@@ -87,8 +99,17 @@ labels:
       - {id: E1_infarct,    item: imaging_infarct,      test: event, window_hours: [-72, 24]}
       - {id: E1_tbi,        item: imaging_tbi_contusion, test: event, window_hours: [-72, 24]}
       - {id: E1_mass,       item: imaging_mass_effect,  test: event, window_hours: [-72, 24]}   # acute/subacute findings only (all E1 items)
-    sublabel_map: {focal: [imaging_ich, imaging_infarct, imaging_sdh_edh, imaging_tbi_contusion],
-                   diffuse: [imaging_sah, imaging_mass_effect]}
+      # Structured alternative for cohorts without imaging reports (diagnosis/procedure codes; timing approximate)
+      - {id: E1_dx_ich,      item: dx_ich,      test: event, window_hours: [-72, 24]}
+      - {id: E1_dx_sah,      item: dx_sah,      test: event, window_hours: [-72, 24]}
+      - {id: E1_dx_sdh_edh,  item: dx_sdh_edh,  test: event, window_hours: [-72, 24]}
+      - {id: E1_dx_infarct,  item: dx_infarct,  test: event, window_hours: [-72, 24]}
+      - {id: E1_dx_tbi,      item: dx_tbi,      test: event, window_hours: [-72, 24]}
+      - {id: E1_dx_mass,     item: dx_mass_effect, test: event, window_hours: [-72, 24]}   # only emitted with another structural dx in the window
+      - {id: E1_proc_neurosurg, item: proc_neurosurgical, test: event, window_hours: [-72, 24]}
+    sublabel_map: {focal: [imaging_ich, imaging_infarct, imaging_sdh_edh, imaging_tbi_contusion,
+                           dx_ich, dx_infarct, dx_sdh_edh, dx_tbi],
+                   diffuse: [imaging_sah, imaging_mass_effect, dx_sah, dx_mass_effect]}
   E2:
     description: "Global hypoxic-ischemic: arrest event (or asphyxia / profound shock)"
     any_of:

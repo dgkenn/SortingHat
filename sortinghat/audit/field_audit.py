@@ -592,24 +592,58 @@ def run_audit(tables: dict[str, pd.DataFrame], seed: int = 0, handcheck_n: int =
                               "a human must confirm note/lab/EEG times line up. Automated checks "
                               "cannot detect a shift applied identically to every table.")}))
 
-    # 3. Medication administration times. drug_exposure has no order-time column and the semantics of
-    # drug_exposure_start_datetime are UNKNOWN; the end datetime (an administration-interval record) is the proxy.
+    # 3. Medication administration times (not just orders). The discriminating column is drug_type_concept_id (record
+    # provenance); its meaning comes from the omop_concept NAME (classify_drug_type). When no type id resolves to a
+    # name (zero-filled ids, concept table without them) the fallback proxy is a non-empty drug_exposure_end_datetime.
+    # Denominator: candidates with >=1 sedation-class exposure in [t0-48h, t0+1h].
     m = tables.get("omop_drug_exposure", empty)
-    if len(m) and "drug_exposure_end_datetime" in m:
+    _, cnames = concept_maps(tables.get("omop_concept"))
+    med_detail: dict = {}
+    if len(m) and "drug_exposure_start_datetime" in m:
         m = m[m["person_id"].isin(cand_ids)].copy()
         m["t0"] = m["person_id"].map(cands.set_index("person_id")["t0"])
         dt_h = (m["drug_exposure_start_datetime"] - m["t0"]).dt.total_seconds() / 3600
         m = m[(dt_h >= -48) & (dt_h <= 1)]
-        per_pt = m.groupby("person_id")["drug_exposure_end_datetime"].apply(lambda x: x.notna().any())
+        tid = pd.to_numeric(m["drug_type_concept_id"], errors="coerce") if "drug_type_concept_id" in m else \
+            pd.Series(np.nan, index=m.index)
+        m["_cat"] = [classify_drug_type(cnames.get(int(x))) if pd.notna(x) and int(x) != 0 else "unresolved"
+                     for x in tid]
+        resolved = m["_cat"].isin(["administration", "order", "other"])
+        use_concept = bool(resolved.any())
+        if use_concept:
+            m["_adm"] = m["_cat"] == "administration"
+            method = "drug_type_concept_id (concept-name semantics)"
+        else:
+            m["_adm"] = m["drug_exposure_end_datetime"].notna() if "drug_exposure_end_datetime" in m else False
+            method = "FALLBACK PROXY: non-empty drug_exposure_end_datetime (no drug_type_concept_id resolved to a name)"
+        per_pt = m.groupby("person_id")["_adm"].any()
+        tally = m["_cat"].value_counts()
+        name_tally = (m.assign(cname=tid.map(lambda x: cnames.get(int(x)) if pd.notna(x) and int(x) != 0 else None))
+                      .dropna(subset=["cname"]).groupby(["cname", "_cat"]).size().reset_index(name="n"))
+        med_detail = {
+            "method": method, "drug_type_semantics_resolved": use_concept,
+            "sedation_rows_in_window_by_category": {k: suppress_count(int(tally.get(k, 0)))
+                                                   for k in ("administration", "order", "other", "unresolved")},
+            "drug_type_concepts": [{"concept_name": ("<id-like name>" if data_io.looks_id_like(str(nm)) else str(nm)),
+                                    "category": cat, "n_rows": suppress_count(int(n))}
+                                   for nm, cat, n in zip(name_tally["cname"], name_tally["_cat"], name_tally["n"])][:50],
+            "start_datetime_is_administration_time": (
+                "yes where the record type is administration" if use_concept else "UNKNOWN (no type semantics)")}
+        all_flag = cands["person_id"].map(per_pt).fillna(False).astype(bool)
+        all_blk, _ = prop_block(all_flag, cands["SiteID"])
+        med_detail["administration_among_all_candidates"] = all_blk["overall"]
     else:
         per_pt = pd.Series(dtype=bool)
+        method = "no sedation-class drug_exposure rows for candidates"
+        med_detail = {"method": method}
     blk, raw = prop_block(per_pt, site_of.reindex(per_pt.index))
     rows.append(_row("Medication administration times (not just orders)", "Sedation baseline, E4a/E4b",
-                     "Administration times for >=80% of candidates (proxy: sedation-class drug_exposure in the "
-                     "48 h before t0 with a non-empty drug_exposure_end_datetime; order vs administration "
-                     "semantics of drug_exposure_start_datetime are UNKNOWN)",
+                     "Administration times for >=80% of candidates (operationalised: among candidates with a "
+                     "sedation-class drug_exposure in the 48 h before t0, share with an ADMINISTRATION-type record "
+                     "per drug_type_concept_id; fallback proxy: non-empty drug_exposure_end_datetime)",
                      "Use orders; label 1B \"approximate\"", False,
-                     blk, raw >= 0.80, {"observed_text": _fmt(blk)}))
+                     blk, raw >= 0.80, {"observed_text": _fmt(blk) + f" [method: {med_detail.get('method', '')}]",
+                                        "details": med_detail}))
 
     # 4. Lab result time: the real measurement table has NO result-time column (only measurement_datetime /
     # measurement_date); pass only if a candidate alias column exists and is filled.
@@ -622,7 +656,9 @@ def run_audit(tables: dict[str, pd.DataFrame], seed: int = 0, handcheck_n: int =
         extra = {"observed_text": _fmt(blk), "result_lag_minutes": _lag(lb, res_col)}
     else:
         blk, raw = {"result_time_column_present": False}, float("nan")
-        extra = {"observed_text": "no result-time column in measurement (collection time only)"}
+        extra = {"observed_text": "no result-time column in measurement (collection time only)",
+                 "details": {"result_time_column_aliases_checked": schema.COLUMN_ALIASES["measurement.result_datetime"],
+                             "n_candidate_lab_rows": suppress_count(len(lb))}}
     rows.append(_row("Lab result or verification time", "Study 1B",
                      "Result time present (operationalised: >=95% of candidate lab rows; needs a result-time "
                      "column, none is known in OMOP measurement)",
@@ -637,25 +673,53 @@ def run_audit(tables: dict[str, pd.DataFrame], seed: int = 0, handcheck_n: int =
         txt = _fmt(blk)
     else:
         blk, raw, txt = {"imaging_table_or_column_found": False}, float("nan"), "imaging table/column not found"
+    img_sites = sorted(set(schema.IMAGING_REAL_LAYOUT["sites"]) & set(cands["SiteID"]))
+    img_cands = int(cands["person_id"].isin(set(im["person_id"]) if len(im) and "person_id" in im else set()).sum())
     rows.append(_row("Imaging report finalization time", "Study 1B, H5",
                      "Present (operationalised: >=95% of candidate imaging studies)", "Drop H5", False,
-                     blk, raw >= 0.95, {"observed_text": txt}))
+                     blk, raw >= 0.95,
+                     {"observed_text": txt + f"; {len(img_sites)} candidate site(s) have an Imaging/<SITE>/ prefix",
+                      "details": {"candidate_sites_with_imaging_prefix": len(img_sites),
+                                  "imaging_prefix_sites_in_bucket": list(schema.IMAGING_REAL_LAYOUT["sites"]),
+                                  "candidates_with_any_imaging_row": suppress_count(img_cands)}}))
 
-    # 6. GCS / FOUR / RASS within +-6 h (measurement rows whose source text matches the score regex)
-    sc = meas[meas["kind"] == "score"] if len(meas) and "kind" in meas else meas
-    sc = sc[sc["person_id"].isin(cand_ids)].copy() if len(sc) else sc
-    if len(sc):
-        sc["off_h"] = (sc["measurement_datetime"] - sc["person_id"].map(cands.set_index("person_id")["t0"])
-                       ).dt.total_seconds().abs() / 3600
-        near = set(sc.loc[sc["off_h"] <= 6, "person_id"])
-    else:
-        near = set()
-    flags = cands["person_id"].isin(near)
+    # 6. GCS / FOUR / RASS within +-6 h of t0. Score rows come from omop_measurement and omop_observation: a row is a
+    # score when its source text matches a score class or its concept id is a score concept found BY NAME in
+    # omop_concept (Measurement/Observation domain). Only GCS, FOUR and RASS count (OTHER scales are reported apart).
+    t0_of = cands.set_index("person_id")["t0"]
+    parts = []
+    if len(meas) and "kind" in meas:
+        sm = meas[meas["kind"] == "score"]
+        parts.append(pd.DataFrame({"person_id": sm["person_id"], "time": sm["measurement_datetime"],
+                                   "cls": sm["score_class"], "src": "measurement"}))
+    obs = tables.get("omop_observation", empty)
+    if len(obs) and "score_class" in obs:
+        parts.append(pd.DataFrame({"person_id": obs["person_id"], "time": obs.get("observation_datetime"),
+                                   "cls": obs["score_class"], "src": "observation"}))
+    sc = pd.concat(parts, ignore_index=True) if parts else pd.DataFrame(columns=["person_id", "time", "cls", "src"])
+    sc = sc[sc["person_id"].isin(cand_ids)].copy()
+    n_no_time = int(sc["time"].isna().sum())
+    sc["off_h"] = (pd.to_datetime(sc["time"]) - sc["person_id"].map(t0_of)).dt.total_seconds().abs() / 3600
+    near_rows = sc[(sc["off_h"] <= 6) & sc["cls"].isin(PRIMARY_SCORE_CLASSES)]
+    flags = cands["person_id"].isin(set(near_rows["person_id"]))
     blk, raw = prop_block(flags, cands["SiteID"])
+
+    def _cov(mask) -> dict:
+        n = int(cands["person_id"].isin(set(near_rows.loc[mask, "person_id"])).sum())
+        return {"n_candidates": suppress_count(n), "proportion": suppress_proportion(n, len(cands))}
+    sc_detail = {
+        "by_class_within_6h": {c: _cov(near_rows["cls"] == c) for c in PRIMARY_SCORE_CLASSES},
+        "by_source_within_6h": {c: _cov(near_rows["src"] == c) for c in ("measurement", "observation")},
+        "other_scales_within_6h_not_counted": _cov(sc["cls"].eq("OTHER") & (sc["off_h"] <= 6)),
+        "n_score_concepts_found_by_name": {c: sum(1 for v in concept_maps(tables.get("omop_concept"))[0].values() if v == c)
+                                           for c in ("GCS", "FOUR", "RASS", "OTHER")},
+        "candidate_score_rows_without_datetime": suppress_count(n_no_time),
+        "candidate_score_rows": suppress_count(len(sc))}
     rows.append(_row("GCS, FOUR or RASS near EEG", "Inclusion, 1A baseline",
-                     "Score within +-6 h for >=50% of candidates",
+                     "Score within +-6 h for >=50% of candidates (GCS incl. components, FOUR, RASS; measurement + "
+                     "observation tables; concepts found by name in omop_concept, plus source-text match)",
                      "BDSP GCS-from-EHR tool; broad cohort only", False,
-                     blk, raw >= 0.50, {"observed_text": _fmt(blk)}))
+                     blk, raw >= 0.50, {"observed_text": _fmt(blk), "details": sc_detail}))
 
     # 7. Site identifier
     counts = cands.groupby("SiteID").size()
@@ -669,13 +733,21 @@ def run_audit(tables: dict[str, pd.DataFrame], seed: int = 0, handcheck_n: int =
                      {"observed_text": f"{len(big)} of {len(counts)} adult sites have >=300 candidates"}))
 
     # 8. Timestamped notes (OMOP note.note_datetime; ASSUMED table)
-    nt = tables.get("omop_note", empty)
-    nt = nt[nt["person_id"].isin(cand_ids) & nt["note_datetime"].notna()] if len(nt) else nt
+    nt_all = tables.get("omop_note", empty)
+    nt_c = nt_all[nt_all["person_id"].isin(cand_ids)] if len(nt_all) else nt_all
+    nt = nt_c[nt_c["note_datetime"].notna()] if len(nt_c) else nt_c
     flags = cands["person_id"].isin(set(nt["person_id"]) if len(nt) else set())
     blk, raw = prop_block(flags, cands["SiteID"])
+    n_note_rows = int(len(nt_c))
+    note_detail = {
+        "candidate_note_rows": suppress_count(n_note_rows),
+        "note_rows_with_note_datetime": (suppress_proportion(int(len(nt)), n_note_rows) if n_note_rows else "n/a"),
+        "candidates_with_any_note_row": suppress_count(int(cands["person_id"].isin(
+            set(nt_c["person_id"]) if len(nt_c) else set()).sum())),
+        "note_text_requested": False}
     rows.append(_row("Timestamped notes", "ACI onset, silver labels",
-                     "Present (operationalised: >=95% of candidates have >=1 timestamped note)", "Stop",
-                     True, blk, raw >= 0.95, {"observed_text": _fmt(blk)}))
+                     "Present (operationalised: >=80% of candidates have >=1 timestamped note, D-101)", "Stop",
+                     True, blk, raw >= 0.80, {"observed_text": _fmt(blk), "details": note_detail}))
 
     # Hand-check sampling list (record-level -> local file only)
     labs_ids = set(lb["person_id"]) if len(lb) else set()
@@ -706,6 +778,22 @@ def _lag(lb: pd.DataFrame, res_col: str) -> dict:
 
 
 # ---------------------------------------------------------------- rendering
+def _detail_lines(d, indent: int = 0) -> list[str]:
+    pad = "  " * indent
+    out = []
+    if isinstance(d, dict):
+        for k, v in d.items():
+            if isinstance(v, (dict, list)) and v:
+                out.append(f"{pad}- {k}:")
+                out += _detail_lines(v, indent + 1)
+            else:
+                out.append(f"{pad}- {k}: {v}")
+    elif isinstance(d, list):
+        for v in d:
+            out.append(f"{pad}- " + (", ".join(f"{k}={x}" for k, x in v.items()) if isinstance(v, dict) else str(v)))
+    return out
+
+
 def to_markdown(report: dict) -> str:
     L = ["# Phase 0a: HEEDB field audit", "",
          f"Aggregate-only. {report['suppression']}. Candidates: {report['n_candidates']}.", "",
@@ -728,6 +816,12 @@ def to_markdown(report: dict) -> str:
         elif isinstance(obs, dict) and "candidates_per_site" in obs:
             for s, n in obs["candidates_per_site"].items():
                 L.append(f"| {r['field']} (candidates) | {s} | {n} | |")
+    L += ["", "## Row details (aggregate-only)", ""]
+    for r in report["rows"]:
+        if r.get("details"):
+            L.append(f"### {r['field']}")
+            L += _detail_lines(r["details"])
+            L.append("")
     ds = next(r for r in report["rows"] if r["field"].startswith("Consistent"))
     L += ["", "## Date-shift detail", "",
           "| Check | n pairs | violations | rate |", "|---|---|---|---|"]
@@ -923,8 +1017,19 @@ def main(argv: list[str] | None = None) -> int:
         safe_print(text.rstrip())
         return 1 if a.strict and (rep["n_missing_confirmed"] or rep["n_tables_not_found"]) else 0
 
-    tables = load_audit_tables(s3, a.sites)
-    report, ids = run_audit(tables, a.seed, a.handcheck_n)
+    stage = "load"
+    try:
+        tables = load_audit_tables(s3, a.sites)
+        stage = "audit"
+        report, ids = run_audit(tables, a.seed, a.handcheck_n)
+    except Exception as exc:  # noqa: BLE001
+        if a.data:                       # local / synthetic: normal traceback for debugging
+            raise
+        # Real data: a message or traceback can quote a value (a bad cell, a key). Print the stage and the exception
+        # CLASS only; reproduce on synthetic data to debug (CLAUDE.md rule 3).
+        safe_print(f"field audit FAILED at stage '{stage}': {type(exc).__name__} (message withheld; reproduce on "
+                   "synthetic data)")
+        return 2
     known = {str(p) for p in tables["eeg_metadata"]["person_id"].dropna().unique()}
 
     out = Path(a.out)

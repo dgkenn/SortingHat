@@ -151,7 +151,7 @@ def test_ed_to_icu_encounter_counts_from_ed_arrival(scenario):
     t = scenario[1].table.set_index("person_id")
     assert t.loc[36, "hours_since_onset"] == pytest.approx(25.0)
     assert not t.loc[36, "onset_le_24h"] and not t.loc[36, "in_broad"] and t.loc[36, "onset_le_48h"]
-    res = build(_ed_icu_world(), visit_chain_gap_h=0.5)           # a 1.5 h gap is NOT bridged
+    res = build(_ed_icu_world(), visit_chain_gap_h=0.25)          # the 0.5 h gap is NOT bridged
     assert res.table.set_index("person_id").loc[36, "hours_since_onset"] == pytest.approx(23.0)
 
 

@@ -664,3 +664,9 @@
 - **Decision:** Raw HEEDB EEG and tables are streamed from S3 and processed in memory. For each EDF only the header and the minute 1 to 11 byte range (plus 10 s of filter padding either side) are fetched with ranged GETs, decoded in RAM and reduced to feature rows (`sortinghat/eeg/stream.py`, `scripts/extract_eeg_features.py`). Only derived feature rows and a small per-recording status ledger are stored, as parquet and CSV under gitignored `local_only/` paths (mode 0600). No raw signal or table is written to disk or committed, and run output is aggregate-only through `sortinghat.safe_output` (counts below 11 shown as "<11"). Failures are reduced to fixed ID-free reason codes.
 - **Rationale:** ICU cEEG EDFs are about 1 GB each and Study 1 uses 10 minutes, so ranged reads cut transfer by roughly two orders of magnitude and avoid a raw-data copy that would need its own access control. Keeping raw bytes in memory only is consistent with CLAUDE.md rules 3, 5 and 6 and the BDSP terms.
 - **Source:** `docs/eeg_pipeline.md`; `docs/heedb_access.md` section 1; CLAUDE.md rules 2, 3, 5, 6.
+
+### D-101 Phase 0a "timestamped notes" row operationalised at >=80% of candidates
+- **Date:** 2026-10-07 · **Area:** data · **Outcome data seen?** No
+- **Decision:** The plan's "Present" criterion for timestamped notes (a Stop row) passes when >=80% of candidates have at least one note with a timestamp.
+- **Rationale:** Notes are needed for ACI onset and silver labels in most, not all, patients; 95% would make a Stop row stricter than the plan's own EEG-start row intends for a secondary field, while 80% still supports both uses. Chosen before the audit was run.
+- **Source:** Phase 0a table; `sortinghat/audit/field_audit.py`.

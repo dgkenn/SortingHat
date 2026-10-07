@@ -27,6 +27,8 @@ prefilter: {lookback_days: 30, forward_days: 10}
 # Encounter = the visit_occurrence containing t0 (following preceding_visit_occurrence_id up to `chain_hops` back,
 # so an ED visit before admission is part of the encounter); fallback when no visit covers t0.
 encounter: {fallback_days: 7, chain_hops: 3}
+# Diagnosis-code rows: time = condition_start_datetime, else linked-visit start, else condition_start_date (start of day);
+# the two fallbacks set timing_approximate (encounter-level codes have imprecise timing).
 
 vocabularies: [LOINC, ICD10CM, ICD9CM, CPT4, HCPCS, ICD10PCS, ICD9Proc, SNOMED, RxNorm, "RxNorm Extension", UCUM]
 
@@ -418,6 +420,117 @@ code_event_items:
       - {system: ICD9CM, code: "934", prefix: true}              # 934 foreign body in trachea, bronchus and lung
     procedure_codes: []
     text_regex: ''
+  # ---- E1 STRUCTURED ALTERNATIVE (project-lead decision 2026-10-07). Diagnosis codes are ENCOUNTER-level and their
+  #      timing is imprecise: event time = condition_start_datetime when present, else the start of the linked visit
+  #      (visit_occurrence_id -> visit_start_datetime), else condition_start_date; the fallbacks set timing_approximate.
+  #      ICD-10-CM lists were verified against the ICD-10 MCP server (FY2027) on 2026-10-07. ICD-9-CM and CPT lists are
+  #      author-confident and NOT tool-verified (the MCP server covers ICD-10 only). `exclude_regex` runs on the
+  #      normalised code: chronic subdural (I62.03) and 7th-character S (sequela) are not acute.
+  dx_ich:
+    description: "acute nontraumatic intracerebral hemorrhage (I61.*)"
+    window_note: "[-72, +24] h of t0 via silver_anchors.yaml"
+    condition_codes:
+      - {system: ICD10CM, code: "I61", prefix: true}
+      - {system: ICD9CM, code: "431", prefix: true}
+    procedure_codes: []
+    text_regex: ''
+  dx_sah:
+    description: "subarachnoid hemorrhage: nontraumatic I60.*, traumatic S06.6*"
+    condition_codes:
+      - {system: ICD10CM, code: "I60", prefix: true}
+      - {system: ICD10CM, code: "S066", prefix: true, exclude_regex: 'S$'}
+      - {system: ICD9CM, code: "430", prefix: true}
+      - {system: ICD9CM, code: "8520", prefix: true}             # 852.0x traumatic subarachnoid
+    procedure_codes: []
+    text_regex: ''
+  dx_sdh_edh:
+    description: "subdural / epidural hemorrhage: I62.0* (not chronic I62.03), S06.4* epidural, S06.5* subdural"
+    condition_codes:
+      - {system: ICD10CM, code: "I620", prefix: true, exclude_regex: '^I6203'}
+      - {system: ICD10CM, code: "S064", prefix: true, exclude_regex: 'S$'}
+      - {system: ICD10CM, code: "S065", prefix: true, exclude_regex: 'S$'}
+      - {system: ICD9CM, code: "4320", prefix: true}             # 432.0 nontraumatic extradural
+      - {system: ICD9CM, code: "4321", prefix: true}             # 432.1 subdural
+      - {system: ICD9CM, code: "8521", prefix: true}             # 852.1x traumatic subdural
+      - {system: ICD9CM, code: "8524", prefix: true}             # 852.4x traumatic extradural
+    procedure_codes: []
+    text_regex: ''
+  dx_infarct:
+    description: "acute cerebral infarction I63.* (sequelae are I69.*, not matched)"
+    condition_codes:
+      - {system: ICD10CM, code: "I63", prefix: true}
+      - {system: ICD9CM, code: "43301", prefix: true}            # 433.x1 / 434.x1 occlusion WITH infarction
+      - {system: ICD9CM, code: "43311", prefix: true}
+      - {system: ICD9CM, code: "43321", prefix: true}
+      - {system: ICD9CM, code: "43331", prefix: true}
+      - {system: ICD9CM, code: "43381", prefix: true}
+      - {system: ICD9CM, code: "43391", prefix: true}
+      - {system: ICD9CM, code: "43401", prefix: true}
+      - {system: ICD9CM, code: "43411", prefix: true}
+      - {system: ICD9CM, code: "43491", prefix: true}
+    procedure_codes: []
+    text_regex: ''
+  dx_tbi:
+    description: "traumatic brain injury: S06.2* diffuse, S06.3* focal (contusion / laceration)"
+    condition_codes:
+      - {system: ICD10CM, code: "S062", prefix: true, exclude_regex: 'S$'}
+      - {system: ICD10CM, code: "S063", prefix: true, exclude_regex: 'S$'}
+      - {system: ICD9CM, code: "851", prefix: true}              # 851.xx cerebral laceration and contusion
+    procedure_codes: []
+    text_regex: ''
+  dx_mass_effect:
+    description: "G93.5 compression of brain / G93.6 cerebral edema; counted ONLY with another structural dx in the same window"
+    requires_any_of: [dx_ich, dx_sah, dx_sdh_edh, dx_infarct, dx_tbi]
+    condition_codes:
+      - {system: ICD10CM, code: "G935", prefix: true}
+      - {system: ICD10CM, code: "G936", prefix: true}
+      - {system: ICD9CM, code: "3484", prefix: true}             # 348.4 compression of brain
+      - {system: ICD9CM, code: "3485", prefix: true}             # 348.5 cerebral edema
+    procedure_codes: []
+    text_regex: ''
+  proc_neurosurgical:
+    description: "craniotomy / craniectomy, EVD placement, intracranial thrombectomy, IV thrombolysis (indication not codable)"
+    condition_codes: []
+    procedure_codes:
+      # ICD-10-PCS (verified against the MCP server, FY2027): extirpation of matter from brain, meninges, dura, epidural,
+      # subdural, subarachnoid, ventricle, cerebral hemisphere (hematoma evacuation, craniotomy)
+      - {system: ICD10PCS, code: "00C0", prefix: true}
+      - {system: ICD10PCS, code: "00C1", prefix: true}
+      - {system: ICD10PCS, code: "00C2", prefix: true}
+      - {system: ICD10PCS, code: "00C3", prefix: true}
+      - {system: ICD10PCS, code: "00C4", prefix: true}
+      - {system: ICD10PCS, code: "00C5", prefix: true}
+      - {system: ICD10PCS, code: "00C6", prefix: true}
+      - {system: ICD10PCS, code: "00C7", prefix: true}
+      # excision of skull / frontal / parietal / temporal / occipital bone, OPEN, non-diagnostic (craniectomy)
+      - {system: ICD10PCS, code: "0NB00ZZ"}
+      - {system: ICD10PCS, code: "0NB10ZZ"}
+      - {system: ICD10PCS, code: "0NB30ZZ"}
+      - {system: ICD10PCS, code: "0NB40ZZ"}
+      - {system: ICD10PCS, code: "0NB50ZZ"}
+      - {system: ICD10PCS, code: "0NB60ZZ"}
+      - {system: ICD10PCS, code: "0NB70ZZ"}
+      # EVD: drainage of cerebral ventricle WITH drainage device (diagnostic-only taps 0096xZX/ZZ are not EVD)
+      - {system: ICD10PCS, code: "009600Z"}
+      - {system: ICD10PCS, code: "009630Z"}
+      - {system: ICD10PCS, code: "009640Z"}
+      # thrombectomy: extirpation of matter from intracranial artery
+      - {system: ICD10PCS, code: "03CG", prefix: true}
+      # thrombolysis into peripheral vein (indication not codable: PE / MI use also lands here; verify)
+      - {system: ICD10PCS, code: "3E03317"}
+      # CPT (author-confident, NOT tool-verified)
+      - {system: CPT4, code: "61312"}                            # craniotomy, hematoma, supratentorial extradural / subdural
+      - {system: CPT4, code: "61313"}                            # craniotomy, intracerebral hematoma, supratentorial
+      - {system: CPT4, code: "61314"}                            # craniotomy, infratentorial / posterior fossa, extradural / subdural
+      - {system: CPT4, code: "61315"}                            # craniotomy, intracerebellar hematoma
+      - {system: CPT4, code: "61154"}                            # burr hole(s) with evacuation of hematoma
+      - {system: CPT4, code: "61322"}                            # decompressive craniectomy, without lobectomy
+      - {system: CPT4, code: "61323"}                            # decompressive craniectomy, with lobectomy
+      - {system: CPT4, code: "61210"}                            # burr hole for ventricular catheter / pressure device (EVD)
+      - {system: CPT4, code: "61107"}                            # twist drill hole for ventricular catheter
+      - {system: CPT4, code: "61645"}                            # intracranial arterial mechanical thrombectomy
+      - {system: CPT4, code: "37195"}                            # cerebral thrombolysis by IV infusion
+    text_regex: ''
   esrd:                      # HELPER (not an anchor item): excludes creatinine_doubling
     description: "end-stage renal disease / chronic dialysis"
     lookback_days: null
@@ -595,6 +708,8 @@ e4b_covariates:
 # =====================================================================================================
 # 7. Items that cannot be computed from structured data (RECORDED GAPS)
 # =====================================================================================================
+# (E1 is anchored on dx_* / proc_neurosurgical for the Study 1 cohort; the imaging_* items stay recorded as gaps for sites
+#  that have imaging reports. imaging_* are never emitted by the structured extractor.)
 unavailable_items:
   imaging_ich:           {reason: "no imaging findings table: the real Imaging/ prefix exists for I0001 and I0004 only (not an EEG site) and holds no coded findings; findings live in radiology report text (open-weight model on approved compute, out of scope)"}
   imaging_sah:           {reason: "as imaging_ich"}
@@ -620,6 +735,13 @@ item_status:
     - bilirubin_doubling_ge2
     - platelets_drop
     - profound_shock
+    - dx_ich                       # E1 structured alternative: encounter-level dx, timing approximate
+    - dx_sah
+    - dx_sdh_edh
+    - dx_infarct
+    - dx_tbi
+    - dx_mass_effect
+    - proc_neurosurgical           # thrombolysis indication not codable
 
 # =====================================================================================================
 # 8. EEG-report impression comparator (PROVISIONAL, comparator ONLY)

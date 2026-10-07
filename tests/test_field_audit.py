@@ -303,3 +303,136 @@ def test_dry_run_does_not_read_rows(synth_dir, monkeypatch):
     monkeypatch.setattr(data_io.LocalStore, "get_object", spy)
     field_audit.probe_schema(data_io.LocalStore(synth_dir))
     assert calls and all(r is not None for r in calls)
+
+
+# ------------------------------------------------------------ drug_type_concept_id semantics and score concepts by name
+ADMIN_ID, ORDER_ID = 32818, 38000177            # ids used by the synthetic generator
+GCS_CID, RASS_CID, FOUR_CID = 3000001, 3000002, 3000003
+
+
+def _concepts(extra=()):
+    rows = [(ADMIN_ID, "EHR administration record", "Type Concept", "Type Concept"),
+            (ORDER_ID, "Prescription written", "Type Concept", "Type Concept"),
+            (GCS_CID, "Glasgow coma score total", "Measurement", "LOINC"),
+            (RASS_CID, "Richmond agitation sedation scale", "Observation", "LOINC"),
+            (FOUR_CID, "Full outline of unresponsiveness score", "Measurement", "LOINC"),
+            (3000009, "Glasgow outcome scale", "Condition", "SNOMED")] + list(extra)
+    return pd.DataFrame(rows, columns=["concept_id", "concept_name", "domain_id", "vocabulary_id"])
+
+
+def test_classify_drug_type_names():
+    c = field_audit.classify_drug_type
+    assert c("EHR administration record") == "administration" and c("Inpatient administration") == "administration"
+    assert c("Prescription written") == "order" and c("Prescription dispensed in pharmacy") == "order"
+    assert c("EHR order") == "order" and c("Claim") == "other" and c(None) == "unresolved"
+
+
+def test_medication_uses_drug_type_concept_names_when_they_resolve(analytic):
+    tables = _copy(analytic)
+    tables["omop_concept"] = _concepts()
+    dx = tables["omop_drug_exposure"]
+    # administration-type rows WITHOUT an end datetime must still count (the old proxy would call them orders)
+    dx["drug_exposure_end_datetime"] = pd.NaT
+    dx["drug_type_concept_id"] = ADMIN_ID
+    report, _ = run_audit(tables)
+    med = next(r for r in report["rows"] if r["field"].startswith("Medication"))
+    assert med["passed"] and med["details"]["drug_type_semantics_resolved"]
+    assert "concept" in med["details"]["method"] and "FALLBACK" not in med["details"]["method"]
+    # the same rows typed as orders although they carry end datetimes: FAIL (an end time is not administration)
+    dx["drug_exposure_end_datetime"] = dx["drug_exposure_start_datetime"] + pd.Timedelta(hours=1)
+    dx["drug_type_concept_id"] = ORDER_ID
+    report, _ = run_audit(tables)
+    med = next(r for r in report["rows"] if r["field"].startswith("Medication"))
+    assert not med["passed"] and med["fallback_triggered"]
+    assert {c["category"] for c in med["details"]["drug_type_concepts"]} == {"order"}
+
+
+def test_medication_falls_back_to_end_time_proxy_when_type_ids_do_not_resolve(analytic):
+    tables = _copy(analytic)
+    tables["omop_drug_exposure"]["drug_type_concept_id"] = 0                  # zero-filled (rule 6)
+    report, _ = run_audit(tables)
+    med = next(r for r in report["rows"] if r["field"].startswith("Medication"))
+    assert not med["details"]["drug_type_semantics_resolved"] and "FALLBACK" in med["details"]["method"]
+
+
+def test_scores_found_by_concept_name_in_measurement_and_observation(analytic):
+    tables = _copy(analytic)
+    m = tables["omop_measurement"]
+    sc = m["kind"] == "score"
+    m.loc[sc, "measurement_source_value"] = None                              # text gives nothing: concept id only
+    m.loc[sc, "measurement_concept_id"] = GCS_CID
+    m.loc[sc, "score_class"] = None
+    base, _ = run_audit(tables)                                               # no concept table: nothing identifiable
+    assert not next(r for r in base["rows"] if r["field"].startswith("GCS"))["passed"]
+    # rebuild the analytic frames from raw rows through the concept map, as the loaders do
+    concept = _concepts()
+    score_map, _ = field_audit.concept_maps(concept)
+    assert score_map == {GCS_CID: "GCS", RASS_CID: "RASS", FOUR_CID: "FOUR"}     # outcome scale (Condition) excluded
+    raw = m.drop(columns=["kind", "score_class"])
+    tables["omop_measurement"] = field_audit.filter_measurements(raw, score_map)
+    tables["omop_concept"] = concept
+    report, _ = run_audit(tables)
+    row = next(r for r in report["rows"] if r["field"].startswith("GCS"))
+    assert row["passed"] and row["details"]["by_class_within_6h"]["GCS"]["proportion"] != "<11"
+    assert row["details"]["n_score_concepts_found_by_name"]["GCS"] == 1
+    # observation-table scores count too
+    obs = tables["omop_measurement"][lambda d: d["kind"] == "score"].head(300)
+    tables["omop_observation"] = pd.DataFrame({
+        "person_id": obs["person_id"], "observation_datetime": obs["measurement_datetime"],
+        "observation_source_value": "RASS score", "score_class": "RASS"})
+    tables["omop_measurement"] = tables["omop_measurement"][lambda d: d["kind"] != "score"]
+    report, _ = run_audit(tables)
+    row = next(r for r in report["rows"] if r["field"].startswith("GCS"))
+    assert row["details"]["by_source_within_6h"]["observation"]["n_candidates"] != 0
+    assert row["details"]["by_source_within_6h"]["measurement"]["n_candidates"] == "<11"     # none left (0 -> <11)
+
+
+def test_other_scales_do_not_count_towards_the_criterion(analytic):
+    tables = _copy(analytic)
+    m = tables["omop_measurement"]
+    sc = m["kind"] == "score"
+    m.loc[sc, "score_class"] = "OTHER"
+    report, _ = run_audit(tables)
+    row = next(r for r in report["rows"] if r["field"].startswith("GCS"))
+    assert not row["passed"]
+
+
+def test_loader_resolves_concepts_by_name_and_drug_types_on_disk(synth, synth_dir, tmp_path):
+    """load_audit_tables on a store whose omop_concept has the type and score concepts: the streaming path
+    (Arrow-side filters) finds score rows with NO source text and classifies drug types by name."""
+    import pyarrow as pa
+    import pyarrow.parquet as pq
+    d = tmp_path / "withconcepts"
+    shutil.copytree(synth_dir, d)
+    cdir = d / "OMOP/Merged/concept"
+    part = sorted(cdir.glob("*.parquet"))[0]
+    old = pq.read_table(part).to_pandas()
+    pq.write_table(pa.Table.from_pandas(pd.concat([old, _concepts().assign(
+        standard_concept="S", concept_class_id="x", concept_code="x")], ignore_index=True), preserve_index=False), part)
+    mpart = sorted((d / "OMOP/Merged/measurement").glob("*.parquet"))[0]
+    mt = pq.read_table(mpart).to_pandas()
+    gcs = mt["measurement_source_value"].astype(str).str.contains("Glasgow")
+    assert gcs.sum() > 50
+    mt.loc[gcs, "measurement_concept_id"] = GCS_CID
+    mt.loc[gcs, "measurement_source_value"] = "x"
+    pq.write_table(pa.Table.from_pandas(mt, preserve_index=False), mpart)
+    tabs = field_audit.load_audit_tables(data_io.LocalStore(d))
+    sm = tabs["omop_measurement"]
+    assert (sm["score_class"] == "GCS").sum() >= gcs.sum() * 0.5            # only cohort patients are kept
+    assert set(tabs["omop_concept"]["concept_id"]) >= {GCS_CID, ADMIN_ID, ORDER_ID}
+    assert 3000009 not in set(tabs["omop_concept"]["concept_id"])             # Condition-domain "Glasgow outcome": excluded
+    report, _ = run_audit(tabs)
+    med = next(r for r in report["rows"] if r["field"].startswith("Medication"))
+    assert med["details"]["drug_type_semantics_resolved"] and "concept" in med["details"]["method"]
+    assert not any("Inpatient" in str(k) for k in med["details"])            # names live in list values, not keys
+
+
+def test_real_data_failure_prints_stage_and_class_only(synth_dir, monkeypatch, capsys, tmp_path):
+    monkeypatch.setattr(data_io, "open_store", lambda *a, **k: data_io.LocalStore(synth_dir))
+
+    def boom(*a, **k):
+        raise ValueError("bad cell 2019-03-04 sub-S0001123456")
+    monkeypatch.setattr(field_audit, "load_audit_tables", boom)
+    assert field_audit.main(["--s3", "--out", str(tmp_path / "o")]) == 2
+    out = capsys.readouterr().out
+    assert "ValueError" in out and "load" in out and "sub-S0001" not in out and "2019" not in out
