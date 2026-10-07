@@ -63,6 +63,13 @@ def shard_of(recording_id: str, n: int) -> int:
 
 def load_recordings(path: Path) -> list[tuple[str, str]]:
     """(recording_id, key) pairs, de-duplicated on recording_id. Never printed."""
+    return [(r, k) for r, k, _ in load_recordings_with_parts(path)]
+
+
+def load_recordings_with_parts(path: Path) -> list[tuple[str, str, tuple | None]]:
+    """(recording_id, key, bids parts) triples, de-duplicated on recording_id. ``parts`` is
+    ``(site, BidsFolder, SessionID, EEGFolder)`` when the key was BUILT from BidsFolder columns (so a missing key can
+    be re-resolved by ``data_io.resolve_edf_key``), else ``None``. Never printed."""
     suf = path.suffix.lower()
     if suf == ".parquet":
         df = pd.read_parquet(path)
@@ -72,6 +79,7 @@ def load_recordings(path: Path) -> list[tuple[str, str]]:
         keys = [ln.strip() for ln in path.read_text().splitlines() if ln.strip()]
         df = pd.DataFrame({"edf_key": keys})
     kc = next((c for c in KEY_COLS if c in df.columns), None)
+    parts: list = [None] * len(df)
     if kc is not None:
         keys = df[kc].astype(str)
     elif {"BidsFolder", "SessionID"} <= set(df.columns):
@@ -80,16 +88,17 @@ def load_recordings(path: Path) -> list[tuple[str, str]]:
         if site_col is None:
             raise SystemExit("input needs a site column (SiteID / site) to build keys from BidsFolder")
         eeg = df["EEGFolder"] if "EEGFolder" in df.columns else pd.Series([None] * len(df))
-        keys = pd.Series([bids_edf_key(str(s), str(b), str(i), None if pd.isna(e) else str(e))
-                          for s, b, i, e in zip(df[site_col], df["BidsFolder"], df["SessionID"], eeg)])
+        parts = [(str(s), str(b), str(i), None if pd.isna(e) else str(e))
+                 for s, b, i, e in zip(df[site_col], df["BidsFolder"], df["SessionID"], eeg)]
+        keys = pd.Series([bids_edf_key(*p) for p in parts])
     else:
         raise SystemExit("input needs an edf_key/key column, or BidsFolder + SessionID + a site column")
     ids = df["recording_id"].astype(str) if "recording_id" in df.columns else keys.map(opaque_id)
     seen, out = set(), []
-    for rid, k in zip(ids, keys):
+    for rid, k, p in zip(ids, keys, parts):
         if rid not in seen and k and k != "nan":
             seen.add(rid)
-            out.append((rid, k))
+            out.append((rid, k, p))
     return out
 
 
@@ -127,7 +136,8 @@ def write_part(rows: list[dict], cols: list[str], out_dir: Path, tag: str) -> No
 
 def summarize(attempted: int, n_ok: int, reasons: Counter, elapsed: list[float], bytes_: list[int],
               fetch_s: list[float], proc_s: list[float], retries: int, usable: dict[str, list[float]],
-              passes: dict[str, list[bool]], wall_s: float, skipped: int) -> dict:
+              passes: dict[str, list[bool]], wall_s: float, skipped: int, chan: Counter | None = None,
+              resolved: Counter | None = None) -> dict:
     n_fail = attempted - n_ok
     show_ok = suppress_count(n_ok) if (n_fail == 0 or n_fail >= 11) else "<11"      # no recovery by subtraction
     out = {
@@ -147,6 +157,10 @@ def summarize(attempted: int, n_ok: int, reasons: Counter, elapsed: list[float],
         },
         "windows": {},
     }
+    if chan:                          # recordings with >= 1 minimum-set channel missing / dead / zero-calibrated
+        out["minimum_set_channel_problems"] = {k: suppress_count(v) for k, v in sorted(chan.items())}
+    if resolved:                      # not_found recordings recovered by the fallback key resolution, by pattern NAME
+        out["key_fallback_resolved_by_pattern"] = {k: suppress_count(v) for k, v in sorted(resolved.items())}
     for w, vals in usable.items():
         out["windows"][w] = {"n": show_ok if show_ok == "<11" else suppress_count(len(vals)),   # n = succeeded: same rule
                              "usable_fraction_quantiles": safe_quantiles(vals),
@@ -181,9 +195,9 @@ def main(argv=None, s3=None) -> int:
     out_dir.mkdir(parents=True, exist_ok=True)
     os.chmod(out_dir, 0o700)
 
-    recs = [(r, k) for r, k in load_recordings(inp) if shard_of(r, args.of) == args.shard]
+    recs = [(r, k, p) for r, k, p in load_recordings_with_parts(inp) if shard_of(r, args.of) == args.shard]
     done = load_done(out_dir, args.retry_permanent)
-    todo = [(r, k) for r, k in recs if r not in done]
+    todo = [(r, k, p) for r, k, p in recs if r not in done]
     skipped = len(recs) - len(todo)
     if args.limit is not None:
         todo = todo[: args.limit]
@@ -215,6 +229,8 @@ def main(argv=None, s3=None) -> int:
     buf_rows: list[dict] = []
     buf_ledger: list[list] = []
     n_ok = retries = 0
+    chan: Counter = Counter()
+    resolved: Counter = Counter()
     t_wall = time.monotonic()
 
     def flush():
@@ -227,14 +243,30 @@ def main(argv=None, s3=None) -> int:
         buf_rows, buf_ledger = [], []
 
     try:
-        for rid, key in todo:
+        from sortinghat import data_io
+        for rid, key, parts in todo:
             res = stream_features(s3, key, timeout_s=args.timeout, max_attempts=args.max_attempts,
                                   compute_failed=args.compute_failed, feat_cfg=feat_cfg, windows=windows)
+            if res.reason == FailureReason.NOT_FOUND and parts is not None:
+                # documented key missing: try the other task token / name variants, then list ONLY this recording's
+                # own session folder (data_io.resolve_edf_key). Keys are never printed; only the pattern name counts.
+                try:
+                    found = data_io.resolve_edf_key(s3, *parts)
+                except Exception:                           # noqa: BLE001 - keep the not_found result
+                    found = None
+                if found is not None and found.found and found.key != key:
+                    res = stream_features(s3, found.key, timeout_s=args.timeout, max_attempts=args.max_attempts,
+                                          compute_failed=args.compute_failed, feat_cfg=feat_cfg, windows=windows)
+                    if res.ok:
+                        resolved[found.pattern] += 1
             elapsed.append(res.elapsed_s)
             bytes_.append(res.bytes_fetched)
             retries += res.n_retries
             if res.ok:
                 n_ok += 1
+                chan["any_missing"] += res.n_missing_min > 0
+                chan["any_dead_constant"] += res.n_dead_min > 0
+                chan["any_zero_calibration"] += res.n_invalid_min > 0
                 fetch_s.append(res.fetch_s)
                 proc_s.append(res.process_s)
                 buf_rows += [{"recording_id": rid, **r} for r in res.rows]
@@ -253,12 +285,16 @@ def main(argv=None, s3=None) -> int:
     wall = time.monotonic() - t_wall
 
     summ = summarize(len(todo), n_ok, reasons, elapsed, bytes_, fetch_s, proc_s, retries, usable, passes, wall,
-                     skipped)
+                     skipped, +chan, +resolved)
     safe_print(f"shard {args.shard}/{args.of} | attempted: {summ['attempted']} | already done (skipped): "
                f"{summ['already_done_skipped']} | succeeded: {summ['succeeded']} | failed: {summ['failed']} "
                f"| success rate: {summ['success_rate']}")
     for r, c in summ["failure_reasons"].items():
         safe_print(f"  failure {r}: {c}")
+    for r, c in summ.get("key_fallback_resolved_by_pattern", {}).items():
+        safe_print(f"  key fallback resolved via {r}: {c}")
+    for r, c in summ.get("minimum_set_channel_problems", {}).items():
+        safe_print(f"  recordings with minimum-set channel problem {r}: {c}")
     t = summ["throughput"]
     safe_print("throughput (not patient data): wall s/recording", t["wall_seconds_per_recording"],
                "| mean fetch s", t["mean_fetch_seconds"], "| mean process s", t["mean_process_seconds"],

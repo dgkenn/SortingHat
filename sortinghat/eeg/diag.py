@@ -190,7 +190,8 @@ def _channel_epochs(h: EDFHeader, i: int, raw_records: np.ndarray, r0: int, star
     out.n_const_digital = int(const.sum())
     gain = (h.phys_max[i] - h.phys_min[i]) / (h.dig_max[i] - h.dig_min[i])
     phys = (ep[:, 0].astype(np.float64) - h.dig_min[i]) * gain + h.phys_min[i]
-    out.n_zero_valued = int((const & (np.abs(phys) < 1e-9)).sum())
+    # zero-filled: the constant is digital 0 or within one quantisation step of physical 0
+    out.n_zero_valued = int((const & ((ep[:, 0] == 0) | (np.abs(phys) <= abs(gain) + 1e-12))).sum())
     return out
 
 
@@ -270,8 +271,6 @@ def _cause(i: SignalInfo) -> str:
     """One mutually exclusive technical cause per recording, in the order a fix would be applied."""
     if i.edf_type == "EDF+D":
         return "edf_plus_d_discontinuous"
-    if any(r.startswith("read_error:") for r in i.reasons):
-        return "decode_error"
     missing = [c for c in REQUIRED if c not in i.found]
     if len(missing) == len(REQUIRED):
         return "bipolar_labels_only" if i.n_bipolar else "no_required_labels_recognised"
@@ -281,6 +280,8 @@ def _cause(i: SignalInfo) -> str:
         return "required_channel_zero_calibration_range"
     if any(e.n_epochs and e.n_const_digital == e.n_epochs for c, e in i.epochs.items() if c in REQUIRED):
         return "required_channel_constant_whole_window"
+    if any(r.startswith("read_error:") for r in i.reasons):
+        return "decode_error"
     if i.usable_primary is not None and i.usable_primary < 0.6:
         return "low_usable_other_artifacts"
     return "no_technical_problem"

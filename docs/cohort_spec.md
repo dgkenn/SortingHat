@@ -1,9 +1,9 @@
 # Study 1 cohort specification (operational)
 
-**Status:** DRAFT, 2026-10-07. Developed and tested on synthetic data only; not yet run on real HEEDB.
+**Status:** DRAFT, 2026-10-07; project-lead decisions D-104 to D-107 applied (section 7). Developed and tested on synthetic data only; not yet run on real HEEDB.
 **Code:** `sortinghat/cohort/` (config, sources, rules, flow, build, output), `scripts/build_cohort.py`, tests `tests/test_cohort*.py`.
 **Design source:** `docs/research_plan_v1.txt` ("Population and index time"), `docs/prereg_study1_sap.md` section 2.
-**Not written here:** DECISION_LOG entries. Section 5 lists every operational choice that needs one (provisional ids `C-nn`); the log keeps its append-only rule.
+**DECISION_LOG:** D-104 to D-107 record the choices below (section 7). Section 5 stays the reference list; ids `C-nn` are the spec's own.
 
 ## 1. What the plan fixes, and what this code does with it
 
@@ -15,7 +15,7 @@
 | t0 = EEG start | `StartTime(EEG)` of reports_findings (S-sites, I0002, I0003); `StartDateTime` of eeg_metadata at I0008/I0009 (no findings file). No fallback time is used | `sources` |
 | Minutes 1-11 must exist | recording duration >= 660 s (`window.PRIMARY_START_S + PRIMARY_DURATION_S`) | `build` |
 | EEG within 24 h of documented ACI onset; 6/12/48 h sensitivity | onset proxy (section 2); rows kept up to the widest window (48 h); flags `onset_le_6h/12h/24h/48h`; `in_strict` / `in_broad` use 24 h | `build` |
-| Strict: GCS <= 11 or FOUR <= 12 within +-6 h of t0 | `severity_strict` (section 3) | `rules.severity` |
+| Strict: GCS <= 11 or FOUR <= 12 within +-6 h of t0 | PRIMARY (D-105): nearest GCS/FOUR in [t0 - 6 h, t0 + 1 h] qualifies -> `severity_strict`, `in_strict`. SENSITIVITY `strict_pm6`: any qualifying score within +-6 h -> `severity_strict_pm6`, `in_strict_pm6` (section 3) | `rules.severity` |
 | Broad EHR-phenotype cohort, reported separately | `phenotype` (section 3); `in_broad` contains `in_strict`; "broad only" = `in_broad & ~in_strict` | `rules.phenotype` |
 | >= 60% usable data on the 10 hairline electrodes | NOT a metadata step. The key list carries the window; the streaming extractor applies the QC and its counts are appended to the flow (flow.md lists it as pending) | `output.PENDING_STEPS` |
 
@@ -34,13 +34,13 @@ Known weakness: the proxy is not the clinical onset. A patient admitted for anot
 
 **Scores.** Rows of `omop_measurement` whose `measurement_source_value` is classified `gcs`, `gcs_eye/motor/verbal` or `four` by `baselines.lexicon.classify_measurement` (the same rule the baselines use, so the cohort and Baseline A read the same rows). Concept ids are not used (they can be zero-filled). Values outside `lexicon.PLAUSIBLE` (GCS 3-15, FOUR 0-16) are dropped, never clipped. When eye, motor and verbal are all charted at the same timestamp and no total is, the total is their sum. A date without a time cannot place a score within +-6 h and is ignored.
 
-**Strict.** Any GCS total <= 11 or any FOUR <= 12 charted within +-6 h of t0 (`score_rule = any`; `nearest` takes only the closest value per instrument). The window includes up to 6 h AFTER t0, as the plan states. This is a selection rule; baselines never see those rows because every baseline feature goes through `baselines.asof.as_of`. Consequence to state in the paper: cohort membership is only knowable retrospectively. Sedation is not adjusted for (a low GCS under propofol still qualifies).
+**Strict (primary, D-105).** Per instrument, the score closest to t0 within [t0 - 6 h, t0 + 1 h] (the pre-t0 score on a tie) is taken; the patient is strict if the nearest GCS total is <= 11 or the nearest FOUR is <= 12. So only 1 h of post-t0 information defines membership, and the intended-use population is knowable at t0 (closes C-18). **`strict_pm6` (flagged sensitivity).** Any GCS <= 11 or FOUR <= 12 within +-6 h of t0, the plan's wording. A strict patient is always `strict_pm6`; the table keeps both flags, the key list carries both, and the flow shows both ("Cohort membership" and "Strict definitions" splits). Rows that are `strict_pm6` or phenotype-positive but not primary-strict stay in the table so the sensitivity cohort can be analysed; `in_broad` = (primary strict or phenotype) within 24 h. Baselines never see post-t0 rows because every feature goes through `baselines.asof.as_of`. Sedation is not adjusted for.
 
 **Broad phenotype.** A condition starts in [encounter start, t0 + 6 h] with a symptom-level code for impaired consciousness: ICD-10-CM R40.0-R40.4, R41.0, R41.82; ICD-9-CM 780.01, 780.02, 780.09, 780.97 (dots removed, upper-cased). Deliberately NOT used: cardiac arrest, anoxic brain injury (E2-specific), G92/G93.4 encephalopathy (banned label evidence, D-007), seizure codes (E3 positive control), so the broad cohort does not select on a label family. EEG referral indication is not used (no real column; `ReferralIndication` is ASSUMED).
 
 ## 4. Flow, disclosure control, outputs
 
-**Order of steps** (units change from EEG sessions to patients at step 10): 1 EEG sessions; 2 patient id resolvable; 3 start time present; 4 age present; 5 age >= 18; 6 a visit covers t0; 7 visit setting classifiable; 8 acute-care setting; 9 not OR/EMU; 10 first qualifying EEG per patient; 11 duration known; 12 duration >= 11 min; 13 onset proxy exists; 14 within 48 h of onset; 15 strict severity or phenotype. Then disjoint splits: strict / broad-only / sensitivity-window-only; hours-from-onset bins; onset basis; acute-care basis (only if the service fallback is on); "first-EEG order uncertain" (patient has another session with no start time).
+**Order of steps** (units change from EEG sessions to patients at step 10): 1 EEG sessions; 2 patient id resolvable; 3 start time present; 4 age present; 5 age >= 18; 6 a visit covers t0; 7 visit setting classifiable; 8 acute-care setting; 9 not OR/EMU; 10 first qualifying EEG per patient; 11 duration known; 12 duration >= 11 min; 13 onset proxy exists; 14 within 48 h of onset; 15 strict severity (primary, or `strict_pm6`) or phenotype. Then disjoint splits: strict / strict_pm6-only / broad-only / sensitivity-window-only; both strict definitions (both / primary only / pm6 only); hours-from-onset bins; onset basis; acute-care basis (only if the service fallback is on); "first-EEG order uncertain" (patient has another session with no start time).
 
 **Disclosure control** (`cohort/flow.py`; everything printed or written goes through `sortinghat.safe_output`):
 
@@ -54,7 +54,7 @@ Known weakness: the proxy is not the clinical onset. A patient admitted for anot
 
 | File | Content | Mode |
 |---|---|---|
-| `out/local_only/cohort_study1.csv` | one row per patient: ids, t0, age, service, visit class, acute basis, duration, onset, onset basis, hours since onset, `onset_le_*h`, lowest GCS/FOUR in the window, `severity_strict`, `phenotype`, `in_strict`, `in_broad`, `n_unstamped_sessions` | 0600 (dir 0700) |
+| `out/local_only/cohort_study1.csv` | one row per patient: ids, t0, age, service, visit class, acute basis, duration, onset, onset basis, hours since onset, `onset_le_*h`, lowest GCS/FOUR in the window, nearest GCS/FOUR in the primary window, `severity_strict`, `severity_strict_pm6`, `phenotype`, `in_strict`, `in_strict_pm6`, `in_broad`, `person_id_source` (id before the merge map), `n_unstamped_sessions` | 0600 (dir 0700) |
 | `out/local_only/recording_keys.csv` | `SiteID, person_id, SessionID, BidsFolder, EEGFolder, edf_key, task_token_assumed, window_start_s, window_duration_s, in_strict, in_broad`; read with `cohort.read_key_list`; `edf_key` is the documented BIDS EDF key under the access point (first candidate of `data_io.bids_edf_candidates`; the extractor can rebuild the others from the same row's `SiteID, BidsFolder, SessionID, EEGFolder`) | 0600 |
 | `out/cohort/flow.md`, `flow.json` | aggregate flow, suppressed | normal |
 
@@ -75,17 +75,17 @@ Entries are not written here. Ids are provisional. "Alt" is the sensitivity swit
 | C-05 | **Encounter chaining**: acute visits ending <= 6 h before the matched visit starts belong to the same encounter (one hop). | Sets ED arrival as encounter start. | `visit_chain_gap_h` |
 | C-06 | **ACI onset proxy** = first abnormal score (GCS <= 14 or FOUR <= 15) in [encounter start, t0], else encounter start. No note-derived onset. | "Documented ACI onset" has no structured field. | `--onset-rule visit_start|score_only`; `abnormal_*_max` |
 | C-07 | **Recording duration** = `DurationInSeconds` / `RecordingDuration`, else `EndTime - StartTime`; minimum 660 s. The unit of `RecordingDuration` (I0008/I0009) is unread; assumed seconds. flow.md prints the quartiles of metadata duration over clock duration per site (about 1 if seconds). Gaps and EDF+D are the extractor's business. | A wrong unit silently drops or keeps a whole site. | `--duration-scale SITE=FACTOR` |
-| C-08 | **Strict severity** = any qualifying score in +-6 h (including up to 6 h after t0); totals as charted, else sum of the three components at one timestamp; implausible values dropped; no sedation adjustment; RASS/NESI do not qualify. | Plan gives thresholds, not "which value". Post-t0 scores define membership (selection, not feature). | `--score-rule nearest` |
+| C-08 | **Strict severity** (CHANGED by D-105): primary = nearest GCS/FOUR in [-6 h, +1 h] of t0, pre-t0 on ties, per instrument; `strict_pm6` = any score within +-6 h as sensitivity. Totals as charted, else the sum of three components at one timestamp; implausible values dropped; no sedation adjustment; RASS/NESI do not qualify. "Nearest" is read per instrument, not among qualifying scores only. | Plan gives thresholds, not which value or window. | `--score-rule any`; `score_before_h`, `score_after_h`, `pm6_window_h` |
 | C-09 | **Windows**: rows kept to 48 h; primary flag at 24 h; 6/12/48 h are flags, not separate cohorts. | The 48 h analysis is wider than the 24 h primary. | `onset_primary_h`, `onset_sensitivity_h` |
 | C-10 | **Broad phenotype proxy** = symptom codes R40.0-4, R41.0, R41.82 / 780.01, .02, .09, .97 in [encounter start, t0 + 6 h]; excludes arrest, anoxic, encephalopathy and seizure codes. Broad contains strict. Billing diagnoses may be stamped at discharge, so the window misses some. | Defines the secondary cohort and its spectrum. | `phenotype_after_h`, `rules.PHENOTYPE_CODES` |
-| C-11 | **Patient identity** = BDSPPatientID (OMOP `person_id`), taken as globally unique; `PatientMergeHistory` is not applied. | Merged records would be counted twice and "first EEG" would be wrong. | needs the merge file |
+| C-11 | **Patient identity** (CHANGED by D-106) = BDSPPatientID (OMOP `person_id`), taken as globally unique, AFTER applying `PatientMergeHistory/` (retired id -> surviving id, chains followed) before first-EEG selection, and re-keying visits/scores/conditions of retired ids. The table is UNREAD (the dry run saw three file names at the access-point root): the old/new id column names are ASSUMED (`merge_pairs`: one id-like column matching old/retired/merged/source..., one matching new/surviving/target/primary...). If the prefix is absent, a one-line notice is printed and written to the flow checks; if its columns are not recognised, the same with "NOT applied". | Merged records would be counted twice and "first EEG" would be wrong. | `sources.merge_pairs` |
 | C-12 | **Missing start time**: such sessions are dropped before choosing the first EEG; no start fallback (ReportBeginDTS, ReportEEGDateTime, CreationTime are not t0). `n_unstamped_sessions` and a flow split show how many included patients have one. | A patient's true first EEG may be the unstamped one. | |
 | C-13 | **Age**: missing age is excluded, not imputed from `HEEDB_patients`; age is at the index EEG. I0008/I0009 age depends on a shifted `DateOfBirth`. | | |
 | C-14 | **Score identification by source text** (shared lexicon with the baselines); concept ids unused. | Concept ids may be zero-filled; the audit's newer concept-class mapping is not used here. | |
 | C-15 | **Disclosure rules of the flow** (merge, pool, partition suppression; section 4). | Changes what the flow can show; small sites are pooled, so the per-site >= 300 check (D-024) must be read from the local table, not the flow. | |
 | C-16 | **Flow stops before EEG QC.** The minimum-channel/usable-data step (10 hairline electrodes, >= 60% usable) is added by the extractor; the cohort size entering the models is the post-QC size. | Plan lists it as a population criterion. | |
-| C-17 | **Referral indication is not part of the cohort** (no real column). Baseline D has no input until a source is chosen. | | |
-| C-18 | **Selection on post-t0 information** (C-08, C-10) limits the intended-use claim: at t0 the cohort definition is not yet known. | Needs a sentence in the preregistration. | |
+| C-17 | **Baseline D is dropped** (D-107): HEEDB has no EEG referral-indication source (no column in any real header), so the Baseline D sensitivity analysis is removed from the SAP. The cohort does not record the indication. (`baselines/` still builds D from `ReferralIndication` for synthetic data; that code is not owned here.) | | |
+| C-18 | **Selection on post-t0 information.** Resolved for the primary strict cohort by D-105 (only +1 h after t0); remains for `strict_pm6` (up to +6 h, labelled sensitivity) and for the broad phenotype window (t0 + 6 h). | | |
 
 ## 6. Limits and what is not verified
 
@@ -94,3 +94,12 @@ Entries are not written here. Ids are provisional. "Alt" is the sensitivity swit
 - Overlapping visits are resolved by "latest start <= t0" (the audit's rule), not by any-overlap.
 - The recording key list assumes the BIDS EDF key pattern; the `cEEG` task token cannot be derived outside S0001/S0002.
 - The three tables `imaging`, `omop_note`, labs are not used by the cohort.
+
+## 7. Project-lead decisions applied (2026-10-07)
+
+| DECISION_LOG | Content | Spec rows |
+|---|---|---|
+| D-104 | Operational choices accepted as specified here: C-01 to C-07, C-09, C-10, C-12 to C-16 | those rows |
+| D-105 | Strict window [-6 h, +1 h] primary, +-6 h sensitivity (`strict_pm6`) | C-08, C-18 |
+| D-106 | Patient merge history applied when available | C-11 |
+| D-107 | Baseline D dropped | C-17 |

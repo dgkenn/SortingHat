@@ -12,7 +12,7 @@ from ..eeg.io import DEFAULT_MINIMUM_CHANNELS
 from ..eeg.window import PRIMARY_DURATION_S, PRIMARY_START_S
 
 ONSET_RULES = ("score_then_visit", "visit_start", "score_only")
-SCORE_RULES = ("any", "nearest")
+SCORE_RULES = ("nearest", "any")
 
 
 @dataclass(frozen=True)
@@ -33,11 +33,14 @@ class CohortConfig:
     abnormal_four_max: float = 15.0
     onset_primary_h: float = 24.0                       # plan: EEG within 24 h of onset
     onset_sensitivity_h: tuple[float, ...] = (6.0, 12.0, 48.0)        # plan: <= 6 / 12 / 48 h sensitivity analyses
-    # --- strict severity
-    score_window_h: float = 6.0                         # plan: within +-6 h of t0
+    # --- strict severity. PRIMARY (D-105): nearest qualifying-instrument score in [t0 - 6 h, t0 + 1 h], pre-t0 on ties.
+    score_before_h: float = 6.0
+    score_after_h: float = 1.0
     gcs_strict_max: float = 11.0                        # plan: GCS <= 11
     four_strict_max: float = 12.0                       # plan: FOUR <= 12
-    score_rule: str = "any"                             # C-08: any qualifying score in the window ("nearest": closest per instrument)
+    score_rule: str = "nearest"                         # primary rule ("any": any qualifying score in the window)
+    # SENSITIVITY ``strict_pm6``: any qualifying score within +-6 h of t0 (the plan's wording; uses 6 h of post-t0 data)
+    pm6_window_h: float = 6.0
     # --- broad EHR phenotype
     phenotype_after_h: float = 6.0                      # C-10: condition start in [encounter start, t0 + this]
     # --- hand-off to the streaming extractor

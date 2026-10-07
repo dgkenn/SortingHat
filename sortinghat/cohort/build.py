@@ -9,7 +9,7 @@ Order of steps (see ``docs/cohort_spec.md`` for the operational choice behind ea
   EEG sessions -> patient id -> start time -> age known -> adult -> visit covering start -> visit setting
   classified -> acute-care setting -> not OR/EMU service -> FIRST QUALIFYING EEG PER PATIENT (sessions become
   patients) -> recording covers minutes 1-11 -> ACI onset proxy exists -> EEG within the widest onset window
-  (48 h) -> strict severity or EHR phenotype.
+  (48 h) -> strict severity (primary window or +-6 h sensitivity) or EHR phenotype.
 
 ``in_strict`` / ``in_broad`` are the PRIMARY cohorts (EEG within 24 h of onset); the 6 / 12 / 48 h sensitivity
 windows are flags on the same rows. The broad cohort contains the strict cohort ("broad only" = broad and not
@@ -27,13 +27,13 @@ import numpy as np
 import pandas as pd
 
 from .. import data_io
-from ..safe_output import safe_quantiles
+from ..safe_output import safe_quantiles, suppress_count
 from . import rules
 from .config import CohortConfig
 from .flow import FlowRecorder, flow_report
 
 KEY_LIST_COLUMNS = ["SiteID", "person_id", "SessionID", "BidsFolder", "EEGFolder", "edf_key",
-                    "task_token_assumed", "window_start_s", "window_duration_s", "in_strict", "in_broad"]
+                    "task_token_assumed", "window_start_s", "window_duration_s", "in_strict", "in_strict_pm6", "in_broad"]
 INCLUDED = "included"
 LATER_SESSION = "Not the patient's first qualifying EEG"
 SESS, PAT = "EEG sessions", "patients"
@@ -47,6 +47,7 @@ class CohortResult:
     flow_raw: dict                      # exact counts, in memory only
     report: dict                        # suppressed, aggregate-only
     config: dict = field(default_factory=dict)
+    merge_status: str = "absent"        # patient merge history: applied | absent | unrecognised
 
 
 def _hours(a: pd.Series, b: pd.Series) -> pd.Series:
@@ -101,14 +102,47 @@ class _Run:
         self.flow.step(label, unit, self.S["SiteID"])
 
 
+MERGE_NOTICE = {
+    "applied": "patient merge history applied before first-EEG selection",
+    "absent": "NO patient merge history table found: patient identity = BDSPPatientID as given (D-106)",
+    "unrecognised": "patient merge history present but its old/new id columns were not recognised: NOT applied (D-106)"}
+
+
+def _remap(df: pd.DataFrame, mm: dict[int, int]) -> pd.DataFrame:
+    if not mm or not len(df):
+        return df
+    pid = df["person_id"].astype("int64")
+    mapped = pid.map(mm)
+    return df.assign(person_id=mapped.where(mapped.notna(), pid).astype("int64"))
+
+
 def build_cohort(src, cfg: CohortConfig | None = None) -> CohortResult:
     cfg = cfg or CohortConfig()
     S0 = src.sessions().reset_index(drop=True)
+    mm, merge_status = src.merge_map() if hasattr(src, "merge_map") else ({}, "absent")
+    S0["person_id_source"] = S0["person_id"]
+    n_remapped = 0
+    if mm and len(S0):
+        mapped = S0["person_id"].map(mm)
+        n_remapped = int(mapped.notna().sum())
+        S0["person_id"] = mapped.where(mapped.notna(), S0["person_id"]).astype("Int64")
+    rev: dict[int, list[int]] = {}
+    for old, new in mm.items():
+        rev.setdefault(new, []).append(old)
+
+    def fetch(fn, pids):
+        """Fetch OMOP rows for the surviving ids AND the ids merged into them, re-keyed to the surviving id."""
+        ids = {int(p) for p in pids}
+        ids |= {o for p in list(ids) for o in rev.get(p, [])}
+        return _remap(fn(sorted(ids)), mm)
+
     sites = sorted(S0["SiteID"].astype(str).unique())
     flow = FlowRecorder(sites)
     run = _Run(S0, flow)
     flow.start("EEG sessions in HEEDB metadata", SESS, S0["SiteID"])
     flow.checks.update(duration_unit_check(S0, sites))
+    flow.checks["merge_history_status"] = MERGE_NOTICE[merge_status] + (
+        f"; sessions re-keyed: {suppress_count(n_remapped)}" if merge_status == "applied" else "")
     n_unstamped = S0[S0["person_id"].notna() & S0["t0"].isna()].groupby("person_id").size()
 
     # ------------------------------------------------------------------ session-level qualification
@@ -119,7 +153,7 @@ def build_cohort(src, cfg: CohortConfig | None = None) -> CohortResult:
 
     S = run.S.copy()
     S["person_id"] = S["person_id"].astype("int64")
-    visits = src.visits(S["person_id"].unique())
+    visits = fetch(src.visits, S["person_id"].unique())
     run.S = S.join(rules.match_visits(S, visits, cfg.acute_classes, cfg.visit_chain_gap_h))
     run.S["ServiceName"] = run.S["ServiceName"].astype("string").str.strip().str.upper()
     run.drop("No visit covering the EEG start", run.S["visit_start"].notna(), SESS)
@@ -147,7 +181,7 @@ def build_cohort(src, cfg: CohortConfig | None = None) -> CohortResult:
 
     # ------------------------------------------------------------------ ACI onset proxy and time since onset
     run.S = run.S.reset_index(drop=True)          # unique, positional index for the row-level joins below
-    scores = rules.extract_scores(src.scores(run.S["person_id"].unique()))
+    scores = rules.extract_scores(fetch(src.scores, run.S["person_id"].unique()))
     on = rules.onset_times(run.S, scores, cfg.onset_rule, cfg.abnormal_gcs_max, cfg.abnormal_four_max)
     run.S = run.S.assign(onset=on["onset"], onset_basis=on["onset_basis"])
     run.S["hours_since_onset"] = _hours(run.S["t0"], run.S["onset"])
@@ -157,12 +191,18 @@ def build_cohort(src, cfg: CohortConfig | None = None) -> CohortResult:
         raise AssertionError("onset after t0")
 
     # ------------------------------------------------------------------ strict severity / broad phenotype
-    sev = rules.severity(run.S, scores, cfg.score_window_h, cfg.gcs_strict_max, cfg.four_strict_max, cfg.score_rule)
-    run.S = run.S.join(sev)
-    cond = src.conditions(run.S["person_id"].unique())
+    sev = rules.severity(run.S, scores, cfg.score_before_h, cfg.score_after_h, cfg.gcs_strict_max,
+                         cfg.four_strict_max, cfg.score_rule)
+    pm6 = rules.severity(run.S, scores, cfg.pm6_window_h, cfg.pm6_window_h, cfg.gcs_strict_max,
+                         cfg.four_strict_max, "any")
+    run.S = run.S.join(sev.rename(columns={"gcs_min": "gcs_min_window", "four_min": "four_min_window",
+                                           "gcs_nearest": "gcs_nearest_window", "four_nearest": "four_nearest_window",
+                                           "n_score_obs": "n_score_obs_window", "strict": "severity_strict"}))
+    run.S["severity_strict_pm6"] = pm6["strict"]
+    cond = fetch(src.conditions, run.S["person_id"].unique())
     run.S["phenotype"] = rules.phenotype(run.S, cond, cfg.phenotype_after_h)
-    run.drop("Neither strict severity (GCS/FOUR) nor EHR phenotype",
-             run.S["severity_strict"] | run.S["phenotype"], PAT)
+    run.drop("Neither strict severity (GCS/FOUR, primary or +-6 h) nor EHR phenotype",
+             run.S["severity_strict"] | run.S["severity_strict_pm6"] | run.S["phenotype"], PAT)
 
     # ------------------------------------------------------------------ flags and the final table
     S = run.S.copy()
@@ -170,17 +210,19 @@ def build_cohort(src, cfg: CohortConfig | None = None) -> CohortResult:
         S[f"onset_le_{h:g}h"] = S["hours_since_onset"] <= h
     prim = S[f"onset_le_{cfg.onset_primary_h:g}h"]
     S["in_strict"] = S["severity_strict"] & prim
+    S["in_strict_pm6"] = S["severity_strict_pm6"] & prim
     S["in_broad"] = (S["severity_strict"] | S["phenotype"]) & prim
     S["n_unstamped_sessions"] = S["person_id"].map(n_unstamped).fillna(0).astype(int)
-    fill = pd.Series([data_io.bids_folder_for(s, p) for s, p in zip(S["SiteID"], S["person_id"])], index=S.index)
+    fill = pd.Series([data_io.bids_folder_for(s, p) for s, p in zip(S["SiteID"], S["person_id_source"])], index=S.index)
     S["BidsFolder"] = S["BidsFolder"].astype(object).where(S["BidsFolder"].notna(), fill)
     run.reason.loc[S["_sess_idx"].to_numpy()] = INCLUDED
     run.stage.loc[S["_sess_idx"].to_numpy()] = 10**6
 
-    cols = ["SiteID", "person_id", "SessionID", "BidsFolder", "EEGFolder", "t0", "age_years", "ServiceName",
+    cols = ["SiteID", "person_id", "person_id_source", "SessionID", "BidsFolder", "EEGFolder", "t0", "age_years", "ServiceName",
             "visit_class", "acute_basis", "duration_s", "duration_basis", "onset", "onset_basis",
             "hours_since_onset", *[f"onset_le_{h:g}h" for h in cfg.onset_windows_h], "gcs_min_window",
-            "four_min_window", "n_score_obs_window", "severity_strict", "phenotype", "in_strict", "in_broad",
+            "four_min_window", "gcs_nearest_window", "four_nearest_window", "n_score_obs_window", "severity_strict",
+            "severity_strict_pm6", "phenotype", "in_strict", "in_strict_pm6", "in_broad",
             "n_unstamped_sessions"]
     table = S[cols].sort_values("person_id").reset_index(drop=True)
     for c in ("SiteID", "SessionID", "BidsFolder", "EEGFolder", "ServiceName"):
@@ -190,7 +232,7 @@ def build_cohort(src, cfg: CohortConfig | None = None) -> CohortResult:
     keys = make_key_list(table, cfg)
     fates = _fates(S0, run.reason, run.stage)
     raw = flow.raw()
-    return CohortResult(table, keys, fates, raw, flow_report(raw, cfg.to_dict()), cfg.to_dict())
+    return CohortResult(table, keys, fates, raw, flow_report(raw, cfg.to_dict()), cfg.to_dict(), merge_status)
 
 
 def _fates(S0: pd.DataFrame, reason: pd.Series, stage: pd.Series) -> pd.Series:
@@ -207,8 +249,13 @@ def _partitions(flow: FlowRecorder, t: pd.DataFrame, cfg: CohortConfig) -> None:
     p = t[f"onset_le_{cfg.onset_primary_h:g}h"]
     flow.partition("Cohort membership of table rows", {
         "strict, primary window": site[t["in_strict"]],
-        "broad only, primary window": site[t["in_broad"] & ~t["in_strict"]],
+        "strict_pm6 only, primary window": site[t["in_strict_pm6"] & ~t["in_strict"]],
+        "broad only, primary window": site[t["in_broad"] & ~t["in_strict"] & ~t["in_strict_pm6"]],
         "sensitivity windows only": site[~p]})
+    flow.partition("Strict definitions, primary onset window", {
+        "both definitions": site[t["in_strict"] & t["in_strict_pm6"]],
+        "primary only (-6 h to +1 h)": site[t["in_strict"] & ~t["in_strict_pm6"]],
+        "strict_pm6 only (+-6 h)": site[~t["in_strict"] & t["in_strict_pm6"]]})
     ws = list(cfg.onset_windows_h)
     bins, lo = {}, -1e-9
     for h in ws:
@@ -239,5 +286,5 @@ def make_key_list(t: pd.DataFrame, cfg: CohortConfig) -> pd.DataFrame:
         "BidsFolder": t["BidsFolder"], "EEGFolder": t["EEGFolder"], "edf_key": edf,
         "task_token_assumed": t["EEGFolder"].isna(),
         "window_start_s": cfg.window_start_s, "window_duration_s": cfg.window_duration_s,
-        "in_strict": t["in_strict"], "in_broad": t["in_broad"]})
+        "in_strict": t["in_strict"], "in_strict_pm6": t["in_strict_pm6"], "in_broad": t["in_broad"]})
     return k[KEY_LIST_COLUMNS].reset_index(drop=True)

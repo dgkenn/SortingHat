@@ -21,6 +21,7 @@ sys.path.insert(0, str(Path(__file__).resolve().parents[1]))     # repo root, so
 from sortinghat import agent_safety, data_io                       # noqa: E402
 from sortinghat.cohort import CohortConfig, StoreSources, build_cohort, write_outputs   # noqa: E402
 from sortinghat.cohort.config import ONSET_RULES, SCORE_RULES        # noqa: E402
+from sortinghat.cohort.build import MERGE_NOTICE                      # noqa: E402
 from sortinghat.cohort.output import known_ids                       # noqa: E402
 from sortinghat.safe_output import safe_print, suppress_count         # noqa: E402
 
@@ -34,7 +35,8 @@ def main(argv=None) -> int:
     ap.add_argument("--sites", nargs="+", help="site codes (default: every site with an eeg-metadata CSV)")
     ap.add_argument("--out", default="out", help="output root (default: out; gitignored)")
     ap.add_argument("--onset-rule", choices=ONSET_RULES, default="score_then_visit")
-    ap.add_argument("--score-rule", choices=SCORE_RULES, default="any")
+    ap.add_argument("--score-rule", choices=SCORE_RULES, default="nearest",
+                    help="primary strict rule in [-6 h, +1 h] of t0 (D-105); strict_pm6 is always reported too")
     ap.add_argument("--service-fallback", action="store_true",
                     help="treat an unclassifiable visit as acute care when ServiceName is LTM (decision C-03)")
     ap.add_argument("--duration-scale", nargs="*", default=[], metavar="SITE=FACTOR",
@@ -56,9 +58,12 @@ def main(argv=None) -> int:
     safe_print("Study 1 cohort built (aggregate-only output; n<11 suppressed).", known_ids=ids)
     safe_print(f"  table rows (EEG within the widest onset window, strict or phenotype): {suppress_count(len(t))}",
                known_ids=ids)
-    safe_print(f"  strict cohort, primary window: {suppress_count(int(t['in_strict'].sum()))}", known_ids=ids)
+    safe_print(f"  strict cohort [-6 h, +1 h], primary window: {suppress_count(int(t['in_strict'].sum()))}", known_ids=ids)
+    safe_print(f"  strict_pm6 sensitivity cohort (+-6 h), primary window: "
+               f"{suppress_count(int(t['in_strict_pm6'].sum()))}", known_ids=ids)
     safe_print(f"  broad cohort (includes strict), primary window: {suppress_count(int(t['in_broad'].sum()))}",
                known_ids=ids)
+    safe_print(f"  notice: {MERGE_NOTICE[result.merge_status]}", known_ids=ids)
     safe_print(f"Flow report: {paths['flow_md']}", known_ids=ids)
     safe_print(f"Record-level files (mode 0600, not printed): {paths['cohort'].parent}/", known_ids=ids)
     return 0

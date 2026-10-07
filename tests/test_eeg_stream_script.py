@@ -131,3 +131,29 @@ def test_summary_suppression_has_no_complement_leak():
     assert s["succeeded"] == "<11" and s["failed"] == "<11" and s["success_rate"] == "<11"
     assert s["failure_reasons"] == {"not_found": "<11"}
     assert s["windows"]["primary"]["usable_fraction_quantiles"]["q50"] == 0.9
+
+
+def test_not_found_documented_key_falls_back_to_own_folder_listing(tmp_path, monkeypatch, capsys):
+    """The documented key is absent (extra BIDS entity in the real name): the script lists only that recording's
+    session folder, finds the .edf, extracts, and reports counts by pattern NAME only."""
+    from test_data_io_resilient import FlakyS3
+    import sortinghat.data_io as dio
+    monkeypatch.setattr(dio, "access_point", lambda name="credentialed": BUCKET)
+    blob = write_edf(tmp_path / "a.edf", generate_eeg(120, background="normal", seed=1), 200, CANONICAL_19).read_bytes()
+    objs, rows = {}, []
+    for i in range(12):
+        bf = f"sub-SYN{i:03d}"
+        objs[f"EEG/bids/SYN/{bf}/ses-1/eeg/{bf}_ses-1_task-EEG_run-01_eeg.edf"] = blob
+        rows.append({"SiteID": "SYN", "BidsFolder": bf, "SessionID": "1", "EEGFolder": None})
+    objs["EEG/bids/SYN/sub-SYN099/ses-1/eeg/other.json"] = b"{}"
+    rows.append({"SiteID": "SYN", "BidsFolder": "sub-SYN099", "SessionID": "1", "EEGFolder": None})    # no edf at all
+    lo = tmp_path / "local_only"
+    lo.mkdir()
+    pd.DataFrame(rows).to_csv(lo / "bids.csv", index=False)
+    rc = xef.main(["--input", str(lo / "bids.csv"), "--out-dir", str(lo / "f"), "--windows", "20s"],
+                  s3=FlakyS3(objs, p=0.0))
+    out = capsys.readouterr().out
+    assert rc == 0 and "key fallback resolved via folder_listing: 12" in out
+    assert "failure not_found: <11" in out and "sub-" not in out and "SYN" not in out and "run-01" not in out
+    df = pd.concat([pd.read_parquet(p) for p in (lo / "f").glob("part-*.parquet")])
+    assert df["recording_id"].nunique() == 12

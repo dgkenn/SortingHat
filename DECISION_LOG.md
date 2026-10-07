@@ -682,3 +682,28 @@
 - **Decision:** H5 is dropped from Study 1: no imaging report finalization time exists at any EEG site. It moves to the prospective programme.
 - **Rationale:** The plan's Phase 0a table specifies "Drop H5" when imaging finalization time is absent.
 - **Source:** Phase 0a table; schema dry run.
+
+### D-104 Study 1 cohort operational choices accepted as specified
+- **Date:** 2026-10-07 · **Area:** data · **Outcome data seen?** No
+- **Decision:** The cohort operationalisations C-01 to C-07, C-09, C-10 and C-12 to C-16 in `docs/cohort_spec.md` section 5 are accepted as written: index rule (first adult, acute-care, non-OR/EMU EEG with a start time; later criteria applied to that EEG only), the visit-based acute-care proxy with the ServiceName fallback off, OR/EMU exclusion, ED-to-admission encounter chaining, the ACI onset proxy (first abnormal GCS/FOUR, else encounter start), recording duration >= 660 s with the unit check, 48 h retention with 6/12/24/48 h flags, the symptom-code broad phenotype, missing-start handling, age rules, text-based score identification, the flow's disclosure rules, the EEG-QC step left to the extractor.
+- **Rationale:** The plan names the population and index time but not these operational rules; each was chosen before any HEEDB data were read and has a sensitivity switch in `CohortConfig`.
+- **Source:** `docs/cohort_spec.md`; Population and index time; `sortinghat/cohort/`.
+
+### D-105 Strict severity window [-6 h, +1 h] primary; +-6 h as a flagged sensitivity
+- **Date:** 2026-10-07 · **Area:** data · **Outcome data seen?** No
+- **Decision:** The primary strict cohort uses the nearest GCS (<= 11) or FOUR (<= 12) per instrument within [t0 - 6 h, t0 + 1 h] (pre-t0 on a tie). The plan's +-6 h rule becomes the sensitivity cohort `strict_pm6` (any qualifying score within +-6 h), reported beside the primary in the flow and the cohort table. Amends the Phase 0a "score within +-6 h" inclusion row for the primary analysis.
+- **Rationale:** The intended-use population must be knowable at t0; a window reaching 6 h after t0 defines membership with information a deployed system would not have. One hour after t0 allows a bedside score charted around the EEG start. Addresses spec item C-18 for the primary cohort.
+- **Source:** Population and index time; `docs/cohort_spec.md` C-08, C-18; Phase 0a, GCS row.
+
+### D-106 Patient merge history applied when available
+- **Date:** 2026-10-07 · **Area:** data · **Outcome data seen?** No
+- **Decision:** If a patient merge-history table exists (`PatientMergeHistory/` at the access-point root), retired ids are mapped to the surviving id (chains followed) before first-EEG selection, and OMOP rows of retired ids are re-keyed. If it is absent or its old/new id columns are not recognised, patient identity stays BDSPPatientID as given and a one-line aggregate notice is printed and written to the flow report. Its column names are unread and assumed.
+- **Rationale:** Merged records would otherwise be counted as two patients and "first EEG per patient" would pick the wrong EEG, and a patient-level split could leak across merged ids.
+- **Source:** `docs/research/heedb_schema_dryrun_2026-10-07.md` (access-point prefixes); `docs/cohort_spec.md` C-11.
+
+### D-107 Baseline D (referral question) dropped
+- **Date:** 2026-10-07 · **Area:** baselines · **Outcome data seen?** No
+- **Decision:** Baseline D and its sensitivity analysis are removed from Study 1. Supersedes D-015.
+- **Rationale:** No EEG referral-indication field exists in any real HEEDB header at any site (`ReferralIndication` is ASSUMED only), so Baseline D has no input and the plan's "indication field only" comparator cannot be built.
+- **Source:** `docs/research/heedb_schema_dryrun_2026-10-07.md`; `docs/heedb_schema_real.md` section B1; `docs/cohort_spec.md` C-17.
+

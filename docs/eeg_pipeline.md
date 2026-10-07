@@ -109,6 +109,41 @@ Runtime is dominated by complexity (pure Python), on the order of 10 s per recor
 an optional `numba` step is a possible later optimisation. Install the optional reader cross-check with
 `pip install -e .[eeg]`.
 
+## Real-data hardening (labels, calibration, dead channels, key resolution)
+
+* **Labels** (`io.normalize_channel_name`): `Fp1`, `FP1`, `EEG Fp1-Ref/-REF/-REF1`, `EEG T7`, `POL Fp1`, `Fp1-AVG/-LE/-AV`,
+  `C3-A2` / `T5-M1` (ear or mastoid reference), `Fp1-G2`, `EEG Fp1 - Ref` map to the canonical name (T7/T8/P7/P8 -> T3/T4/T5/T6).
+  Bipolar labels (`Fp1-F7`, `C3-Cz`) are NOT referential and map to nothing (`io.is_bipolar_label` counts them); a file with
+  only bipolar chains fails as `no_eeg_channels`. Two signals mapping to one channel no longer abort the read: the first wins
+  (`meta['duplicate_channels']`).
+* **Calibration** (`io.channel_scaling_status`): a signal with physical range 0 (pmin == pmax, e.g. 0/0) or digital range 0
+  decodes to a CONSTANT whatever the samples are. Such a channel is dropped and listed in `meta['invalid_scaling_channels']`
+  (reason `invalid_scaling_minimum_channels`), never counted as a flat electrode; if every EEG channel is like that the stream
+  result is `edf_invalid_scaling`.
+* **Dead channels** (`io.drop_dead_channels`, run by `pipeline.process_recording`): a channel that is EXACTLY constant (or NaN)
+  over the whole fetched segment (zero-filled placeholder, unplugged input) is removed and reported as missing
+  (`meta['dead_channels']`, reason `dead_minimum_channels`), not as flat data. Partly flat channels are still flagged by the QC.
+* **EDF+**: the `EDF Annotations` signal is skipped; `EDF+C` reads; `EDF+D` is refused (`edf_discontinuous`). `EDFHeader.edf_type`
+  and `Recording.meta['edf_type']` record which.
+* **Key resolution** (`data_io.resolve_edf_key`, used by `scripts/extract_eeg_features.py` when a documented key is `not_found`):
+  documented key, other task token, task-less name, SessionID spellings (`12.0` -> `12`), then a listing of ONLY the recording's own
+  `ses-<id>/eeg/` folder (`Delimiter='/'`); `parent_fallback` (off) also lists the subject's folder.
+* **Streaming summary** now also prints counts of recordings with a missing / dead / zero-calibration minimum-set channel and the
+  number recovered by the key fallback (by pattern name).
+
+### Diagnostics (human-run, aggregates only)
+
+```
+HEEDB_AWS_PROFILE=<profile> python3 scripts/diag_eeg_paths.py   --site S0001 --n 60 --seed 0
+HEEDB_AWS_PROFILE=<profile> python3 scripts/diag_eeg_signals.py --site S0001 --n 60 --seed 0
+```
+
+Both sample adult sessions from `eeg_metadata` (identifiers used in code only) and print no key, folder name or ID.
+Small cells: counts of TECHNICAL FILE properties (files with a header quirk, folders without a `.edf`, label counts) use
+`safe_output.technical_count`: exact when the sample has at least 50 recordings (so "7 of 60" is shown as 7), otherwise n < 11
+prints "<11". This exception is for file-layout diagnostics only, never clinical or demographic counts. Pooled epoch fractions
+and quantiles still need at least 11 recordings.
+
 ## Known limits
 
 * Only plain EDF (and EDF+C) is read; mixed per-signal rates are resampled to the highest rate.

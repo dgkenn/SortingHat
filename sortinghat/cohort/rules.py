@@ -183,37 +183,37 @@ def onset_times(index: pd.DataFrame, scores: pd.DataFrame, rule: str, gcs_max: f
 
 
 # ------------------------------------------------------------------------------------------- severity
-def severity(index: pd.DataFrame, scores: pd.DataFrame, window_h: float, gcs_max: float, four_max: float,
-             rule: str = "any") -> pd.DataFrame:
-    """Strict-severity flags per index row: GCS <= ``gcs_max`` or FOUR <= ``four_max`` within +-``window_h`` of t0.
+def severity(index: pd.DataFrame, scores: pd.DataFrame, before_h: float, after_h: float, gcs_max: float,
+             four_max: float, rule: str = "nearest") -> pd.DataFrame:
+    """Strict-severity flag per index row: GCS <= ``gcs_max`` or FOUR <= ``four_max`` charted in
+    [t0 - ``before_h``, t0 + ``after_h``].
 
-    ``rule='any'``: any score of the instrument in the window qualifies; ``'nearest'``: only the score closest to
-    t0 (earlier on a tie). Also returns the lowest GCS / FOUR in the window and the number of score observations
+    ``rule='nearest'`` (primary): per instrument only the score closest to t0 counts, the earlier (pre-t0) one on a
+    tie. ``rule='any'`` (the ``strict_pm6`` sensitivity): any score of the instrument in the window qualifies.
+    Also returns the lowest and the nearest GCS / FOUR in the window and the number of score observations
     (record-level; local file only)."""
     idx = index.index
-    out = pd.DataFrame({"gcs_min_window": np.nan, "four_min_window": np.nan, "n_score_obs_window": 0,
-                        "severity_strict": False}, index=idx)
-    out["gcs_min_window"] = out["gcs_min_window"].astype(float)
-    out["four_min_window"] = out["four_min_window"].astype(float)
+    out = pd.DataFrame({"gcs_min": np.nan, "four_min": np.nan, "gcs_nearest": np.nan, "four_nearest": np.nan,
+                        "n_score_obs": 0, "strict": False}, index=idx).astype(
+        {"gcs_min": float, "four_min": float, "gcs_nearest": float, "four_nearest": float})
     if not len(scores) or not len(index):
-        out["severity_scored"] = False
         return out
     j = index[["person_id", "t0"]].reset_index().merge(scores, on="person_id")
     key = j.columns[0]
     j["dt_h"] = (j["t"] - j["t0"]).dt.total_seconds() / 3600.0
-    j = j[j["dt_h"].abs() <= window_h]
-    out["n_score_obs_window"] = j.groupby(key).size().reindex(idx).fillna(0).astype(int)
-    for ins, col in (("gcs", "gcs_min_window"), ("four", "four_min_window")):
-        out[col] = j[j["instrument"] == ins].groupby(key)["value"].min().reindex(idx)
+    j = j[(j["dt_h"] >= -before_h) & (j["dt_h"] <= after_h)]
+    out["n_score_obs"] = j.groupby(key).size().reindex(idx).fillna(0).astype(int)
+    for ins in ("gcs", "four"):
+        out[f"{ins}_min"] = j[j["instrument"] == ins].groupby(key)["value"].min().reindex(idx)
+    near = j.assign(_a=j["dt_h"].abs(), _post=(j["dt_h"] > 0).astype(int)).sort_values(
+        [key, "instrument", "_a", "_post", "t"]).drop_duplicates([key, "instrument"])
+    for ins in ("gcs", "four"):
+        out[f"{ins}_nearest"] = near[near["instrument"] == ins].set_index(key)["value"].reindex(idx)
     if rule == "nearest":
-        j = j.assign(_a=j["dt_h"].abs()).sort_values([key, "instrument", "_a", "t"])
-        near = j.drop_duplicates([key, "instrument"])
-        gq = near[near["instrument"] == "gcs"].set_index(key)["value"].reindex(idx)
-        fq = near[near["instrument"] == "four"].set_index(key)["value"].reindex(idx)
+        gq, fq = out["gcs_nearest"], out["four_nearest"]
     else:
-        gq, fq = out["gcs_min_window"], out["four_min_window"]
-    out["severity_strict"] = ((gq <= gcs_max) | (fq <= four_max)).fillna(False).to_numpy(bool)
-    out["severity_scored"] = out["n_score_obs_window"] > 0
+        gq, fq = out["gcs_min"], out["four_min"]
+    out["strict"] = ((gq <= gcs_max) | (fq <= four_max)).fillna(False).to_numpy(bool)
     return out
 
 

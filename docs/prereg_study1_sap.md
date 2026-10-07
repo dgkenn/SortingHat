@@ -22,10 +22,10 @@ Items marked **[OP]** are operationalizations that the plan does not state; they
 ## 2. Population and index time
 
 - Adults, acute-care encounter (ICU, inpatient, ED), **first qualifying EEG per patient**. One row per patient throughout, so every index-level split is a patient-level split.
-- **Strict cohort** (primary): GCS <= 11 or FOUR <= 12. **Broad EHR-phenotype cohort**: reported separately, never pooled into the primary estimate.
+- **Strict cohort** (primary, D-105): nearest GCS <= 11 or FOUR <= 12 within [-6 h, +1 h] of t0 (pre-t0 preferred on ties), so the intended-use population is knowable at t0. Sensitivity cohort `strict_pm6`: any such score within +-6 h of t0 (the plan's wording). **Broad EHR-phenotype cohort**: reported separately, never pooled into the primary estimate.
 - **t0 = EEG start.** Primary window = minutes 1 to 11 of the recording, requiring >= 60% usable data on the minimum channel set. **Minimum channel set = the 10 hairline electrodes Fp1, Fp2, F7, F8, T3, T4, T5, T6, O1, O2** (D-096), so every included recording supports the Ceribell-headband simulation; the other nine 10-20 channels are optional for QC.
 - EEG within 24 h of documented acute-consciousness-impairment (ACI) onset; time since onset enters every model as a covariate. Sensitivity windows: <= 6 h, <= 12 h, <= 48 h.
-- Record the **EEG referral indication** as a category (for example "rule out NCSE", "post-arrest", "unexplained AMS"). It is used only in Baseline D.
+- The plan's **EEG referral indication** category is NOT recorded: HEEDB has no referral-indication field, so Baseline D is dropped (D-107, supersedes D-015).
 - Eligibility depends on the Phase 0a field audit passing its "Stop" rows (plan, Phase 0a). The site criterion is >= 3 adult sites with >= 300 candidates each (`metrics.splits.check_site_requirements`); if it fails, the plan falls back to a grouped split with a weaker claim (D-024).
 - Flow of exclusions (counts only, small cells suppressed per `sortinghat.safe_output`) is reported in a STARD-AI / TRIPOD+AI flow diagram.
 
@@ -66,7 +66,7 @@ Evaluation set: about 1,000 consecutive gold cases (D-093; a 1,500-case reserve 
 | A Severity + sedation | Age, sex, GCS/FOUR/RASS, NESI, t0 sedative and opioid exposure | **H1** |
 | B Bedside | A + vitals, pupils, witnessed convulsion, arrest/trauma history, point-of-care glucose | Secondary |
 | C Full t0 | B + every lab, toxicology, imaging and culture result **available before t0** | **H2** |
-| D Referral question | C + the EEG indication category (indication field only) | Sensitivity (proxy for the clinician's prior) |
+| ~~D Referral question~~ | Dropped (D-107): no referral-indication source in HEEDB | none |
 
 "Available before t0" uses result-availability (verification) time, not collection time, wherever the Phase 0a audit shows it exists; otherwise Study 1B is labeled "approximate" (plan, Phase 0a).
 
@@ -174,7 +174,7 @@ All computed on patients assessable for that label, on the pooled LOSO predictio
 1. **Unassessable labels** are missing by design, not missing at random. They are masked in the endpoint; the mask rate per label and per site is reported. If unassessability differs across sites by more than the pre-pilot expectation, report the Delta restricted to patients with all primary labels assessable as a sensitivity **[OP]**.
 2. **EEG quality:** < 60% usable data on the minimum channel set means exclusion (plan). Exclusion counts by site are reported. Sensitivity: an inverse-probability-of-inclusion weighted Delta, with weights from a model on baseline covariates and site, fitted within training sites only.
 3. **Baseline covariates:** missingness is a feature of the t0 state (a lab not yet drawn is information). Missing values are handled by an in-training-fold imputation plus a missingness indicator for each variable, with imputation parameters fitted on training sites only. No multiple imputation of predictors, because a deployed model cannot do it.
-4. **Severity score** (GCS, FOUR or RASS) must fall within +/- 6 h of the EEG for inclusion (Phase 0a). Patients outside the window enter only the broad cohort through the BDSP GCS-from-EHR tool. Sensitivity: exclude patients whose severity score was derived rather than documented.
+4. **Severity score** (GCS or FOUR) must fall within [-6 h, +1 h] of the EEG for the primary strict cohort (D-105; the Phase 0a +/- 6 h check is the `strict_pm6` sensitivity). Patients outside the window enter only the broad cohort through the BDSP GCS-from-EHR tool. Sensitivity: exclude patients whose severity score was derived rather than documented.
 5. **Timing fields:** where the audit forces the fallback (orders instead of administration times, collection time plus assay lag instead of result time), the corresponding analysis is labeled "approximate" in every table and abstract.
 6. **Silver-label gaps** affect training only. They do not enter the endpoint.
 
@@ -218,7 +218,7 @@ Each is reported next to the primary result with the same Delta and CI machinery
 | 3 | ACI-to-EEG windows <= 6 h, <= 12 h, <= 48 h | Spectrum (plan) |
 | 4 | **Sedative-excluded subset** | Detect Delta carried by sedative signatures |
 | 5 | **Severity matching** (H3 strata) and a within-stratum matched analysis | Detect Delta carried by depth of unconsciousness |
-| 6 | Baselines B and D in place of A or C | Value over bedside data and over the referral question (proxy for the clinician's prior) |
+| 6 | Baseline B in place of A or C (Baseline D dropped, D-107) | Value over bedside data |
 | 7 | Broad EHR-phenotype cohort, reported separately | Spectrum |
 | 8 | Approximate-time versions (orders for administrations; collection time plus lag for results) where the audit forces them | Robustness to timestamp quality |
 | 9 | Site-weighted (equal-weight) Delta; `site_t` interval; cluster and two-stage bootstraps | Between-site variance |
@@ -228,6 +228,7 @@ Each is reported next to the primary result with the same Delta and CI machinery
 | 13 | MORGOTH-based vs CBraMod-based combined model | Commercial-clean gap |
 | 14 | IPW-for-inclusion and complete-label analyses (section 9) | Missing-data robustness |
 | 15 | Early-EEG subgroup (H5) with and without covariate adjustment | Intended-use proxy |
+| 16 | `strict_pm6` strict cohort (any qualifying score within +-6 h of t0) | Window of the strict definition (D-105) |
 
 ## 13. Reporting
 

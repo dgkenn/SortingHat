@@ -44,17 +44,17 @@ def scenario():
     P(16, dur=659.0)                                            # 1 s short of minutes 1-11
     P(17, dur=660.0)                                            # exactly long enough
     P(18, dur=None, clock_dur=1800.0)                           # no metadata duration; clock duration 30 min
-    P(19, visit_start_h=-30.0, gcs_at=2.0)                      # 30 h after arrival, strict via a score after t0
-    P(20, visit_start_h=-60.0, gcs_at=2.0)                      # 60 h: outside the widest window
+    P(19, visit_start_h=-30.0, gcs_at=0.5)                      # 30 h after arrival, strict via a score 30 min after t0
+    P(20, visit_start_h=-60.0, gcs_at=0.5)                      # 60 h: outside the widest window
     w.patient(21, visit_start_h=-60.0, gcs=10.0, gcs_at=-5.0); w.score(21, GCS, T0 - H(50), 15)   # onset = first abnormal score
-    w.patient(22, visit_start_h=-10.0, gcs=8.0, gcs_at=2.0); w.score(22, GCS, T0 - H(100), 10)     # earlier encounter ignored
+    w.patient(22, visit_start_h=-10.0, gcs=8.0, gcs_at=0.5); w.score(22, GCS, T0 - H(100), 10)     # earlier encounter ignored
     P(23, gcs=None)                                             # no score, no phenotype
     P(24, gcs=12.0)                                             # GCS 12 > 11
     P(25, gcs=11.0)                                             # GCS 11 boundary
     P(26, gcs=None); w.score(26, FOUR, T0 - H(1), 12)           # FOUR 12 boundary
     P(27, gcs=None); w.score(27, FOUR, T0 - H(1), 13)           # FOUR 13
-    P(28, gcs=8.0, gcs_at=7.0)                                  # strict score but outside +-6 h
-    P(29, gcs=8.0, gcs_at=5.5)                                  # inside +-6 h, AFTER t0
+    P(28, gcs=8.0, gcs_at=7.0)                                  # strict score but outside every window
+    P(29, gcs=8.0, gcs_at=5.5)                                  # inside +-6 h but after +1 h: strict_pm6 only
     P(30, gcs=14.0); w.cond_row(30, "R40.2", T0 - H(1))         # phenotype only (broad, not strict)
     P(31, gcs=14.0); w.cond_row(31, "G93.41", T0 - H(1))        # encephalopathy code is not a phenotype code
     P(32, gcs=14.0); w.cond_row(32, "R40.2", T0 + H(10))        # phenotype code outside the window
@@ -63,7 +63,7 @@ def scenario():
         w.score(33, nm, T0 - H(1), v)
     P(34, gcs=None); w.score(34, "GCS eye opening", T0 - H(1), 1); w.score(34, "GCS motor response", T0 - H(1), 2)
     P(35, gcs=99.0)                                             # implausible value dropped
-    w.eeg(36); w.visit(36, "ED", T0 - H(25), end=T0 - H(23.5)); w.visit(36, "ICU", T0 - H(23)); w.score(36, GCS, T0 + H(2), 8)
+    w.eeg(36); w.visit(36, "ED", T0 - H(25), end=T0 - H(23.5)); w.visit(36, "ICU", T0 - H(23)); w.score(36, GCS, T0 + H(0.5), 8)
     P(37, id_blank=True)                                        # BDSPPatientID blank: from BidsFolder
     P(38, site="I0008", age=50.0)                               # I-site layout: start in metadata, DOB, no findings
     P(39, site="I0008", age=15.0)
@@ -157,7 +157,7 @@ def test_ed_to_icu_encounter_counts_from_ed_arrival(scenario):
 
 def _ed_icu_world():
     w = World()
-    w.eeg(36); w.visit(36, "ED", T0 - H(25), end=T0 - H(23.5)); w.visit(36, "ICU", T0 - H(23)); w.score(36, GCS, T0 + H(2), 8)
+    w.eeg(36); w.visit(36, "ED", T0 - H(25), end=T0 - H(23.5)); w.visit(36, "ICU", T0 - H(23)); w.score(36, GCS, T0 + H(0.5), 8)
     return w
 
 
@@ -175,19 +175,50 @@ def test_onset_rules(scenario):
 # ------------------------------------------------------------------------------------- strict / broad
 def test_strict_and_broad_flags(scenario):
     t = scenario[1].table.set_index("person_id")
-    assert t.loc[25, "in_strict"] and t.loc[26, "in_strict"] and t.loc[29, "in_strict"]
+    assert t.loc[25, "in_strict"] and t.loc[26, "in_strict"]
+    assert not t.loc[29, "in_strict"] and t.loc[29, "in_strict_pm6"] and not t.loc[29, "in_broad"]   # sensitivity only
     assert t.loc[33, "in_strict"] and t.loc[33, "gcs_min_window"] == 5       # eye + motor + verbal
     assert t.loc[30, "in_broad"] and not t.loc[30, "in_strict"] and t.loc[30, "phenotype"]
     assert (t["in_broad"] | ~t["in_strict"]).all()                           # strict is a subset of broad
     assert t.loc[1, "in_strict"] and t.loc[1, "in_broad"]
 
 
-def test_score_rule_nearest():
+def _strict(*scores, **cfg):
     w = World()
-    w.patient(1, gcs=8.0, gcs_at=-5.0); w.score(1, GCS, T0 - H(1), 14)
-    assert build(w).table["in_strict"].tolist() == [True]                    # any score <= 11 in the window
-    r = build(w, score_rule="nearest")
-    assert fate(r, 1).startswith("Neither")                                  # nearest is 14
+    w.patient(1, gcs=None)
+    for nm, h, v in scores:
+        w.score(1, nm, T0 + H(h), v)
+    r = build(w, **cfg)
+    t = r.table
+    return (bool(t["in_strict"].iloc[0]), bool(t["in_strict_pm6"].iloc[0])) if len(t) else (False, False)
+
+
+def test_primary_window_is_minus6_to_plus1_and_pm6_is_a_flagged_sensitivity():
+    assert _strict((GCS, -6.0, 8)) == (True, True)                # -6 h inclusive
+    assert _strict((GCS, -6.1, 8)) == (False, False)
+    assert _strict((GCS, 1.0, 8)) == (True, True)                 # +1 h inclusive
+    assert _strict((GCS, 1.1, 8)) == (False, True)                # after +1 h: strict_pm6 only
+    assert _strict((GCS, 6.0, 8)) == (False, True) and _strict((GCS, 6.1, 8)) == (False, False)
+
+
+def test_primary_uses_the_nearest_score_pre_t0_on_ties():
+    assert _strict((GCS, -5.0, 8), (GCS, -1.0, 14)) == (False, True)     # nearest is 14; pm6 'any' still sees the 8
+    assert _strict((GCS, -1.0, 8), (GCS, 1.0, 14)) == (True, True)       # tie -> pre-t0 (8)
+    assert _strict((GCS, -1.0, 14), (GCS, 1.0, 8)) == (False, True)      # tie -> pre-t0 (14)
+    assert _strict((GCS, -3.0, 14), (GCS, 0.5, 8)) == (True, True)       # nearest is the post-t0 8
+    assert _strict((GCS, -1.0, 14), (FOUR, -2.0, 12)) == (True, True)    # nearest is taken per instrument
+    assert _strict((GCS, -5.0, 8), (GCS, -1.0, 14), score_rule="any") == (True, True)   # any: all in the window
+
+
+def test_both_strict_definitions_are_reported_in_the_flow(scenario):
+    parts = scenario[1].flow_raw["partitions"]
+    titles = [p["title"] for p in parts]
+    assert "Strict definitions, primary onset window" in titles
+    sd = next(p for p in parts if p["title"].startswith("Strict definitions"))["parts"]
+    assert {k: sum(v.values()) for k, v in sd.items()} == {
+        "both definitions": sum(scenario[1].table.eval("in_strict & in_strict_pm6")),
+        "primary only (-6 h to +1 h)": sum(scenario[1].table.eval("in_strict & ~in_strict_pm6")),
+        "strict_pm6 only (+-6 h)": sum(scenario[1].table.eval("~in_strict & in_strict_pm6"))}
 
 
 def test_scores_are_range_checked_not_clipped():
@@ -247,28 +278,38 @@ def test_matches_audit_candidates_on_synthetic(synth):
     assert (t == c).all()
 
 
-def test_strict_flag_matches_an_independent_recomputation(synth):
+def test_strict_flags_match_an_independent_recomputation(synth):
     tables = synth[0]
     res = build_cohort(FrameSources(tables))
     m = tables["omop_measurement"]
     m = m[m["measurement_source_value"].isin([GCS, FOUR])]
-    out = {}
+    lim = {GCS: 11, FOUR: 12}
+    prim, pm6 = {}, {}
     for pid, t0 in zip(res.table["person_id"], res.table["t0"]):
-        g = m[(m["person_id"] == pid) & ((m["measurement_datetime"] - t0).abs() <= pd.Timedelta(hours=6))]
-        v = g.set_index("measurement_source_value")["value_as_number"]
-        low = [(g["measurement_source_value"] == GCS) & (g["value_as_number"].between(3, 11)),
-               (g["measurement_source_value"] == FOUR) & (g["value_as_number"].between(0, 12))]
-        out[pid] = bool(low[0].any() or low[1].any())
-    exp = pd.Series(out)
-    got = res.table.set_index("person_id")["severity_strict"]
-    assert (got == exp.reindex(got.index)).all()
+        g = m[m["person_id"] == pid]
+        dt = (g["measurement_datetime"] - t0).dt.total_seconds() / 3600
+        ok = False
+        for name, cap in lim.items():
+            h = g[(g["measurement_source_value"] == name) & dt.between(-6, 1)]
+            if len(h):
+                d = (dt[h.index]).abs()
+                best = h.assign(_a=d, _p=(dt[h.index] > 0)).sort_values(["_a", "_p"]).iloc[0]
+                ok |= best["value_as_number"] <= cap
+        prim[pid] = bool(ok)
+        w6 = g[dt.abs() <= 6]
+        pm6[pid] = bool(((w6["measurement_source_value"] == GCS) & (w6["value_as_number"].between(3, 11))).any()
+                        or ((w6["measurement_source_value"] == FOUR) & (w6["value_as_number"].between(0, 12))).any())
+    t = res.table.set_index("person_id")
+    assert (t["severity_strict"] == pd.Series(prim).reindex(t.index)).all()
+    assert (t["severity_strict_pm6"] == pd.Series(pm6).reindex(t.index)).all()
+    assert t["severity_strict"].sum() > 100 and (t["severity_strict_pm6"] & ~t["severity_strict"]).sum() > 0
 
 
 def test_synthetic_invariants(synth):
     res = build_cohort(FrameSources(synth[0]))
     t = res.table
     assert t["person_id"].is_unique and len(t) > 100
-    assert (t["in_strict"] <= t["in_broad"]).all()
+    assert (t["in_strict"] <= t["in_broad"]).all() and (t["in_strict"] <= t["in_strict_pm6"]).all()
     assert (t["duration_s"] >= 660).all()
     assert (t["age_years"] >= 18).all() and t["visit_class"].isin(["ICU", "Inpatient", "ED"]).all()
     assert (t["hours_since_onset"].between(0, 48)).all()

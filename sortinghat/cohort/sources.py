@@ -15,6 +15,9 @@ Nothing here prints; callers must not either (CLAUDE.md rule 3).
 
 from __future__ import annotations
 
+import io
+import re
+
 import numpy as np
 import pandas as pd
 
@@ -29,6 +32,45 @@ _VISIT_COLS = ["person_id", "visit_occurrence_id", "visit_start_datetime", "visi
 _MEAS_COLS = ["person_id", "measurement_datetime", "measurement_date", "measurement_time",
               "measurement_source_value", "value_as_number"]
 _COND_COLS = ["person_id", "condition_start_datetime", "condition_source_value"]
+
+
+# ------------------------------------------------------------------------------------------ merge history
+MERGE_PREFIX = "PatientMergeHistory/"
+# The layout of PatientMergeHistory/ is UNREAD (the dry run listed three file names at the access-point root, nothing
+# inside them). Column names are therefore ASSUMED: one column naming the retired id and one the surviving id.
+_ID_COL = re.compile(r"id|patient|person|mrn", re.I)
+_OLD_COL = re.compile(r"old|merged|retired|source|from|secondary|duplicate|prior|previous|deprecated", re.I)
+_NEW_COL = re.compile(r"new|surviv|target|\bto\b|primary|master|current|final|canonical|kept", re.I)
+
+
+def merge_pairs(df: pd.DataFrame) -> dict[int, int] | None:
+    """{retired id: surviving id} from a merge-history frame, or None when the old/new columns are not identifiable
+    (exactly one id-like column matching the 'old' words and one matching the 'new' words are required)."""
+    cols = [c for c in df.columns if _ID_COL.search(str(c))]
+    old = [c for c in cols if _OLD_COL.search(str(c)) and not _NEW_COL.search(str(c))]
+    new = [c for c in cols if _NEW_COL.search(str(c)) and not _OLD_COL.search(str(c))]
+    if len(old) != 1 or len(new) != 1:
+        return None
+    o = pd.to_numeric(df[old[0]], errors="coerce")
+    n = pd.to_numeric(df[new[0]], errors="coerce")
+    ok = o.notna() & n.notna() & (o != n)
+    return {int(a): int(b) for a, b in zip(o[ok], n[ok])}
+
+
+def resolve_merges(m: dict[int, int], max_hops: int = 20) -> dict[int, int]:
+    """Follow merge chains (A -> B -> C gives A -> C); a cycle stops at the last id reached before it repeats."""
+    out = {}
+    for a in m:
+        seen, cur = {a}, m[a]
+        for _ in range(max_hops):
+            nxt = m.get(cur)
+            if nxt is None or nxt in seen:
+                break
+            seen.add(cur)
+            cur = nxt
+        out[a] = cur
+    return out
+
 
 
 def _text(df: pd.DataFrame, col: str) -> pd.Series:
@@ -90,6 +132,14 @@ class FrameSources:
             return empty_sessions()
         return pd.concat(parts, ignore_index=True)
 
+    def merge_map(self) -> tuple[dict[int, int], str]:
+        """({retired id: surviving id}, status). Optional table key ``patient_merge_history`` (not a ``schema`` table)."""
+        d = self.t.get("patient_merge_history")
+        if d is None:
+            return {}, "absent"
+        m = merge_pairs(d)
+        return ({}, "unrecognised") if m is None else (resolve_merges(m), "applied")
+
     def _rows(self, table: str, person_ids) -> pd.DataFrame:
         d = self.t.get(table)
         if d is None or not len(d):
@@ -132,6 +182,26 @@ class StoreSources:
         if not parts:
             raise FileNotFoundError("no eeg_metadata CSV found for any requested site")
         return pd.concat(parts, ignore_index=True)
+
+    def merge_map(self) -> tuple[dict[int, int], str]:
+        """Read ``PatientMergeHistory/`` if it has files (CSV or parquet); only whole-file reads, ids kept in memory."""
+        keys = data_io.list_keys(self.s3, MERGE_PREFIX)
+        pairs: dict[int, int] = {}
+        found = False
+        for k in keys:
+            low = k.lower()
+            if not low.endswith((".csv", ".csv.gz", ".parquet", ".txt", ".tsv")):
+                continue
+            body = self.s3.get_object(Bucket=data_io.access_point(), Key=k)["Body"].read()
+            df = pd.read_parquet(io.BytesIO(body)) if low.endswith(".parquet") else pd.read_csv(
+                io.BytesIO(body), dtype=str, sep="\t" if low.endswith((".tsv", ".txt")) else ",")
+            m = merge_pairs(df)
+            if m is not None:
+                pairs.update(m)
+                found = True
+        if not keys:
+            return {}, "absent"
+        return (resolve_merges(pairs), "applied") if found else ({}, "unrecognised")
 
     def _stream(self, table: str, columns: list[str], person_ids, keep=None) -> pd.DataFrame:
         pids = sorted({int(p) for p in person_ids})
