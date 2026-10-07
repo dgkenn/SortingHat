@@ -86,7 +86,7 @@ def test_site_variant_headers_on_disk(synth_dir):
     assert {"InstituteID", "StartDateTime", "EndDateTime", "DateOfBirth", "RecordingDuration"} <= set(i8)
     assert not {"SiteID", "AgeAtVisit", "StartTime", "EndTime", "DurationInSeconds", "ServiceName"} & set(i8)
     for h in (s_hdr, i2, i3, i8):
-        assert "PatientClass" not in h and "ReferralIndication" not in h and "EEGFolder" not in h or h is s_hdr
+        assert "PatientClass" not in h and "ReferralIndication" not in h      # in no real header
     assert not (synth_dir / "EEG/HEEDB_Metadata/I0008_EEG__reports_findings.csv").exists()
     assert not (synth_dir / "EEG/HEEDB_Metadata/I0009_EEG__reports_findings.csv").exists()
     rf3 = pd.read_csv(synth_dir / "EEG/HEEDB_Metadata/I0003_EEG__reports_findings.csv", nrows=0).columns

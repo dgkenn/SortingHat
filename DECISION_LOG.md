@@ -658,3 +658,9 @@
 - **Decision:** The shared multi-label head's selection grid includes a separate L2 penalty on the EEG feature block, so the baseline+EEG model can shrink toward the baseline-only model.
 - **Rationale:** Without it, many weak EEG features inflate variance and push null Δ above 0; with it, synthetic no-signal runs keep |Δ| < 0.02 while planted signals are recovered.
 - **Source:** `docs/models_spec.md`.
+
+### D-100 Raw HEEDB EEG and tables are streamed and processed in memory; only derived rows are stored
+- **Date:** 2026-10-07 · **Area:** data · **Outcome data seen?** No
+- **Decision:** Raw HEEDB EEG and tables are streamed from S3 and processed in memory. For each EDF only the header and the minute 1 to 11 byte range (plus 10 s of filter padding either side) are fetched with ranged GETs, decoded in RAM and reduced to feature rows (`sortinghat/eeg/stream.py`, `scripts/extract_eeg_features.py`). Only derived feature rows and a small per-recording status ledger are stored, as parquet and CSV under gitignored `local_only/` paths (mode 0600). No raw signal or table is written to disk or committed, and run output is aggregate-only through `sortinghat.safe_output` (counts below 11 shown as "<11"). Failures are reduced to fixed ID-free reason codes.
+- **Rationale:** ICU cEEG EDFs are about 1 GB each and Study 1 uses 10 minutes, so ranged reads cut transfer by roughly two orders of magnitude and avoid a raw-data copy that would need its own access control. Keeping raw bytes in memory only is consistent with CLAUDE.md rules 3, 5 and 6 and the BDSP terms.
+- **Source:** `docs/eeg_pipeline.md`; `docs/heedb_access.md` section 1; CLAUDE.md rules 2, 3, 5, 6.

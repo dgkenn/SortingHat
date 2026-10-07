@@ -43,7 +43,13 @@ best-effort for Bash; the human-run-only rule is the real control.
 - Schema dry run (names only; the first command a human runs on real data, via `scripts/heedb_run.sh ... --s3`):
   `python -m sortinghat.audit.field_audit --data data/synthetic --dry-run-schema`
 
+- Names-only real probe (project-lead authorised only; headers, parquet footers and `Delimiter='/'` prefix names, never values, rows,
+  counts, dates or IDs, never inside per-patient folders): `scripts/heedb_run.sh python3 scripts/heedb_dry_run.py`
+  (= `field_audit --s3 --dry-run-schema --list-unlisted --probe-prefixes`).
+
 ## Schema
 
 Real table/column names and provenance (CONFIRMED / NAMED / ASSUMED) are in `sortinghat/schema.py`,
-`docs/heedb_schema_real.md` and `docs/heedb_schema.md`. Remap ASSUMED columns by a human against the real tables.
+`docs/heedb_schema_real.md` and `docs/heedb_schema.md`. The two per-site CSV tables have per-site header variants
+(`schema.SITE_VARIANTS`; I0008/I0009 have no reports_findings); read them with `data_io.read_site_table`, which maps to canonical names.
+Only `PatientClass`, `ReferralIndication` and the `imaging` table remain ASSUMED.

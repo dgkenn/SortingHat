@@ -700,7 +700,7 @@ def dry_run_markdown(rep: dict) -> str:
                          + ", ".join(f"`{c}`" for c in u["unlisted_columns"]))
     if rep.get("prefixes") is not None:
         L += prefix_markdown(rep["prefixes"])
-    L += ["", "## Still unknown (no column named anywhere in the source)", ""] + [f"- {x}" for x in rep["still_unknown"]]
+    L += ["", "## Still unknown after the names-only dry run", ""] + [f"- {x}" for x in rep["still_unknown"]]
     return "\n".join(L) + "\n"
 
 

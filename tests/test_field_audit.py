@@ -8,6 +8,7 @@ import pandas as pd
 import pytest
 
 from sortinghat import schema
+from sortinghat import data_io
 from sortinghat.audit import field_audit
 from sortinghat.audit.field_audit import build_candidates, from_raw_tables, run_audit
 
@@ -176,7 +177,7 @@ def broken_dir(synth_dir, tmp_path):
     meta = next((d / "EEG/eeg-metadata").glob("S0001_*.csv"))
     txt = meta.read_text()
     head, rest = txt.split("\n", 1)
-    head = head.replace("DurationInSeconds", "DurationInSecond").replace(",PatientClass", "")
+    head = head.replace("DurationInSeconds", "DurationInSecond").replace(",BidsFlag", "")
     # rows still have the old width; the dry run reads the header line only
     meta.write_text(head + "\n" + rest)
     rf = d / "EEG/HEEDB_Metadata/S0001_EEG__reports_findings.csv"
@@ -197,18 +198,97 @@ def test_dry_run_schema_reports_missing_names_only(broken_dir, synth, tmp_path, 
     miss = {m["column"]: m for m in units[("eeg_metadata", "S0001")]["missing"]}
     assert miss["DurationInSeconds"]["closest_actual_name"] == "DurationInSecond"
     assert miss["DurationInSeconds"]["provenance"] == "CONFIRMED"
-    assert miss["PatientClass"]["provenance"] == "ASSUMED"
+    assert miss["BidsFlag"]["provenance"] == "CONFIRMED"
     assert [m["column"] for m in units[("reports_findings", "S0001")]["missing"]] == ["StartTime(EEG)"]
     assert units[("reports_findings", "S0001")]["missing"][0]["closest_actual_name"] == "StartTime (EEG)"
     assert not units[("imaging", None)]["found"] and not units[("omop_note_nlp", None)]["found"]
     assert units[("eeg_metadata", "S0002")]["missing"] == []
-    assert rep["n_tables_not_found"] == 2 and rep["n_missing_confirmed"] == 2
+    # I0008 / I0009 have no reports_findings file by design: absent, but not counted as a missing table
+    assert units[("reports_findings", "I0008")]["expected_absent"] and not units[("reports_findings", "I0008")]["found"]
+    assert rep["n_tables_not_found"] == 2 and rep["n_missing_confirmed"] == 3
     # names only: no patient ids, session ids, folders or timestamps anywhere in stdout or files
     all_ids = {str(p) for p in synth[0]["omop_person"]["person_id"]}
     blob = text + (out_dir / "schema_dry_run.json").read_text() + (out_dir / "schema_dry_run.md").read_text()
     assert not (set(re.findall(r"[A-Za-z0-9_\-]{6,}", blob)) & all_ids)
     assert not re.search(r"sub-|ses-|\d{4}-\d\d-\d\d", blob)
     assert "Still unknown" in text
+
+
+def test_dry_run_per_site_variants_are_not_drift(synth_dir):
+    """Each site is compared with ITS OWN real header: variants differ but nothing is missing or unlisted."""
+    rep = field_audit.probe_schema(data_io.LocalStore(synth_dir), list_unlisted=True)
+    for u in rep["units"]:
+        if u["found"]:
+            assert u["missing"] == [] and u["unlisted_columns"] == [], (u["table"], u["site"])
+    assert rep["n_missing_confirmed"] == 0 and rep["n_tables_not_found"] == 0
+
+
+def test_list_unlisted_prints_names_only(synth_dir, tmp_path, capsys):
+    d = tmp_path / "extra"
+    shutil.copytree(synth_dir, d)
+    f = d / "EEG/HEEDB_Metadata/HEEDB_patients.csv"
+    head, rest = f.read_text().split("\n", 1)
+    f.write_text(head + ",SomeNewColumn,sub-S0001123456\n" + rest)
+    assert field_audit.main(["--data", str(d), "--dry-run-schema", "--list-unlisted"]) == 0
+    out = capsys.readouterr().out
+    assert "Unlisted columns" in out and "heedb_patients: `SomeNewColumn`, `<id-like column>`" in out
+    assert "sub-S0001123456" not in out
+
+
+def test_probe_prefixes_lists_levels_and_never_enters_patient_folders(synth_dir, tmp_path, capsys):
+    d = tmp_path / "px"
+    shutil.copytree(synth_dir, d)
+    (d / "EEG/bids/S0001/sub-S0001123456/ses-1/eeg").mkdir(parents=True)
+    (d / "EEG/bids/S0001/sub-S0001123456/ses-1/eeg/x.edf").write_bytes(b"x")
+    for i in range(60):                                                           # a population of folders
+        (d / f"Imaging/I0004/Clinical/f{i}").mkdir(parents=True, exist_ok=True)
+    (d / "Imaging/I0001/sub-123456").mkdir(parents=True)
+    (d / "Imaging/I0001/BIDS").mkdir()
+    (d / "Imaging/I0001/12345.csv").write_text("a\n")
+    assert field_audit.main(["--data", str(d), "--dry-run-schema", "--probe-prefixes"]) == 0
+    out = capsys.readouterr().out
+    assert "## Access point prefixes" in out and "prefix `EEG/`" in out and "prefix `bids/`" in out
+    assert "prefix `BIDS/`" in out
+    assert "sub-S0001123456" not in out and "ses-1" not in out and "x.edf" not in out        # not listed
+    assert "sub-123456" not in out and "12345.csv" not in out                                  # masked
+    assert "<id-like prefix>" in out and "<id-like file>" in out
+    assert "Imaging/I0004/Clinical/f0" not in out                                              # not descended
+
+
+def test_id_like_guard_and_flags_need_dry_run():
+    for bad in ("sub-S0001123", "ses-1", "123456", "1234567.csv", "2026_04_30", "18thAugust2025",
+                "0123456789abcdef0123"):
+        assert data_io.looks_id_like(bad), bad
+    for ok in ("I0001", "S0002-EHR", "Clinical", "BIDS", "Non-BIDS", "part-00000.parquet", "HEEDB_Metadata"):
+        assert not data_io.looks_id_like(ok), ok
+    with pytest.raises(SystemExit):
+        field_audit.main(["--s3", "--out", "x", "--list-unlisted"])
+
+
+def test_local_store_delimiter_listing(synth_dir):
+    s3 = data_io.LocalStore(synth_dir)
+    root = s3.list_objects_v2(Bucket="x", Prefix="", Delimiter="/")
+    assert {c["Prefix"] for c in root["CommonPrefixes"]} >= {"EEG/", "OMOP/"}
+    eeg = s3.list_objects_v2(Bucket="x", Prefix="EEG/", Delimiter="/")
+    assert {c["Prefix"] for c in eeg["CommonPrefixes"]} == {"EEG/HEEDB_Metadata/", "EEG/eeg-metadata/"}
+
+
+# ------------------------------------------------------------ PatientClass is derived from visits on disk
+def test_patient_class_derivation_matches_generated_class_where_a_time_exists(synth, synth_dir):
+    tabs = field_audit.load_audit_tables(data_io.LocalStore(synth_dir))
+    got = tabs["eeg_metadata"]
+    assert got["PatientClass"].notna().mean() > 0.9
+    mem = field_audit.from_raw_tables(synth[0])["eeg_metadata"]
+    adult = got[(got["AgeAtVisit"] >= 18) & got["ClassTime"].notna()]       # visits are read for these only
+    a = adult.set_index("SessionID")["PatientClass"]
+    b = mem.set_index("SessionID")["PatientClass"].reindex(a.index)
+    assert len(a) > 1000 and (a.fillna("-") == b.fillna("-")).all()
+
+
+def test_visit_class_prefers_concept_then_text():
+    vc = field_audit.visit_class
+    assert vc(32037, "whatever") == "ICU" and vc(0, "Inpatient") == "Inpatient" and vc(0, "ED") == "ED"
+    assert vc(0, "Outpatient") == "Outpatient" and vc(0, "") is None and vc(None, None) is None
 
 
 def test_dry_run_does_not_read_rows(synth_dir, monkeypatch):

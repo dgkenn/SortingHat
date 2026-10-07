@@ -207,7 +207,7 @@ def list_keys(s3, prefix: str, *, bucket: str | None = None, suffix: str | None 
 
 
 # A name is "id-like" when it could be a patient/session/date identifier. Such names are never printed.
-_ID_LIKE_RE = re.compile(r"(^|[^A-Za-z])(sub|ses)-|\d{5,}|^\d+/?$|[0-9a-f]{12,}|\d{4}[-_]\d{2}[-_]\d{2}", re.I)
+_ID_LIKE_RE = re.compile(r"(^|[^A-Za-z])(sub|ses)-|\d{5,}|^\d+/?$|[0-9a-f]{12,}|\d{4}[-_]\d{2}[-_]\d{2}|\d{1,2}(st|nd|rd|th)?[A-Za-z]{3,9}\d{4}", re.I)
 ID_LIKE = "<id-like name>"
 MAX_LEVEL_ITEMS = 40          # a level with more prefixes than this is not listed at all (population-like)
 

@@ -1,28 +1,113 @@
-# Real HEEDB table and column names found in the earlier research code
+# Real HEEDB table and column names
 
-Source repo: `dgkenn/codex-playground-`, ref `origin/claude/research-program-continuation-5upe54`
-(2026-08-10). Paths below are relative to that repo. Evidence is **column names used by code that read the
-real BDSP bucket** (and a few documentation lines), not data inspection: this port saw no HEEDB data and
-printed no values. See `docs/heedb_access.md` for key paths and access.
+Two sources of evidence:
 
-Status vocabulary:
+1. **Names-only dry run of the real BDSP access point, 2026-10-07** (authorised by the project lead; CSV header lines,
+   parquet footers and `Delimiter='/'` prefix listings only; no value, row, count, date or ID was read or printed).
+   Output: `docs/research/heedb_schema_dryrun_2026-10-07.md`. Section 0 below summarises what it settled.
+2. The earlier research code (`dgkenn/codex-playground-`, ref `origin/claude/research-program-continuation-5upe54`,
+   2026-08-10): column names used by code that read the real bucket. Sections A to C are from that code and are
+   annotated where the dry run changed the picture. See `docs/heedb_access.md` for key paths and access.
 
-- **CONFIRMED**: the exact column name is read (`row.get("...")` / `r["..."]`) by analysis code that ran
-  against the real table, or is stated in the source's own catalogue/docs as observed.
-- **NAMED**: the name appears only in an extractor request list, a constant, a docstring or a doc table, with
-  no downstream use found. An OMOP extractor requests columns as `[c for c in cols if c in have]`, so a
-  requested column that does not exist is **silently skipped**: NAMED does not prove the column exists.
-- **UNKNOWN**: nothing in the source touches it.
+Status vocabulary (as in `sortinghat/schema.py`):
+
+- **CONFIRMED**: the exact name is SEEN in a real header (dry run), or is read by analysis code that ran against
+  the real table. A mapping is CONFIRMED when both sides are real header names. This says nothing about units,
+  semantics or fill rates, which were not read.
+- **NAMED**: the name appears only in an extractor request list, constant or doc, and was NOT found in the header.
+- **ASSUMED**: placeholder, found in no real header (`PatientClass`, `ReferralIndication`, the `imaging` table).
+
+## 0. What the 2026-10-07 names-only dry run settled
+
+### 0.1 `eeg_metadata` is NOT uniform across sites: four header variants
+
+`schema.SITE_VARIANTS` records them; `data_io.normalise_site_table` maps each onto canonical names. Every name
+below was SEEN in the header (CONFIRMED). "-" means the column is not in that site's header.
+
+| Canonical | S0001 / S0002 | I0002 | I0003 | I0008 / I0009 (actual header name) |
+|---|---|---|---|---|
+| SiteID | SiteID | SiteID | SiteID | - (header has **InstituteID**; SiteID is filled from the file name) |
+| BDSPPatientID | yes (blank on some releases) | yes | yes | yes |
+| BidsFolder | yes | yes | yes | yes |
+| SessionID | yes | yes | yes | yes |
+| EEGFolder | yes | - | - | - |
+| DurationInSeconds | yes | yes | yes | **RecordingDuration** (unit not stated by the name; assumed seconds, verify with an aggregate check) |
+| ServiceName | yes | - | yes | - |
+| AgeAtVisit | yes (sparse) | yes | yes | - (**DateOfBirth** present; age = StartTime - DateOfBirth) |
+| AgeInDaysAtVisit | - | - | yes | - |
+| SexDSC | yes | yes | yes | yes |
+| DateOfBirth | - | - | - | yes |
+| DateOfDeath | yes | - | - | - |
+| StartTime / EndTime | yes (blank on the 2026_04_30 release) | yes | yes | **StartDateTime / EndDateTime** |
+| CreationTime | yes | yes | yes | - |
+| HasXLTEKAnnotations | yes | yes | yes | yes |
+| HasPersystAnnotations | yes | - | yes | - |
+| BDSPLastModifiedDTS | - | yes | yes | yes |
+| BidsFlag | yes | - | - | yes |
+| InstituteID | - | - | - | yes |
+
+`EEGFolder` (S0001/S0002 only) is why `BidsFolder` is the universal key: the `ceeg` task-token rule in
+`data_io.bids_edf_key` cannot be applied at the I-sites (it defaults to `EEG` there, unverified).
+**I0008 and I0009 have no `reports_findings` file at all**; their real start/end are in `eeg_metadata`
+(`StartDateTime` / `EndDateTime`).
+
+### 0.2 `reports_findings` variants (I0008 / I0009: no file)
+
+All sites that have the file carry `BDSPPatientID, SessionID, StartTime(EEG), EndTime(EEG), AgeAtVisit, SexDSC` and
+**all 39 label columns**: the 12 CONFIRMED and 11 NAMED flags of section A2 (now CONFIRMED) plus 16 sleep/syndrome
+labels (`spindles, vertex wave, k_complexes, posts, awake, n1, n2, dravet, jeavons, sunflower, wham, angelman, fold,
+jae, jme, bects`). Differences:
+
+| Header name | Sites | Canonical | Role |
+|---|---|---|---|
+| ServiceName(EEG) | S0001, S0002 (NOT I0002, I0003) | ServiceName(EEG) | OR / EMU / Routine / LTM |
+| SiteID | S0001, S0002 | SiteID | |
+| CreationTime(EEG) | all three groups | ReportCreationTime | report creation |
+| BeginDTS(Reports), ExamEndDTS(Reports) | S0001, S0002 | ReportBeginDTS, ReportExamEndDTS | exam begin/end; start-time fallback |
+| EncounterDTS(Reports) | S0001, S0002 | ReportEncounterDTS | encounter time |
+| ProcedureDSC(Reports) | S0001, S0002 | ReportProcedureDSC | procedure description (EEG type, not a clinical indication) |
+| EEGDateTime(Reports), ProcedureDate(Reports) | I0003 | ReportEEGDateTime, ReportProcedureDate | start-time fallback |
+| EEGDate(Reports) | I0002 | ReportEEGDate | date only (not a time proxy) |
+| AgeInDaysAtVisit | I0003 | AgeInDaysAtVisit | |
+| N1 | I0003 | (not mapped) | duplicate of `n1` in different case |
+| DeidentifiedName(Reports) | all three groups | (never loaded) | name-like text; `data_io.read_site_table` does not read it |
+
+### 0.3 Other tables
+
+- `HEEDB_patients`: `Race` does not exist; the header has **RaceAndEthnicity** and **RaceAndEthnicityDSC**. The other
+  NAMED columns (`VisitCount, HasEEG, HasReports, MatchedEEGReports, ICD10Count, MedicationCount`) exist.
+- `HEEDB_ICD10_for_Neurology`: 16 chapter columns (`Behavioral/Cognitive Syndromes ... Miscellaneous`) plus the NAMED
+  `SiteID, SexDSC, VisitCount, AgeAtVisitAvg` (all exist). `HEEDB_Medication_ATC`: 13 ATC-group columns plus the same four.
+- OMOP `visit_occurrence`: the NAMED `discharge_to_*` are really **`discharged_to_concept_id` / `discharged_to_source_value`**.
+  Also present: `visit_occurrence_id, visit_type_concept_id, admitted_from_concept_id, admitted_from_source_value,
+  visit_start_date, visit_end_date, care_site_id, preceding_visit_occurrence_id`.
+- OMOP `note` and `note_nlp` **exist** with the OMOP CDM v5.4 columns (`note_datetime`, `note_date`,
+  `note_type_concept_id`, `note_class_concept_id`, `note_title`, `note_source_value`, `visit_occurrence_id`; `note_text`
+  is in the table and is deliberately never requested). `person` has the CDM v5.4 extras (`gender_concept_id`,
+  `year_of_birth`, `birth_datetime`, `race_concept_id`, `ethnicity_concept_id`, `*_source_value`).
+- OMOP `drug_exposure` has `drug_type_concept_id` (record provenance: prescription written versus administration
+  record, via a concept join), `route_source_value`, `drug_exposure_start_date`, `drug_exposure_end_date`,
+  `verbatim_end_date`. OMOP `measurement` has `measurement_time`, `measurement_type_concept_id`, `value_source_value`,
+  `range_low/high` but **no result/verification datetime**.
+
+### 0.4 Access point layout (prefix names only)
+
+Root: `ECG/ EEG/ EHR/ Imaging/ NAX/ OMOP/ PSG/ PatientMergeHistory/` (no `BIND/`). `EEG/` = `HEEDB_Metadata/ bids/
+eeg-metadata/`. `OMOP/` = `I0001-OMOP/ I0002-OMOP/ I0003-OMOP/ Merged/ Merged_Fixed/`. `EHR/` = `I0001-EHR ... I0009-EHR`
+(7 sites). `NAX/` = `NAX-epilepsy nax-gcs nax-mci-dementia nax-stroke-mrs nax-stroke-nihss`. **`Imaging/` holds only
+`I0001/` and `I0004/`, each with `BIDS/ Clinical/ Non-BIDS/`**; none of the six HEEDB EEG-metadata sites (I0002, I0003,
+I0008, I0009, S0001, S0002) has an imaging prefix. `Imaging/imaging_metadata/` does not exist. Nothing deeper than
+`Imaging/<SITE>/{BIDS,Clinical,Non-BIDS}/` was listed.
 
 ## A. Real tables and columns
 
-**Tally of CONFIRMED real columns: 63** (eeg_metadata 12, reports_findings 19, HEEDB_patients 4, ICD10 table 3,
+**Tally of columns read by the earlier code (before the dry run): 63** (eeg_metadata 12, reports_findings 19, HEEDB_patients 4, ICD10 table 3,
 medication ATC table 2, OMOP 23 across person/condition/drug/measurement/death/procedure/observation/concept).
 The NAMED-only columns are listed in the tables but not counted.
 
 ### A1. `EEG/eeg-metadata/{SITE}_eeg_metadata_<release date>.csv` (one row per EEG session)
 
-Only `S0001` and `S0002` were read in the analyses; release date seen: `2026_04_30`.
+Only `S0001` and `S0002` were read in the analyses; release date seen: `2026_04_30`. **The dry run (section 0.1) found four header variants; this table describes S0001/S0002.**
 
 | Column | Status | Source | Note |
 |---|---|---|---|
@@ -30,7 +115,7 @@ Only `S0001` and `S0002` were read in the analyses; release date seen: `2026_04_
 | BDSPPatientID | CONFIRMED (caveat) | `analysis/heedb_bs_quantify.py`, `heedb_bs_mortality.py` | The later `heedb_command_following.py` docstring says this column is **blank** in this table and the patient id must come from `BidsFolder` (`sub-<SITE><PID>`); `heedb_bs_calibrate.py` says the same. The earlier mortality scripts keyed `DateOfDeath` on it. Check on your release before relying on it. |
 | BidsFolder | CONFIRMED | `pipeline/stream_fetch.py`, `heedb_bs_quantify.py` | `sub-<SITE><PID>`; PID is the numeric BDSPPatientID |
 | SessionID | CONFIRMED | same | joins to `reports_findings.SessionID` |
-| EEGFolder | CONFIRMED | `heedb_bs_quantify.py`, `heedb_command_following.py` | value starting `ceeg` selects task token `cEEG` in the EDF key |
+| EEGFolder | CONFIRMED (S0001/S0002 only) | `heedb_bs_quantify.py`, `heedb_command_following.py` | value starting `ceeg` selects task token `cEEG` in the EDF key; NOT in the I-site headers |
 | DurationInSeconds | CONFIRMED | `pipeline/stream_fetch.py`, `heedb_bs_calibrate.py` | plural **Seconds**; `sortinghat/schema.py` has `DurationInSecond` |
 | ServiceName | CONFIRMED | `pipeline/stream_fetch.py` | values seen include Routine, LTM, EMU (config), OR (`heedb_bs_iatrogenic.py`) |
 | AgeAtVisit | CONFIRMED (mostly empty) | `docs/HANDOFF.md`, `pipeline/stream_fetch.py` | "largely empty" in the catalog |
@@ -38,7 +123,8 @@ Only `S0001` and `S0002` were read in the analyses; release date seen: `2026_04_
 | DateOfDeath | CONFIRMED | `heedb_bs_mortality.py`, `heedb_bs_iatrogenic.py`, `pipeline/stream_fetch.py` | outcome column; only meaningful for S0001/S0002 |
 | StartTime | CONFIRMED (blank) | `heedb_command_following.py` | blank in this table; real times are in `reports_findings` |
 | EndTime | CONFIRMED (blank) | same | |
-| CreationTime, HasXLTEKAnnotations, HasPersystAnnotations, BDSPLastModifiedDTS | NAMED | `docs/heedb_schema.md` (public BDSP page, already in this repo) | never read by the source code |
+| CreationTime, HasXLTEKAnnotations, HasPersystAnnotations | CONFIRMED (header, 2026-10-07) | dry run | per-site, see 0.1 |
+| BDSPLastModifiedDTS | CONFIRMED at I-sites only (header) | dry run | absent at S0001/S0002 |
 
 ### A2. `EEG/HEEDB_Metadata/{SITE}_EEG__reports_findings.csv` (one row per EEG report)
 
@@ -65,7 +151,8 @@ Sites read: `S0001`, `S0002`. A label cell counts as asserted when non-empty and
 | Column | Status | Source |
 |---|---|---|
 | SiteID, BDSPPatientID, Sex, AgeAtVisitAvg | CONFIRMED | `pipeline/stream_fetch.py` `_load_patients`; joined on (SiteID, numeric id) |
-| Race, VisitCount, HasEEG, HasReports, MatchedEEGReports, ICD10Count, MedicationCount | NAMED | `docs/HEEDB_UNLOCK.md` table |
+| VisitCount, HasEEG, HasReports, MatchedEEGReports, ICD10Count, MedicationCount | CONFIRMED (header, 2026-10-07) | `docs/HEEDB_UNLOCK.md` table + dry run |
+| Race | does NOT exist; header has RaceAndEthnicity, RaceAndEthnicityDSC | dry run | |
 
 ### A4. `HEEDB_ICD10_for_Neurology.csv` and `HEEDB_Medication_ATC.csv`
 
@@ -107,11 +194,13 @@ G45.9') or counts -> presence flag").
 | procedure_occurrence | procedure_source_value | CONFIRMED | `heedb_concept_select.py` (numeric billing codes, not names) |
 | observation | observation_concept_id | CONFIRMED | catalogue rule 6: "100 % zero" |
 | observation | observation_datetime, observation_date, observation_source_value, value_as_string | NAMED | extractor only (goals-of-care entries) |
-| visit_occurrence | visit_start_datetime, visit_end_datetime, visit_concept_id, discharge_to_concept_id, discharge_to_source_value, visit_source_value | NAMED | extractor only (single 9 GB part, about 512 M rows) |
+| visit_occurrence | visit_start_datetime, visit_end_datetime, visit_concept_id, visit_source_value | CONFIRMED (footer, 2026-10-07) | extractor only (single 9 GB part, about 512 M rows) |
+| visit_occurrence | discharge_to_concept_id, discharge_to_source_value | **renamed in reality: discharged_to_concept_id, discharged_to_source_value** | dry run |
 | concept | concept_id, concept_name, domain_id, vocabulary_id, standard_concept | CONFIRMED | `heedb_concept_select.py`, `heedb_wlst_procedure.py` |
 | concept | concept_class_id, concept_code | NAMED | extractor only |
-| person | (any column besides person_id) | UNKNOWN | the source verified the 15M-row `person` table matches EEG patients but never read its columns |
-| note, specimen, device_exposure, etc. | all | UNKNOWN | no source script touches them |
+| person | gender_concept_id, year_of_birth, birth_datetime, race_concept_id, ethnicity_concept_id (+ *_source_value) | CONFIRMED (footer, 2026-10-07) | see 0.3 |
+| note, note_nlp | all columns of the schema | CONFIRMED (footer, 2026-10-07) | exist; see 0.3 |
+| specimen, device_exposure, etc. | all | UNKNOWN | not probed |
 
 Merged table sizes recorded in the source: `measurement` 66 GB / 554 parts, `drug_exposure` 59 GB / 375,
 `condition_occurrence` 27 GB / 181. Cohort scale: 49,232 patients with S0001+S0002 EEG reports; 7,323
@@ -138,15 +227,15 @@ with a clinician burst-suppression label on 22,057 reports.
 | BDSPPatientID | DOCUMENTED | eeg_metadata.BDSPPatientID (may be blank); reports_findings.BDSPPatientID; derive from BidsFolder | CONFIRMED with caveat: verify non-blank on your release |
 | BidsFolder | DOCUMENTED | eeg_metadata.BidsFolder | CONFIRMED |
 | SessionID | DOCUMENTED | eeg_metadata.SessionID | CONFIRMED |
-| CreationTime | DOCUMENTED | none seen | UNKNOWN (never read) |
+| CreationTime | DOCUMENTED | eeg_metadata.CreationTime (all but I0008/I0009) | CONFIRMED (header) |
 | StartTime | DOCUMENTED | **reports_findings."StartTime(EEG)"**; eeg_metadata.StartTime is blank | CONFIRMED but in a different table and name |
 | EndTime | DOCUMENTED | **reports_findings."EndTime(EEG)"**; eeg_metadata.EndTime is blank | CONFIRMED, different table and name |
 | DurationInSecond | DOCUMENTED | **DurationInSeconds** (plural) | CONFIRMED, **name differs; schema.py will not match** |
 | ServiceName | DOCUMENTED | eeg_metadata.ServiceName; reports_findings."ServiceName(EEG)" | CONFIRMED (values Routine, LTM, EMU, OR) |
 | AgeAtVisit | DOCUMENTED | eeg_metadata.AgeAtVisit (largely empty); reports_findings.AgeAtVisit; HEEDB_patients.AgeAtVisitAvg | CONFIRMED; prefer findings or patients table |
 | SexDSC | DOCUMENTED | eeg_metadata.SexDSC (often empty); reports_findings.SexDSC; HEEDB_patients.Sex | CONFIRMED |
-| PatientClass (ICU/Inpatient/ED/Outpatient) | ASSUMED | no such column seen. Nearest: `ServiceName` (LTM suggests ICU monitoring, OR/EMU/Routine are other contexts) and OMOP `visit_occurrence.visit_concept_id` | UNKNOWN; visit_concept_id is NAMED only and may be zero-filled (rule 6) |
-| ReferralIndication | ASSUMED | none seen | UNKNOWN |
+| PatientClass (ICU/Inpatient/ED/Outpatient) | ASSUMED | **dry run: no such column in any eeg_metadata header; derive from OMOP visit_occurrence** (`field_audit.derive_patient_class`). Nearest: `ServiceName` (LTM suggests ICU monitoring, OR/EMU/Routine are other contexts) and OMOP `visit_occurrence.visit_concept_id` | UNKNOWN; visit_concept_id is NAMED only and may be zero-filled (rule 6) |
+| ReferralIndication | ASSUMED | **dry run: in no real header at any site.** Nearest: `ProcedureDSC(Reports)` at S-sites (EEG type) | UNKNOWN |
 
 Not in SortingHat's schema but real and useful: `DateOfDeath` (eeg_metadata), `EEGFolder`, the finding flags
 (`bs`, `gen slowing`, `seizure`, ...), and OMOP `death.death_datetime`.
@@ -158,7 +247,7 @@ Not in SortingHat's schema but real and useful: `DateOfDeath` (eeg_metadata), `E
 | BDSPPatientID | OMOP drug_exposure.person_id (integer of BDSPPatientID) | CONFIRMED |
 | med_name | OMOP drug_exposure.drug_source_value (free text; the source regex-matched propofol, midazolam, pentobarbital, dexmedetomidine, norepinephrine, ...) | CONFIRMED |
 | med_class | none stored. The source derived classes by regex on drug_source_value, or used the per-patient ATC-group wide table (no times) | UNKNOWN as a column; derive it |
-| order_time | none seen | UNKNOWN |
+| order_time | `drug_type_concept_id` can distinguish prescription-written from administration records (values unread) | UNKNOWN until its values are summarised |
 | admin_time | drug_exposure.drug_exposure_start_datetime (end: drug_exposure_end_datetime). Whether this is order or administration time is not stated; the source noted vasopressor end times are stamped at death by the charting system (rule 7 note) | CONFIRMED name; semantics UNKNOWN |
 
 ### B3. `labs`
@@ -168,7 +257,7 @@ Not in SortingHat's schema but real and useful: `DateOfDeath` (eeg_metadata), `E
 | BDSPPatientID | measurement.person_id | CONFIRMED |
 | lab_name | measurement.measurement_source_value (text; the source row-filtered it by regex, e.g. neuron-specific enolase) | CONFIRMED |
 | collect_time | measurement.measurement_datetime (or measurement_date) | CONFIRMED name; collection-versus-result semantics UNKNOWN |
-| result_time | no result datetime column seen | UNKNOWN |
+| result_time | dry run: no result/verification datetime in `measurement` (only measurement_datetime, measurement_date, measurement_time) | NOT FOUND |
 
 Also seen: value_as_number, unit_source_value (mixed units possible), measurement_concept_id (NAMED).
 
@@ -176,7 +265,7 @@ Also seen: value_as_number, unit_source_value (mixed units possible), measuremen
 
 | SortingHat column | Real equivalent | Mapping status |
 |---|---|---|
-| all (modality, study_time, report_final_time) | The access point has an `Imaging/` top-level prefix (`docs/HEEDB_UNLOCK.md`); no script reads it | UNKNOWN |
+| all (modality, study_time, report_final_time) | `Imaging/<SITE>/{BIDS,Clinical,Non-BIDS}/` for **I0001 and I0004 only** (dry run); table layout inside not listed; BIND/ does not exist at the root | UNKNOWN columns; location CONFIRMED to prefix level |
 
 ### B5. `clinical_scores`
 
@@ -191,11 +280,11 @@ Also seen: value_as_number, unit_source_value (mixed units possible), measuremen
 
 | SortingHat column | Real equivalent | Mapping status |
 |---|---|---|
-| all (note_id, note_type, note_time) | OMOP `note` table and `EHR/<SITE>-EHR/` unstructured branch are not touched by any source script. EEG report text is represented only by the findings flags in `reports_findings` | UNKNOWN |
+| note_id, note_type, note_time | OMOP `note`: `note_id`, `note_type_concept_id` / `note_source_value` / `note_title` / `note_class_concept_id`, `note_datetime` (+ `note_date`) | CONFIRMED (footer, 2026-10-07); timestamp semantics unread |
 
 ## C. Mismatches to fix when remapping (human action, not done here)
 
-1. `DurationInSecond` must become `DurationInSeconds` (confirmed plural).
+1. `DurationInSecond` must become `DurationInSeconds` (confirmed plural) at S/I0002/I0003; I0008/I0009 call it `RecordingDuration`.
 2. EEG start and end times live in `reports_findings` as `StartTime(EEG)` / `EndTime(EEG)`; the metadata
    table's `StartTime`/`EndTime` were blank in `S0001`/`S0002` for release `2026_04_30`. The two tables join on
    (`BidsFolder` = `sub-<SITE><BDSPPatientID>`, `SessionID`).
@@ -203,8 +292,8 @@ Also seen: value_as_number, unit_source_value (mixed units possible), measuremen
    `person_id`, not HEEDB-metadata tables with `med_name`/`lab_name`/`score_type` columns. `HEEDB_Medication_ATC`
    and `HEEDB_ICD10_for_Neurology` are wide per-patient presence tables with no timestamps, so they cannot
    support timing checks.
-4. `PatientClass`, `ReferralIndication`, imaging and notes remain unmapped; the first field-audit run on real
-   data should print `list(df.columns)` for each table (columns only, no rows) to settle them.
+4. Done by the 2026-10-07 dry run (section 0): notes exist, `PatientClass` and `ReferralIndication` are in no header (PatientClass is
+   derived from visits), imaging sits under `Imaging/<SITE>/` for I0001 and I0004 only.
 5. Data-quality lessons that bear on the audit: `*_concept_id` columns can be all zero (rule 6); billing-code
    `*_source_value` columns need a `concept` join (rule 5); death rows are incomplete (about 45 percent in the
    burst-suppression cohort), so "no death row" is not survival; temperature units mix F and C; time-shifted

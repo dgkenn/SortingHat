@@ -1,0 +1,633 @@
+# OMOP concept map for the STRUCTURED silver-label extractor (sortinghat/labels/concepts.py, extract.py).
+#
+# Maps every item of configs/silver_anchors.yaml to OMOP rows. Nothing here has been checked against data.
+#
+# STATUS: PROVISIONAL. Codes below are the ones the author is confident of; each is a *candidate* that a human
+#   must verify against the local `omop_concept` table (concept_code + vocabulary_id) before a real run
+#   (docs/silver_extraction.md, "Items needing a human"). `codes: []` means "no confident code; name regex only".
+#
+# How a row is matched (first hit wins; the route is recorded as `basis` and counted in the diagnostics):
+#   concept         *_concept_id in the ids that `omop_concept` resolves for this item's (vocabulary_id, concept_code)
+#   source_concept  *_source_concept_id likewise (ICD/CPT live there for conditions and procedures)
+#   source_code     the *_source_value text IS the code (zero-filled concept ids are expected, catalogue rule 6)
+#   name            regex over the *_source_value text (fallback only; `allow_name_fallback: false` turns it off)
+# A regex never fires on a row whose text also matches `name_exclude`.
+#
+# Units: every quantitative item has ONE canonical unit (the `unit` in silver_anchors.yaml). A row's unit comes
+#   from unit_source_value, else the UCUM code of unit_concept_id, else the unit stored with the matched LOINC code
+#   (`codes[].unit`). Units are normalised (case, micro sign, mcg->ug, spaces) before the conversion lookup.
+#   conversion value = (x + pre_add) * mul + add. An unrecognised unit DROPS the row (counted, never guessed).
+#   A value outside `plausible` (after conversion) is dropped (counted).
+version: 1
+status: "PROVISIONAL: author-confident codes only; verify against the local omop_concept before any real run"
+anchor_config: silver_anchors.yaml
+
+# Rows are pulled for [t0 - back, t0 + forward] days per case; items may override `lookback_days` (null = unbounded).
+prefilter: {lookback_days: 30, forward_days: 10}
+# Encounter = the visit_occurrence containing t0 (following preceding_visit_occurrence_id up to `chain_hops` back,
+# so an ED visit before admission is part of the encounter); fallback when no visit covers t0.
+encounter: {fallback_days: 7, chain_hops: 3}
+
+vocabularies: [LOINC, ICD10CM, ICD9CM, CPT4, HCPCS, ICD10PCS, ICD9Proc, SNOMED, RxNorm, "RxNorm Extension", UCUM]
+
+# ---- unit tokens: normalised unit string -> canonical token (applied before the per-item conversion lookup)
+unit_aliases:
+  "mg/100ml": "mg/dl"
+  "mg%": "mg/dl"
+  "ug/100ml": "ug/dl"
+  "mcg/dl": "ug/dl"
+  "mcg/ml": "ug/ml"
+  "mcg/l": "ug/l"
+  "mcmol/l": "umol/l"
+  "micromol/l": "umol/l"
+  "mmol/litre": "mmol/l"
+  "meq/l": "meq/l"
+  "mm[hg]": "mmhg"
+  "mm hg": "mmhg"
+  "mmhg": "mmhg"
+  "[degf]": "degf"
+  "degf": "degf"
+  "f": "degf"
+  "fahrenheit": "degf"
+  "cel": "degc"
+  "degc": "degc"
+  "c": "degc"
+  "celsius": "degc"
+  "10*3/ul": "10*3/ul"
+  "10^3/ul": "10*3/ul"
+  "10e3/ul": "10*3/ul"
+  "x10e3/ul": "10*3/ul"
+  "x10(3)/ul": "10*3/ul"
+  "x10^3/ul": "10*3/ul"
+  "x10*3/ul": "10*3/ul"
+  "k/ul": "10*3/ul"
+  "k/mm3": "10*3/ul"
+  "10*3/mm3": "10*3/ul"
+  "thou/ul": "10*3/ul"
+  "th/ul": "10*3/ul"
+  "10*9/l": "10*3/ul"
+  "10^9/l": "10*3/ul"
+  "x10^9/l": "10*3/ul"
+  "g/l": "g/l"
+  "cells/ul": "/ul"
+  "cells/mm3": "/ul"
+  "/mm3": "/ul"
+  "#/ul": "/ul"
+  "/ul": "/ul"
+  "10*6/l": "/ul"
+  "bpm": "/min"
+  "/min": "/min"
+  "{beats}/min": "/min"
+  "{breaths}/min": "/min"
+  "ph": "ph"
+  "[ph]": "ph"
+  "ph units": "ph"
+  "units": "ph"
+
+# =====================================================================================================
+# 1. Quantitative lab / vital items (omop_measurement)
+# =====================================================================================================
+measurement_items:
+  ammonia:
+    codes: [{system: LOINC, code: "16362-6", unit: "umol/L"}]
+    name_regex: '\bammonia\b|\bnh3\b'
+    name_exclude: 'urine|csf|cerebro|stool|fluid'
+    unit: "umol/L"
+    plausible: [1, 3000]
+    conversions: {"umol/L": {mul: 1}, "ug/dL": {mul: 0.58718}, "mmol/L": {mul: 1000}}   # NH3 17.031 g/mol: ug/dL * 10 / 17.031
+  bun:
+    codes: [{system: LOINC, code: "3094-0", unit: "mg/dL"}]
+    name_regex: '\bbun\b|urea nitrogen'
+    name_exclude: 'urine|csf|cerebro|fluid|ratio|creat'
+    unit: "mg/dL"
+    plausible: [1, 400]
+    conversions: {"mg/dL": {mul: 1}, "mmol/L": {mul: 2.8014}}   # urea mmol/L -> urea nitrogen mg/dL
+  creatinine:
+    codes: [{system: LOINC, code: "2160-0", unit: "mg/dL"}, {system: LOINC, code: "14682-9", unit: "umol/L"}]
+    name_regex: '\bcreatinine\b|\bcreat\b'
+    name_exclude: 'urine|ur\b|csf|cerebro|fluid|clearance|ratio|bun|random|24 ?h|kinase|\bck\b|cystatin'
+    unit: "mg/dL"
+    plausible: [0.1, 40]
+    conversions: {"mg/dL": {mul: 1}, "umol/L": {mul: 0.011312}, "mg/L": {mul: 0.1}}
+  glucose:
+    codes: [{system: LOINC, code: "2345-7", unit: "mg/dL"}, {system: LOINC, code: "2339-0", unit: "mg/dL"},
+            {system: LOINC, code: "41653-7", unit: "mg/dL"}, {system: LOINC, code: "14749-6", unit: "mmol/L"}]
+    name_regex: '\bglucose\b|\bglu\b|\bglucometer\b|blood sugar'
+    name_exclude: 'urine|ur\b|csf|cerebro|fluid|pleural|ascit|stool|tolerance|a1c|hemoglobin|dipstick|\bqual'
+    unit: "mg/dL"
+    plausible: [5, 2500]
+    conversions: {"mg/dL": {mul: 1}, "mmol/L": {mul: 18.016}, "g/L": {mul: 100}}
+  sodium:
+    codes: [{system: LOINC, code: "2951-2", unit: "mmol/L"}, {system: LOINC, code: "2947-0", unit: "mmol/L"}]
+    name_regex: '\bsodium\b|\bna\b'
+    name_exclude: 'urine|ur\b|csf|cerebro|fluid|stool|random|24 ?h|bicarb|chloride'
+    unit: "mmol/L"
+    plausible: [80, 200]
+    conversions: {"mmol/L": {mul: 1}, "meq/L": {mul: 1}}
+  paco2:
+    codes: [{system: LOINC, code: "2019-8", unit: "mmHg"}]
+    name_regex: '\bpaco2\b|pco2.*art|art.*pco2|arterial.*(pco2|co2)|co2.*arterial'
+    name_exclude: 'venous|\bvbg\b|capillary|end[- ]?tidal|etco2|total co2|tco2|bicarb|mixed'
+    unit: "mmHg"
+    plausible: [5, 250]
+    conversions: {"mmHg": {mul: 1}, "kPa": {mul: 7.50062}}
+  ph_arterial:
+    codes: [{system: LOINC, code: "2744-1", unit: "pH"}]
+    name_regex: 'ph.*arterial|arterial.*ph|\bph\b.*\bart\b|\bart\b.*\bph\b|\bpha\b|\babg\b.*ph'
+    name_exclude: 'venous|\bvbg\b|urine|ur\b|csf|cerebro|fluid|stool|capillary|cord|mixed|gastric|salivary|tissue|\bpo2\b'
+    unit: "pH"
+    plausible: [6.3, 7.9]
+    conversions: {"pH": {mul: 1}}
+  calcium:
+    codes: [{system: LOINC, code: "17861-6", unit: "mg/dL"}]
+    name_regex: '\bcalcium\b'
+    name_exclude: 'ioniz|\bion\b|free|urine|ur\b|csf|cerebro|fluid|corrected|random|24 ?h|antigen|\b125\b|19-9|oxalate|phosph'
+    unit: "mg/dL"
+    plausible: [2, 30]
+    conversions: {"mg/dL": {mul: 1}, "mmol/L": {mul: 4.008}, "meq/L": {mul: 2.004}}
+  lactate:
+    codes: [{system: LOINC, code: "2524-7", unit: "mmol/L"}, {system: LOINC, code: "32693-4", unit: "mmol/L"}]
+    name_regex: '\blactate\b|\blactic acid\b'
+    name_exclude: 'csf|cerebro|fluid|pleural|dehydrogenase|\bldh\b'
+    unit: "mmol/L"
+    plausible: [0.1, 40]
+    conversions: {"mmol/L": {mul: 1}, "mg/dL": {mul: 0.11101}}
+  bilirubin:
+    codes: [{system: LOINC, code: "1975-2", unit: "mg/dL"}, {system: LOINC, code: "14631-6", unit: "umol/L"}]
+    name_regex: '(total )?bilirubin(, total| total)?'
+    name_exclude: 'direct|indirect|conjugat|unconjugat|delta|neonat|urine|fluid|csf|cerebro|amniotic|neo\b'
+    unit: "mg/dL"
+    plausible: [0.05, 80]
+    conversions: {"mg/dL": {mul: 1}, "umol/L": {mul: 0.05847}, "mg/L": {mul: 0.1}}
+  platelets:
+    codes: [{system: LOINC, code: "777-3", unit: "10*3/uL"}]
+    name_regex: '\bplatelets?\b|\bplt\b'
+    name_exclude: 'mean|volume|\bmpv\b|distribution|\bpdw\b|large|immature|clump|aggregat|antibod|function|\bplatelet ?crit\b'
+    unit: "10*3/uL"
+    plausible: [1, 2000]
+    conversions: {"10*3/uL": {mul: 1}, "/uL": {mul: 0.001}}
+  wbc:        # no rule uses it since SIRS was removed (D-087); extracted only with include_unused_items=true
+    codes: [{system: LOINC, code: "6690-2", unit: "10*3/uL"}]
+    name_regex: '\bwbc\b|white (blood )?(cell|count)|leuk[o]?cyte'
+    name_exclude: 'csf|cerebro|fluid|urine|ur\b|stool|pleural|synovial|peritoneal|differential|%|\bdiff\b'
+    unit: "10*3/uL"
+    plausible: [0.1, 500]
+    conversions: {"10*3/uL": {mul: 1}, "/uL": {mul: 0.001}}
+    unused: true
+  temp_c:     # unused by any rule; the F->C conversion is here for extractors and tested
+    codes: [{system: LOINC, code: "8310-5", unit: "Cel"}]
+    name_regex: '\btemp(erature)?\b'
+    name_exclude: 'set ?point|target|room|skin|ambient|goal|incubator|water|blanket'
+    unit: "degC"
+    plausible: [25, 45]
+    conversions: {"degC": {mul: 1}, "degF": {pre_add: -32, mul: 0.555556}}
+    unused: true
+  heart_rate:
+    codes: [{system: LOINC, code: "8867-4", unit: "/min"}]
+    name_regex: '\bheart rate\b|\bpulse rate\b|^hr$|^pulse$'
+    name_exclude: 'fetal|variab|alarm|limit|set'
+    unit: "/min"
+    plausible: [10, 300]
+    conversions: {"/min": {mul: 1}}
+    unused: true
+  resp_rate:
+    codes: [{system: LOINC, code: "9279-1", unit: "/min"}]
+    name_regex: '\bresp(iratory)? rate\b|^rr$'
+    name_exclude: 'set|alarm|limit|spontaneous|vent'
+    unit: "/min"
+    plausible: [2, 100]
+    conversions: {"/min": {mul: 1}}
+    unused: true
+  # --- CSF
+  csf_wbc:
+    codes: [{system: LOINC, code: "26464-8", unit: "/uL"}]
+    name_regex: '(csf|cerebro|cerebral ?spinal).*(wbc|white|leuk|nucleated|cell count|tnc)|(wbc|white|leuk|nucleated|tnc).*(csf|cerebro)'
+    name_exclude: 'differential|%|\bpercent\b|\brbc\b|red'
+    unit: "cells/uL"
+    plausible: [0, 100000]
+    conversions: {"/uL": {mul: 1}, "10*3/uL": {mul: 1000}}
+  csf_rbc:
+    codes: [{system: LOINC, code: "26455-6", unit: "/uL"}]    # CANDIDATE, not verified here (silver_anchors.yaml note)
+    name_regex: '(csf|cerebro|cerebral ?spinal).*(rbc|red|erythro)|(rbc|red cell|erythro).*(csf|cerebro)'
+    name_exclude: 'differential|%'
+    unit: "cells/uL"
+    plausible: [0, 5000000]
+    conversions: {"/uL": {mul: 1}, "10*3/uL": {mul: 1000}}
+  csf_protein:
+    codes: [{system: LOINC, code: "2880-3", unit: "mg/dL"}]
+    name_regex: '(csf|cerebro|cerebral ?spinal).*protein|protein.*(csf|cerebro)'
+    name_exclude: 'oligoclonal|electroph|igg|index|albumin|14-3-3|tau|myelin|ratio'
+    unit: "mg/dL"
+    plausible: [1, 10000]
+    conversions: {"mg/dL": {mul: 1}, "g/L": {mul: 100}, "mg/L": {mul: 0.1}}
+  csf_glucose:
+    codes: [{system: LOINC, code: "2342-4", unit: "mg/dL"}]
+    name_regex: '(csf|cerebro|cerebral ?spinal).*gluc|gluc.*(csf|cerebro)'
+    name_exclude: 'ratio|index'
+    unit: "mg/dL"
+    plausible: [1, 1500]
+    conversions: {"mg/dL": {mul: 1}, "mmol/L": {mul: 18.016}, "g/L": {mul: 100}}
+  # --- toxic levels (quantitative)
+  ethanol_serum:
+    codes: [{system: LOINC, code: "5643-2", unit: "mg/dL"}]
+    name_regex: '\bethanol\b|alcohol,? ?(serum|blood|level)|\betoh\b|blood alcohol'
+    name_exclude: 'urine|ur\b|breath|csf|methanol|isopropyl|ethylene|screen|qual|presence'
+    unit: "mg/dL"
+    plausible: [0, 1500]
+    conversions: {"mg/dL": {mul: 1}, "mmol/L": {mul: 4.607}, "g/L": {mul: 100}, "g/dL": {mul: 1000}, "%": {mul: 1000}, "mg/L": {mul: 0.1}}
+  acetaminophen:
+    codes: [{system: LOINC, code: "3298-7", unit: "ug/mL"}]
+    name_regex: 'acetaminophen|paracetamol|\bapap\b'
+    name_exclude: 'urine|ur\b|screen|qual|presence|csf'
+    unit: "ug/mL"
+    plausible: [0, 1500]
+    conversions: {"ug/mL": {mul: 1}, "mg/L": {mul: 1}, "umol/L": {mul: 0.15116}, "mg/dL": {mul: 10}, "ug/dL": {mul: 0.01}, "ng/mL": {mul: 0.001}}
+  salicylate:
+    codes: [{system: LOINC, code: "4024-6", unit: "mg/dL"}]
+    name_regex: 'salicylate|\bsalicyl|aspirin level'
+    name_exclude: 'urine|ur\b|screen|qual|presence|csf'
+    unit: "mg/dL"
+    plausible: [0, 200]
+    conversions: {"mg/dL": {mul: 1}, "mg/L": {mul: 0.1}, "ug/mL": {mul: 0.1}, "mmol/L": {mul: 13.812}}
+
+# Support series (NOT anchor items): only used to compute profound_shock.
+support_items:
+  map:
+    codes: [{system: LOINC, code: "8478-0", unit: "mmHg"}]
+    name_regex: 'mean arterial|\bmap\b|mean (blood )?pressure|\bmbp\b|art(erial)? ?(line)? ?mean'
+    name_exclude: 'pulmonary|\bpap\b|\bcpp\b|cerebral|perfusion|intracranial|\bicp\b|target|goal|set|alarm|limit|\bmap kinase'
+    unit: "mmHg"
+    plausible: [10, 300]
+    conversions: {"mmHg": {mul: 1}, "kPa": {mul: 7.50062}}
+  sbp:
+    codes: [{system: LOINC, code: "8480-6", unit: "mmHg"}]
+    name_regex: 'systolic|\bsbp\b'
+    name_exclude: 'pulmonary|\bpap\b|target|goal|set|alarm|limit|home|orthostatic'
+    unit: "mmHg"
+    plausible: [20, 350]
+    conversions: {"mmHg": {mul: 1}}
+  dbp:
+    codes: [{system: LOINC, code: "8462-4", unit: "mmHg"}]
+    name_regex: 'diastolic|\bdbp\b'
+    name_exclude: 'pulmonary|\bpap\b|target|goal|set|alarm|limit|home|orthostatic'
+    unit: "mmHg"
+    plausible: [5, 250]
+    conversions: {"mmHg": {mul: 1}}
+
+# =====================================================================================================
+# 2. Qualitative results (omop_measurement rows read as positive / negative)
+# =====================================================================================================
+qualitative_items:
+  blood_culture_drawn:      # ANY blood-culture row (order/collection/result) proves a culture was drawn
+    codes: [{system: LOINC, code: "600-7"}, {system: LOINC, code: "17928-3"}, {system: LOINC, code: "17934-1"}]
+    name_regex: '(blood|bld).*cultur|cultur.*(blood|bld)|\bbcx\b|\bbld cx\b'
+    name_exclude: 'urine|ur\b|csf|cerebro|fluid|stool|sputum|wound|catheter tip|cord|sensitivity|susceptib|\bmic\b'
+    result: none
+  blood_culture_pos:        # organism identified in blood culture (E7 support). Commensals alone do NOT count.
+    codes: [{system: LOINC, code: "600-7"}, {system: LOINC, code: "17928-3"}, {system: LOINC, code: "17934-1"}]
+    name_regex: '(blood|bld).*cultur|cultur.*(blood|bld)|\bbcx\b|\bbld cx\b'
+    name_exclude: 'urine|ur\b|csf|cerebro|fluid|stool|sputum|wound|catheter tip|cord|sensitivity|susceptib|\bmic\b'
+    result: positive
+    nonneg_text_is_positive: true       # these rows carry the organism / "no growth" as the result
+    commensal_regex: 'coagulase[- ]negative|\bcons\b|epidermidis|micrococc|corynebacter|diphtheroid|propionibacter|cutibacter|bacillus species|viridans|skin (flora|contaminant)|contaminant'
+  csf_culture_pos:
+    codes: []
+    name_regex: '(csf|cerebro|cerebral ?spinal).*cultur|cultur.*(csf|cerebro)'
+    name_exclude: 'fung|afb|myco|viral|sensitivity|susceptib|\bmic\b'
+    result: positive
+    nonneg_text_is_positive: true
+    commensal_regex: 'coagulase[- ]negative|\bcons\b|epidermidis|micrococc|corynebacter|diphtheroid|propionibacter|cutibacter|contaminant'
+  csf_pcr_pos:              # HSV / VZV / enterovirus / meningitis-encephalitis panel on CSF; specimen must be named
+    codes: []
+    name_regex: '(csf|cerebro|cerebral ?spinal).*(pcr|naat|nucleic|\bdna\b|\brna\b|meningitis|encephalitis|filmarray|\bme panel)|(hsv|herpes|vzv|varicella|enterovirus|parechovirus|\bcmv\b|west nile|\bjc\b).*(csf|cerebro)'
+    name_exclude: 'antibody|\bigg\b|\bigm\b|titer|index'
+    result: positive
+    numeric_positive: true
+  csf_autoimmune_ab_pos:    # NMDAR etc. in CSF OR serum (silver_anchors.yaml); GAD65 deliberately excluded (diabetes)
+    codes: []
+    name_regex: 'nmda|lgi-?1|caspr-?2|\bampa\b|gaba-?b|\bdppx\b|iglon5|autoimmune enceph|paraneoplastic|anti-?neuronal'
+    name_exclude: 'ampa(?!r)\b.*(urine|drug)|amphet'
+    result: positive
+    numeric_positive: true
+
+# Result vocabularies (applied to value_source_value, the Meas Value concept name, then value_as_number)
+result_text:
+  negative: '^\s*(no growth|negative|neg\b|not detected|none detected|none seen|no organism|no bacteria|sterile|normal|undetect|non[- ]?reactive|not seen|nd\b|absent|<\s*\d)|\bno (bacterial |significant )?growth\b'
+  pending: 'pending|in progress|preliminary|incubat|to follow|specimen (received|in lab)|not (yet )?resulted'
+  positive: '^\s*(pos\b|positive|detected|reactive|abnormal|present|confirmed|\+|>\s*\d|\d+\s*(copies|iu|titer|:))|presumptive pos|grew|growth of|\bgram[- ](positive|negative)\b'
+
+# =====================================================================================================
+# 3. Toxicology screens (qualitative rows; agent from the name) + the in-hospital drugs that EXPLAIN a positive
+# =====================================================================================================
+# A positive screen is E4a-eligible (item tox_screen_positive_nontherapeutic) ONLY IF none of `in_hospital_drugs`
+# was administered in the encounter at or before the specimen time. Otherwise it is an E4b covariate
+# (e4b_tox_inhospital) and fires nothing. Class lists are deliberately generous (cross-reactivity): a missed E4a
+# costs recall, a false E4a plants an iatrogenic case in the intoxication label.
+tox_agents:
+  opiates:
+    name_regex: 'opiate|opioid|morphine|codeine|heroin|6-?mam'
+    in_hospital_drugs: [morphine, codeine, hydromorphone, hydrocodone, oxycodone, oxymorphone, heroin]
+  oxycodone:
+    name_regex: 'oxycodone|oxymorphone'
+    in_hospital_drugs: [oxycodone, oxymorphone]
+  fentanyl:
+    name_regex: 'fentanyl'
+    in_hospital_drugs: [fentanyl, sufentanil, alfentanil]
+  methadone:
+    name_regex: 'methadone|\bemdp\b'
+    in_hospital_drugs: [methadone]
+  buprenorphine:
+    name_regex: 'buprenorphine|suboxone'
+    in_hospital_drugs: [buprenorphine]
+  benzodiazepines:
+    name_regex: 'benzodiazepine|\bbzd\b|benzo\b'
+    in_hospital_drugs: [midazolam, lorazepam, diazepam, clonazepam, alprazolam, chlordiazepoxide, temazepam, oxazepam]
+  barbiturates:
+    name_regex: 'barbiturate|barbit'
+    in_hospital_drugs: [phenobarbital, pentobarbital, butalbital, secobarbital]
+  phencyclidine:
+    name_regex: '\bpcp\b|phencyclidine'
+    in_hospital_drugs: [ketamine]
+  amphetamines:
+    name_regex: 'amphetamine|methamphetamine|\bmdma\b|amfetamine'
+    in_hospital_drugs: [amphetamine, dextroamphetamine, methamphetamine, lisdexamfetamine]
+  cocaine:
+    name_regex: 'cocaine|benzoylecgonine'
+    in_hospital_drugs: [cocaine]
+  cannabinoids:
+    name_regex: 'cannabin|\bthc\b|marijuana|cannabis'
+    in_hospital_drugs: [dronabinol, nabilone]
+  tricyclics:
+    name_regex: 'tricyclic|\btca\b'
+    in_hospital_drugs: [amitriptyline, nortriptyline, imipramine, doxepin, cyclobenzaprine, desipramine, clomipramine]
+tox_context_regex: 'screen|drug|tox|urine|\bur\b|serum|qual|presence|detect|confirm|level|panel|immunoassay'
+tox_exclude_regex: 'prescribed|therapeutic|home med|medication list|history|\bhx\b|consent|ordered|plan'
+
+# =====================================================================================================
+# 4. Event items from codes (conditions, procedures, observations)
+# =====================================================================================================
+# Prefix lists are matched on codes with dots removed, upper case. ICD-9 and ICD-10 are mixed in HEEDB
+# condition_source_value, so both are listed. `prefix: true` entries match concept_code by prefix.
+code_event_items:
+  arrest_event:
+    description: "CPR / ROSC procedure or cardiac-arrest condition (I46.*)"
+    condition_codes:
+      - {system: ICD10CM, code: "I46", prefix: true}             # I46.2 / I46.8 / I46.9 cardiac arrest
+      - {system: ICD9CM, code: "4275", prefix: true}             # 427.5 cardiac arrest
+      - {system: SNOMED, code: "410429000"}                      # cardiac arrest (disorder); verify
+    procedure_codes:
+      - {system: CPT4, code: "92950"}                            # cardiopulmonary resuscitation
+      - {system: ICD10PCS, code: "5A12012"}                      # performance of cardiac output, single, manual (CPR)
+      - {system: ICD9Proc, code: "9960"}                         # 99.60 cardiopulmonary resuscitation NOS
+      - {system: ICD9Proc, code: "9963"}                         # 99.63 closed chest cardiac massage
+    text_regex: 'cardiac arrest|cardiopulmonary arrest|\brosc\b|return of spontaneous circulation|\bcpr\b|code blue|resuscitat'
+    text_exclude: 'history of|h/o|\bhx\b|prior|previous|s/p remote|family|denies|no cardiac arrest|education|training|ehr'
+    text_tables: [observation, procedure]
+  asphyxia_event:
+    description: "hanging / drowning / choking (airway foreign body) / CO or other asphyxiation"
+    condition_codes:
+      - {system: ICD10CM, code: "T71", prefix: true}             # asphyxiation
+      - {system: ICD10CM, code: "T751", prefix: true}            # drowning and nonfatal submersion
+      - {system: ICD10CM, code: "T58", prefix: true}             # toxic effect of carbon monoxide
+      - {system: ICD10CM, code: "T17", prefix: true}             # foreign body in respiratory tract (choking)
+      - {system: ICD10CM, code: "R0901", prefix: true}           # asphyxia
+      - {system: ICD10CM, code: "W75", prefix: true}             # accidental suffocation and strangulation in bed
+      - {system: ICD10CM, code: "W76", prefix: true}             # other accidental hanging and strangulation
+      - {system: ICD10CM, code: "W77", prefix: true}
+      - {system: ICD10CM, code: "W78", prefix: true}             # inhalation of gastric contents
+      - {system: ICD10CM, code: "W79", prefix: true}             # inhalation and ingestion of food causing obstruction
+      - {system: ICD10CM, code: "W80", prefix: true}
+      - {system: ICD10CM, code: "W81", prefix: true}
+      - {system: ICD10CM, code: "W83", prefix: true}
+      - {system: ICD10CM, code: "W84", prefix: true}
+      - {system: ICD10CM, code: "W65", prefix: true}             # drowning (bath, pool, natural water ...)
+      - {system: ICD10CM, code: "W66", prefix: true}
+      - {system: ICD10CM, code: "W67", prefix: true}
+      - {system: ICD10CM, code: "W68", prefix: true}
+      - {system: ICD10CM, code: "W69", prefix: true}
+      - {system: ICD10CM, code: "W70", prefix: true}
+      - {system: ICD10CM, code: "W73", prefix: true}
+      - {system: ICD10CM, code: "W74", prefix: true}
+      - {system: ICD10CM, code: "X70", prefix: true}             # intentional self-harm by hanging
+      - {system: ICD10CM, code: "X71", prefix: true}             # intentional self-harm by drowning
+      - {system: ICD9CM, code: "9947", prefix: true}             # 994.7 asphyxiation and strangulation
+      - {system: ICD9CM, code: "9941", prefix: true}             # 994.1 drowning
+      - {system: ICD9CM, code: "986", prefix: true}              # 986 toxic effect of carbon monoxide
+      - {system: ICD9CM, code: "933", prefix: true}              # 933 foreign body in pharynx and larynx
+      - {system: ICD9CM, code: "934", prefix: true}              # 934 foreign body in trachea, bronchus and lung
+    procedure_codes: []
+    text_regex: ''
+  esrd:                      # HELPER (not an anchor item): excludes creatinine_doubling
+    description: "end-stage renal disease / chronic dialysis"
+    lookback_days: null
+    condition_codes:
+      - {system: ICD10CM, code: "N186", prefix: true}
+      - {system: ICD10CM, code: "Z992", prefix: true}
+      - {system: ICD9CM, code: "5856", prefix: true}
+      - {system: ICD9CM, code: "V4511", prefix: true}
+    procedure_codes: []
+    text_regex: ''
+
+# =====================================================================================================
+# 5. Drug items (omop_drug_exposure). Matched by drug_concept_id (concept_name of RxNorm / RxNorm Extension
+#    concepts, or an ingredient concept_code below) and by regex over drug_source_value. No concept_ancestor
+#    table is read, so an RxNorm ingredient code only matches rows coded AT the ingredient level.
+# =====================================================================================================
+# applied to vasopressor and antidote groups (topical / oral / local-anaesthetic combination products are not those uses)
+drug_exclude_regex: 'ophth|otic|topical|cream|ointment|nasal|inhal|nebul|vaginal|shampoo|lozenge|dental|cartridge|lidocaine|bupivacaine|articaine|ropivacaine|mepivacaine|racepinephrine|tablet|\btab\b|capsule|\bcap\b|patch|spray|drops?\b|\bgel\b'
+# applied to antimicrobials (oral tablets stay in: some agents qualify by any route)
+antimicrobial_exclude_regex: 'ophth|otic|topical|cream|ointment|nasal|inhal|nebul|vaginal|shampoo|lozenge|dental|\bgel\b|drops?\b|spray|irrigation|lock|\bcement\b|powder'
+drug_groups:
+  vasopressor:
+    description: "new vasopressor start (E6 organ dysfunction); dobutamine / milrinone are inotropes and excluded"
+    ingredients:
+      norepinephrine: {regex: 'norepinephrine|levophed|noradrenaline', rxnorm: "7512"}
+      epinephrine: {regex: '\bepinephrine\b|adrenaline', rxnorm: "3992"}
+      vasopressin: {regex: 'vasopressin|vasostrict', rxnorm: "11149"}
+      phenylephrine: {regex: 'phenylephrine|neo-?synephrine', rxnorm: "8163"}
+      dopamine: {regex: '\bdopamine\b', rxnorm: "3616"}
+      angiotensin_ii: {regex: 'angiotensin ii|giapreza'}
+    extra_exclude: 'midodrine|droxidopa|epinephrine.*(lidocaine|articaine)|\bpf\b|auto-?injector|epipen|anaphyl'
+    washout_hours: 24         # a start counts as "new" only if no pressor started in the previous 24 h (rate-change rows)
+  antidote:
+    description: "antidote GIVEN (response is not codable from structured data)"
+    ingredients:
+      naloxone: {regex: 'naloxone|narcan', rxnorm: "7242", pairs_with: opioid_exposure}
+      nalmefene: {regex: 'nalmefene', pairs_with: opioid_exposure}
+      flumazenil: {regex: 'flumazenil|romazicon', pairs_with: benzodiazepine_exposure}
+      physostigmine: {regex: 'physostigmine'}
+      fomepizole: {regex: 'fomepizole|antizol'}
+      acetylcysteine: {regex: 'acetylcysteine|acetadote|\bnac\b'}
+      hydroxocobalamin: {regex: 'hydroxocobalamin|cyanokit'}
+      pralidoxime: {regex: 'pralidoxime|protopam|2-?pam'}
+      digoxin_immune_fab: {regex: 'digifab|digoxin immune'}
+    extra_exclude: 'mucomyst|solution for inhalation'
+  exposure_sets:             # in-hospital exposure classes that EXPLAIN a tox screen or turn an antidote into a reversal
+    opioid_exposure: [morphine, codeine, hydromorphone, hydrocodone, oxycodone, oxymorphone, fentanyl, sufentanil, alfentanil, remifentanil, meperidine, methadone, buprenorphine, tramadol]
+    benzodiazepine_exposure: [midazolam, lorazepam, diazepam, clonazepam, alprazolam, chlordiazepoxide, temazepam, oxazepam]
+  sedative:                  # E4b covariate hint (planned ICU sedatives)
+    ingredients:
+      propofol: {regex: 'propofol|diprivan'}
+      midazolam: {regex: 'midazolam|versed'}
+      lorazepam: {regex: 'lorazepam|ativan'}
+      dexmedetomidine: {regex: 'dexmedetomidine|precedex'}
+      ketamine: {regex: 'ketamine|ketalar'}
+      pentobarbital: {regex: 'pentobarbital|nembutal'}
+      phenobarbital: {regex: 'phenobarbital|phenobarbitone'}
+      etomidate: {regex: 'etomidate|amidate'}
+  # ingredient regexes for every ingredient named in exposure_sets / tox_agents.in_hospital_drugs
+  other_ingredients:
+    morphine: 'morphine'
+    codeine: 'codeine'
+    hydromorphone: 'hydromorphone|dilaudid'
+    hydrocodone: 'hydrocodone|vicodin|norco'
+    oxycodone: 'oxycodone|oxycontin|percocet|roxicodone'
+    oxymorphone: 'oxymorphone|opana'
+    heroin: 'heroin|diacetylmorphine'
+    fentanyl: 'fentanyl|sublimaze'
+    sufentanil: 'sufentanil'
+    alfentanil: 'alfentanil'
+    remifentanil: 'remifentanil|ultiva'
+    meperidine: 'meperidine|demerol'
+    methadone: 'methadone'
+    buprenorphine: 'buprenorphine|suboxone|subutex'
+    tramadol: 'tramadol|ultram'
+    diazepam: 'diazepam|valium'
+    clonazepam: 'clonazepam|klonopin'
+    alprazolam: 'alprazolam|xanax'
+    chlordiazepoxide: 'chlordiazepoxide|librium'
+    temazepam: 'temazepam|restoril'
+    oxazepam: 'oxazepam|serax'
+    butalbital: 'butalbital|fioricet'
+    secobarbital: 'secobarbital'
+    amphetamine: 'amphetamine|adderall'
+    dextroamphetamine: 'dextroamphetamine|dexedrine'
+    methamphetamine: 'methamphetamine|desoxyn'
+    lisdexamfetamine: 'lisdexamfetamine|vyvanse'
+    cocaine: 'cocaine'
+    dronabinol: 'dronabinol|marinol'
+    nabilone: 'nabilone'
+    amitriptyline: 'amitriptyline|elavil'
+    nortriptyline: 'nortriptyline|pamelor'
+    imipramine: 'imipramine|tofranil'
+    doxepin: 'doxepin'
+    cyclobenzaprine: 'cyclobenzaprine|flexeril'
+    desipramine: 'desipramine'
+    clomipramine: 'clomipramine|anafranil'
+
+# Qualifying antimicrobials for QAD (CDC Adult Sepsis Event style). APPROXIMATION of the CDC list (antibacterial and
+# antifungal agents; antivirals excluded): verify with the infection-prevention co-investigator.
+# route: iv = IV / IM only; any = qualifies by any route.
+antimicrobials:
+  vancomycin: {regex: 'vancomycin', route: iv}
+  piperacillin_tazobactam: {regex: 'piperacillin|zosyn', route: iv}
+  cefepime: {regex: 'cefepime|maxipime', route: iv}
+  ceftriaxone: {regex: 'ceftriaxone|rocephin', route: iv}
+  ceftazidime: {regex: 'ceftazidime|fortaz|tazicef', route: iv}
+  cefazolin: {regex: 'cefazolin|ancef', route: iv}
+  cefoxitin: {regex: 'cefoxitin', route: iv}
+  cefuroxime: {regex: 'cefuroxime|zinacef', route: iv}
+  ceftaroline: {regex: 'ceftaroline|teflaro', route: iv}
+  meropenem: {regex: 'meropenem|merrem', route: iv}
+  imipenem: {regex: 'imipenem|primaxin', route: iv}
+  ertapenem: {regex: 'ertapenem|invanz', route: iv}
+  aztreonam: {regex: 'aztreonam|azactam', route: iv}
+  ampicillin: {regex: 'ampicillin|unasyn', route: iv}
+  nafcillin: {regex: 'nafcillin|oxacillin', route: iv}
+  penicillin_g: {regex: 'penicillin g|pen g|bicillin', route: iv}
+  gentamicin: {regex: 'gentamicin', route: iv}
+  tobramycin: {regex: 'tobramycin', route: iv}
+  amikacin: {regex: 'amikacin', route: iv}
+  azithromycin: {regex: 'azithromycin|zithromax', route: iv}
+  erythromycin: {regex: 'erythromycin', route: iv}
+  clindamycin: {regex: 'clindamycin|cleocin', route: iv}
+  daptomycin: {regex: 'daptomycin|cubicin', route: iv}
+  tigecycline: {regex: 'tigecycline|tygacil', route: iv}
+  colistin: {regex: 'colistin|polymyxin', route: iv}
+  linezolid: {regex: 'linezolid|zyvox', route: any}
+  metronidazole: {regex: 'metronidazole|flagyl', route: any}
+  levofloxacin: {regex: 'levofloxacin|levaquin', route: any}
+  ciprofloxacin: {regex: 'ciprofloxacin|cipro\b', route: any}
+  moxifloxacin: {regex: 'moxifloxacin|avelox', route: any}
+  doxycycline: {regex: 'doxycycline', route: any}
+  minocycline: {regex: 'minocycline', route: any}
+  trimethoprim_sulfamethoxazole: {regex: 'sulfamethoxazole|trimethoprim|bactrim|septra', route: any}
+  rifampin: {regex: 'rifampin|rifampicin', route: any}
+  micafungin: {regex: 'micafungin|mycamine', route: iv}
+  caspofungin: {regex: 'caspofungin|cancidas', route: iv}
+  anidulafungin: {regex: 'anidulafungin|eraxis', route: iv}
+  amphotericin: {regex: 'amphotericin|ambisome|abelcet', route: iv}
+  fluconazole: {regex: 'fluconazole|diflucan', route: any}
+  voriconazole: {regex: 'voriconazole|vfend', route: any}
+antimicrobial_iv_route_regex: '\biv\b|intraven|\bim\b|intramusc|inject|\binj\b|infus|piggyback|\bpb\b|\bivpb\b'
+antimicrobial_oral_route_regex: '\bpo\b|oral|\bpr\b|enteral|\bng\b|\bog\b|tablet|\btab\b|capsule'
+qad:
+  window_days: 2              # first QAD within +-2 calendar days of the blood-culture day
+  min_days: 4
+  same_agent_gap_days: 1      # a single missing day between administrations of the SAME agent is bridged
+  new_agent_lookback_days: 2  # "new" = the agent was not given on the previous 2 calendar days
+  max_span_days: 14           # cap on days credited from one drug_exposure row (end dates can be stamped at death)
+
+# =====================================================================================================
+# 6. Derived flags (parameters; the logic lives in extract.py)
+# =====================================================================================================
+derived_items:
+  profound_shock:
+    map_lt: 50
+    min_duration_min: 30      # first-to-last low reading in one run
+    max_gap_min: 15           # consecutive low readings further apart than this do not form a run
+    event_time: run_onset
+  creatinine_doubling: {ratio: 2.0, baseline: min_prior_in_encounter, exclude: esrd}
+  bilirubin_doubling_ge2: {min_value_mgdl: 2.0, ratio: 2.0, baseline: min_prior_in_encounter}
+  platelets_drop: {max_value: 100, min_baseline: 100, min_fractional_decline: 0.5, baseline: max_prior_in_encounter}
+  tox_screen_positive_nontherapeutic: {window_note: "specimen time; agent split by tox_agents.in_hospital_drugs"}
+  antidote_response: {note: "antidote GIVEN; clinical response is not codable from structured data"}
+  vasopressor_initiation: {note: "see drug_groups.vasopressor"}
+  qad_ge4: {note: "see qad"}
+
+# E4b covariate hints produced alongside the silver labels (not anchors; E4b is excluded from the primary endpoint)
+e4b_covariates:
+  tox_inhospital_window_hours: [-24, 6]
+  antidote_reversal_window_hours: [-6, 6]
+  sedative_exposure_window_hours: [-24, 0]
+
+# =====================================================================================================
+# 7. Items that cannot be computed from structured data (RECORDED GAPS)
+# =====================================================================================================
+unavailable_items:
+  imaging_ich:           {reason: "no imaging findings table: the real Imaging/ prefix exists for I0001 and I0004 only (not an EEG site) and holds no coded findings; findings live in radiology report text (open-weight model on approved compute, out of scope)"}
+  imaging_sah:           {reason: "as imaging_ich"}
+  imaging_sdh_edh:       {reason: "as imaging_ich"}
+  imaging_infarct:       {reason: "as imaging_ich"}
+  imaging_tbi_contusion: {reason: "as imaging_ich"}
+  imaging_mass_effect:   {reason: "as imaging_ich"}
+
+# Computability of each anchor item (full = threshold on coded labs; proxy = computed with a documented approximation)
+item_status:
+  proxy:
+    - antidote_response            # antidote GIVEN only; response not codable
+    - tox_screen_positive_nontherapeutic   # name-matched screens; outpatient prescriptions not excluded
+    - qad_ge4                      # no death / transfer shortcut; route heuristics
+    - vasopressor_initiation       # peri-procedural push-dose pressors count
+    - blood_culture_pos            # commensals excluded by regex; positivity from result text
+    - csf_culture_pos
+    - csf_pcr_pos
+    - csf_autoimmune_ab_pos
+    - arrest_event                 # coding time of a diagnosis is approximate
+    - asphyxia_event
+    - creatinine_doubling
+    - bilirubin_doubling_ge2
+    - platelets_drop
+    - profound_shock
+
+# =====================================================================================================
+# 8. EEG-report impression comparator (PROVISIONAL, comparator ONLY)
+# =====================================================================================================
+# reports_findings (EEG report flags) may NEVER be positive silver evidence (D-006). They feed only the circularity
+# audit as the "EEG impression" reference. A flag cell counts when non-empty and not None/nan. This label mapping is
+# a PROVISIONAL guess by the author and needs clinician sign-off; labels with no entry get NO comparator rows.
+eeg_impression_comparator:
+  status: "PROVISIONAL: needs EEG-clinician sign-off; structured flags cannot express toxic/infectious etiologies"
+  E1: ["foc slowing", "lpd", "lrda"]
+  E2: ["bs", "low voltage"]
+  E5: ["gpd"]

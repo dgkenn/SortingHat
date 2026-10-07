@@ -1,0 +1,242 @@
+"""Study 1 cohort builder (plan: "Population and index time"; SAP section 2).
+
+One row per patient. Every step is counted per site in a ``FlowRecorder``; ``build_cohort`` returns the
+record-level table and key list (IN MEMORY - write them only with ``cohort.output.write_outputs``) and the
+suppressed aggregate flow report.
+
+Order of steps (see ``docs/cohort_spec.md`` for the operational choice behind each, C-nn):
+
+  EEG sessions -> patient id -> start time -> age known -> adult -> visit covering start -> visit setting
+  classified -> acute-care setting -> not OR/EMU service -> FIRST QUALIFYING EEG PER PATIENT (sessions become
+  patients) -> recording covers minutes 1-11 -> ACI onset proxy exists -> EEG within the widest onset window
+  (48 h) -> strict severity or EHR phenotype.
+
+``in_strict`` / ``in_broad`` are the PRIMARY cohorts (EEG within 24 h of onset); the 6 / 12 / 48 h sensitivity
+windows are flags on the same rows. The broad cohort contains the strict cohort ("broad only" = broad and not
+strict is the separately reported part). t0 = EEG start (``StartTime(EEG)``); the EEG QC step (minimum channel
+set, >= 60% usable) belongs to the streaming extractor and is appended to the flow after it has run.
+
+No printing here; record-level frames are returned, never emitted (CLAUDE.md rule 3).
+"""
+
+from __future__ import annotations
+
+from dataclasses import dataclass, field
+
+import numpy as np
+import pandas as pd
+
+from .. import data_io
+from ..safe_output import safe_quantiles
+from . import rules
+from .config import CohortConfig
+from .flow import FlowRecorder, flow_report
+
+KEY_LIST_COLUMNS = ["SiteID", "person_id", "SessionID", "BidsFolder", "EEGFolder", "edf_key",
+                    "task_token_assumed", "window_start_s", "window_duration_s", "in_strict", "in_broad"]
+INCLUDED = "included"
+LATER_SESSION = "Not the patient's first qualifying EEG"
+SESS, PAT = "EEG sessions", "patients"
+
+
+@dataclass
+class CohortResult:
+    table: pd.DataFrame                 # RECORD-LEVEL: local_only
+    keys: pd.DataFrame                  # RECORD-LEVEL: local_only
+    fates: pd.Series                    # RECORD-LEVEL, in memory only: person_id -> last step reached / "included"
+    flow_raw: dict                      # exact counts, in memory only
+    report: dict                        # suppressed, aggregate-only
+    config: dict = field(default_factory=dict)
+
+
+def _hours(a: pd.Series, b: pd.Series) -> pd.Series:
+    return (a - b).dt.total_seconds() / 3600.0
+
+
+def _duration(S: pd.DataFrame, cfg: CohortConfig) -> tuple[pd.Series, pd.Series]:
+    """Recording duration in seconds: metadata value x per-site unit scale; else EndTime - StartTime."""
+    scale = S["SiteID"].map(dict(cfg.duration_scale_by_site)).fillna(1.0).astype(float)
+    meta = pd.to_numeric(S["duration_raw_s"], errors="coerce") * scale
+    clock = (S["t_end"] - S["t0"]).dt.total_seconds()
+    clock = clock.where(clock > 0)
+    dur = meta.where(meta.notna(), clock)
+    basis = pd.Series(np.where(meta.notna(), "metadata", np.where(clock.notna(), "clock", "none")), index=S.index)
+    return dur, basis
+
+
+def duration_unit_check(S: pd.DataFrame, sites: list[str]) -> dict:
+    """Aggregate check of the DurationInSeconds / RecordingDuration unit: quartiles of metadata duration over the
+    EndTime - StartTime clock duration per site (about 1 if the unit really is seconds)."""
+    out = {}
+    clock = (S["t_end"] - S["t0"]).dt.total_seconds()
+    meta = pd.to_numeric(S["duration_raw_s"], errors="coerce")
+    ok = (clock > 0) & (meta > 0)
+    ratio = meta / clock
+    for s in sites:
+        q = safe_quantiles(ratio[ok & (S["SiteID"] == s)].to_numpy(float), qs=(0.25, 0.5, 0.75))
+        med = q["q50"]
+        warn = "" if isinstance(med, str) or 0.8 <= med <= 1.25 else " ; UNIT WARNING: median far from 1"
+        out[f"duration_over_clock_{s}"] = f"{q}{warn}"
+    return out
+
+
+class _Run:
+    """Working state of one build: the shrinking session/patient frame plus the record-level reasons."""
+
+    def __init__(self, S: pd.DataFrame, flow: FlowRecorder):
+        self.S = S.assign(_sess_idx=S.index)
+        self.flow = flow
+        self.reason = pd.Series("", index=S.index, dtype=object)
+        self.stage = pd.Series(-1, index=S.index, dtype=int)
+        self.n = 0
+
+    def drop(self, label: str, keep: pd.Series, unit: str) -> None:
+        """Exclude the rows where ``keep`` is False; count the step per site; remember the reason per session."""
+        keep = keep.fillna(False).astype(bool).reindex(self.S.index, fill_value=False)
+        self.n += 1
+        gone = self.S.loc[~keep, "_sess_idx"].to_numpy()
+        self.reason.loc[gone] = label
+        self.stage.loc[gone] = self.n
+        self.S = self.S[keep.to_numpy()]
+        self.flow.step(label, unit, self.S["SiteID"])
+
+
+def build_cohort(src, cfg: CohortConfig | None = None) -> CohortResult:
+    cfg = cfg or CohortConfig()
+    S0 = src.sessions().reset_index(drop=True)
+    sites = sorted(S0["SiteID"].astype(str).unique())
+    flow = FlowRecorder(sites)
+    run = _Run(S0, flow)
+    flow.start("EEG sessions in HEEDB metadata", SESS, S0["SiteID"])
+    flow.checks.update(duration_unit_check(S0, sites))
+    n_unstamped = S0[S0["person_id"].notna() & S0["t0"].isna()].groupby("person_id").size()
+
+    # ------------------------------------------------------------------ session-level qualification
+    run.drop("Patient id not resolvable", run.S["person_id"].notna(), SESS)
+    run.drop("EEG start time missing", run.S["t0"].notna(), SESS)
+    run.drop("Age missing", run.S["age_years"].notna(), SESS)
+    run.drop(f"Age < {cfg.adult_age_years:g} y", run.S["age_years"] >= cfg.adult_age_years, SESS)
+
+    S = run.S.copy()
+    S["person_id"] = S["person_id"].astype("int64")
+    visits = src.visits(S["person_id"].unique())
+    run.S = S.join(rules.match_visits(S, visits, cfg.acute_classes, cfg.visit_chain_gap_h))
+    run.S["ServiceName"] = run.S["ServiceName"].astype("string").str.strip().str.upper()
+    run.drop("No visit covering the EEG start", run.S["visit_start"].notna(), SESS)
+
+    S = run.S
+    unknown = S["visit_class"].isna()
+    acute_v = S["visit_class"].isin(cfg.acute_classes)
+    acute_s = unknown & cfg.use_service_fallback & S["ServiceName"].isin([x.upper() for x in cfg.service_acute]
+                                                                         ).fillna(False)
+    run.drop("Visit care setting unclassifiable", ~unknown | acute_s, SESS)
+    run.drop("Non-acute care setting (outpatient)", acute_v | acute_s, SESS)
+    run.S = run.S.assign(acute_basis=np.where(run.S["visit_class"].isin(cfg.acute_classes), "visit", "service"))
+    run.drop("OR or EMU service (not an ACI work-up)",
+             ~run.S["ServiceName"].isin([x.upper() for x in cfg.exclude_services]).fillna(False), SESS)
+
+    # ------------------------------------------------------------------ first qualifying EEG per patient
+    run.S = run.S.sort_values(["person_id", "t0", "SessionID"], kind="stable")
+    run.drop(LATER_SESSION, ~run.S["person_id"].duplicated(keep="first"), PAT)
+
+    # ------------------------------------------------------------------ recording must cover minutes 1-11
+    dur, basis = _duration(run.S, cfg)
+    run.S = run.S.assign(duration_s=dur, duration_basis=basis)
+    run.drop("Recording duration unknown", run.S["duration_s"].notna(), PAT)
+    run.drop(f"Recording shorter than {cfg.min_duration_s / 60:g} min", run.S["duration_s"] >= cfg.min_duration_s, PAT)
+
+    # ------------------------------------------------------------------ ACI onset proxy and time since onset
+    run.S = run.S.reset_index(drop=True)          # unique, positional index for the row-level joins below
+    scores = rules.extract_scores(src.scores(run.S["person_id"].unique()))
+    on = rules.onset_times(run.S, scores, cfg.onset_rule, cfg.abnormal_gcs_max, cfg.abnormal_four_max)
+    run.S = run.S.assign(onset=on["onset"], onset_basis=on["onset_basis"])
+    run.S["hours_since_onset"] = _hours(run.S["t0"], run.S["onset"])
+    run.drop("No ACI onset proxy", run.S["onset"].notna(), PAT)
+    run.drop(f"EEG more than {cfg.onset_max_h:g} h after onset", run.S["hours_since_onset"] <= cfg.onset_max_h, PAT)
+    if (run.S["hours_since_onset"] < 0).any():                  # impossible by construction (onset <= t0)
+        raise AssertionError("onset after t0")
+
+    # ------------------------------------------------------------------ strict severity / broad phenotype
+    sev = rules.severity(run.S, scores, cfg.score_window_h, cfg.gcs_strict_max, cfg.four_strict_max, cfg.score_rule)
+    run.S = run.S.join(sev)
+    cond = src.conditions(run.S["person_id"].unique())
+    run.S["phenotype"] = rules.phenotype(run.S, cond, cfg.phenotype_after_h)
+    run.drop("Neither strict severity (GCS/FOUR) nor EHR phenotype",
+             run.S["severity_strict"] | run.S["phenotype"], PAT)
+
+    # ------------------------------------------------------------------ flags and the final table
+    S = run.S.copy()
+    for h in cfg.onset_windows_h:
+        S[f"onset_le_{h:g}h"] = S["hours_since_onset"] <= h
+    prim = S[f"onset_le_{cfg.onset_primary_h:g}h"]
+    S["in_strict"] = S["severity_strict"] & prim
+    S["in_broad"] = (S["severity_strict"] | S["phenotype"]) & prim
+    S["n_unstamped_sessions"] = S["person_id"].map(n_unstamped).fillna(0).astype(int)
+    fill = pd.Series([data_io.bids_folder_for(s, p) for s, p in zip(S["SiteID"], S["person_id"])], index=S.index)
+    S["BidsFolder"] = S["BidsFolder"].astype(object).where(S["BidsFolder"].notna(), fill)
+    run.reason.loc[S["_sess_idx"].to_numpy()] = INCLUDED
+    run.stage.loc[S["_sess_idx"].to_numpy()] = 10**6
+
+    cols = ["SiteID", "person_id", "SessionID", "BidsFolder", "EEGFolder", "t0", "age_years", "ServiceName",
+            "visit_class", "acute_basis", "duration_s", "duration_basis", "onset", "onset_basis",
+            "hours_since_onset", *[f"onset_le_{h:g}h" for h in cfg.onset_windows_h], "gcs_min_window",
+            "four_min_window", "n_score_obs_window", "severity_strict", "phenotype", "in_strict", "in_broad",
+            "n_unstamped_sessions"]
+    table = S[cols].sort_values("person_id").reset_index(drop=True)
+    for c in ("SiteID", "SessionID", "BidsFolder", "EEGFolder", "ServiceName"):
+        table[c] = table[c].astype(object)
+
+    _partitions(flow, table, cfg)
+    keys = make_key_list(table, cfg)
+    fates = _fates(S0, run.reason, run.stage)
+    raw = flow.raw()
+    return CohortResult(table, keys, fates, raw, flow_report(raw, cfg.to_dict()), cfg.to_dict())
+
+
+def _fates(S0: pd.DataFrame, reason: pd.Series, stage: pd.Series) -> pd.Series:
+    """person_id -> reason of the session that got furthest (or 'included'). Record-level; in memory only."""
+    d = pd.DataFrame({"person_id": S0["person_id"], "reason": reason, "stage": stage}).dropna(subset=["person_id"])
+    d["person_id"] = d["person_id"].astype("int64")
+    best = d.sort_values(["person_id", "stage"], kind="stable").drop_duplicates("person_id", keep="last")
+    return best.set_index("person_id")["reason"]
+
+
+def _partitions(flow: FlowRecorder, t: pd.DataFrame, cfg: CohortConfig) -> None:
+    """Disjoint-and-exhaustive splits of the final table (suppressed with complementary suppression)."""
+    site = t["SiteID"]
+    p = t[f"onset_le_{cfg.onset_primary_h:g}h"]
+    flow.partition("Cohort membership of table rows", {
+        "strict, primary window": site[t["in_strict"]],
+        "broad only, primary window": site[t["in_broad"] & ~t["in_strict"]],
+        "sensitivity windows only": site[~p]})
+    ws = list(cfg.onset_windows_h)
+    bins, lo = {}, -1e-9
+    for h in ws:
+        bins[f"{lo if lo > 0 else 0:g} to {h:g} h"] = site[(t["hours_since_onset"] > lo) & (t["hours_since_onset"] <= h)]
+        lo = h
+    flow.partition("Hours from onset proxy to EEG start (table rows)", bins)
+    flow.partition("Onset proxy basis (table rows)", {
+        "first abnormal score": site[t["onset_basis"] == "abnormal_score"],
+        "ED arrival or admission": site[t["onset_basis"] == "visit_start"]})
+    flow.partition("Acute-care basis (table rows)", {
+        "visit setting": site[t["acute_basis"] == "visit"], "service fallback": site[t["acute_basis"] == "service"]})
+    flow.partition("First-EEG order uncertain: an unstamped EEG exists (table rows)", {
+        "yes": site[t["n_unstamped_sessions"] > 0], "no": site[t["n_unstamped_sessions"] == 0]})
+
+
+def make_key_list(t: pd.DataFrame, cfg: CohortConfig) -> pd.DataFrame:
+    """Recording key list the streaming extractor reads (RECORD-LEVEL; local_only). One row per table row.
+
+    ``edf_key`` is the BIDS EDF key under the access point (``data_io.bids_edf_key``). ``EEGFolder`` exists only in
+    the S0001/S0002 headers, so elsewhere the task token defaults to 'EEG' (``task_token_assumed`` = True: UNVERIFIED
+    for continuous-EEG sessions at the I-sites). The window is minutes 1-11 (60-660 s from recording start)."""
+    eeg_folder = t["EEGFolder"].astype(object).where(t["EEGFolder"].notna(), None)
+    edf = [data_io.bids_edf_key(s, b, str(sid), ef)
+           for s, b, sid, ef in zip(t["SiteID"], t["BidsFolder"], t["SessionID"], eeg_folder)]
+    k = pd.DataFrame({
+        "SiteID": t["SiteID"], "person_id": t["person_id"], "SessionID": t["SessionID"],
+        "BidsFolder": t["BidsFolder"], "EEGFolder": t["EEGFolder"], "edf_key": edf,
+        "task_token_assumed": t["EEGFolder"].isna(),
+        "window_start_s": cfg.window_start_s, "window_duration_s": cfg.window_duration_s,
+        "in_strict": t["in_strict"], "in_broad": t["in_broad"]})
+    return k[KEY_LIST_COLUMNS].reset_index(drop=True)
