@@ -40,6 +40,8 @@ def _as_text(table: str, df: pd.DataFrame) -> pd.DataFrame:
         if c in out.columns:
             ts = pd.to_datetime(out[c], errors="coerce")
             txt = ts.dt.strftime("%Y-%m-%d %H:%M:%S")
+            us = ts.dt.microsecond.fillna(0).astype(int)
+            txt = txt.where(us == 0, txt + "." + us.astype(str).str.zfill(6))     # optional .ffffff
             out[c] = txt.astype(object).where(ts.notna(), None)
     return out
 

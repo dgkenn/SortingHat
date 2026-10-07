@@ -27,6 +27,8 @@ from dataclasses import dataclass
 import numpy as np
 from scipy import stats
 
+_trapz = getattr(np, "trapezoid", None) or np.trapz
+
 Z = 1.959963984540054
 PREVALENCES = (0.05, 0.10, 0.20)
 C_STATS = (0.70, 0.75, 0.80)
@@ -63,7 +65,7 @@ def slope_information(prevalence: float, c_stat: float, n_grid: int = 20001) -> 
     dens = (1 - prevalence) * stats.norm.pdf(x, mu0, s) + prevalence * stats.norm.pdf(x, mu1, s)
     pr = 1.0 / (1.0 + np.exp(-x))
     w = pr * (1 - pr) * dens
-    I = np.array([[np.trapezoid(w, x), np.trapezoid(w * x, x)], [np.trapezoid(w * x, x), np.trapezoid(w * x * x, x)]])
+    I = np.array([[_trapz(w, x), _trapz(w * x, x)], [_trapz(w * x, x), _trapz(w * x * x, x)]])
     return I
 
 
@@ -108,6 +110,29 @@ def delta_halfwidth_at_n(sd_d: float, n: float) -> float:
 
 def n_for_delta_halfwidth(sd_d: float, halfwidth: float) -> float:
     return (Z * sd_d / halfwidth) ** 2
+
+
+def p_all_sites_favorable(true_delta: float, sd_d: float, n_per_site: int, n_sites: int = 3) -> float:
+    """P(every site's estimated Delta < 0) when each site's true Delta is ``true_delta`` (no heterogeneity)."""
+    p_one = stats.norm.cdf(-true_delta / (sd_d / np.sqrt(n_per_site)))
+    return float(p_one**n_sites)
+
+
+def power_h1_rule(true_delta: float, sd_d: float, n_per_site: int, n_sites: int = 3,
+                  tau: float = 0.0, n_sim: int = 200_000, seed: int = 0) -> float:
+    """Monte Carlo power of the H1/H2 rule: pooled 95% CI upper bound < 0 AND every site estimate < 0.
+
+    Site estimates ~ N(true_delta + u_s, sd_d^2 / n_per_site) with u_s ~ N(0, tau^2) (between-site
+    heterogeneity); the pooled CI is the normal-theory patient-level interval (a close stand-in for the
+    within-site bootstrap interval). Common SD across sites assumed.
+    """
+    rng = np.random.default_rng(seed)
+    se_s = sd_d / np.sqrt(n_per_site)
+    est = rng.normal(true_delta, np.sqrt(se_s**2 + tau**2), (n_sim, n_sites))
+    pooled = est.mean(axis=1)
+    se_pool = se_s / np.sqrt(n_sites)
+    ok = (pooled + Z * se_pool < 0) & np.all(est < 0, axis=1)
+    return float(ok.mean())
 
 
 @dataclass(frozen=True)
@@ -171,6 +196,17 @@ def format_delta_table(sds=(0.10, 0.20, 0.30), ns=(1000, 800, 500)) -> str:
     return h + body
 
 
+def format_power_table(sd_d: float = 0.20, n_per_site: int = 333, deltas=(-0.01, -0.02, -0.03, -0.05),
+                       taus=(0.0, 0.01)) -> str:
+    h = ("| True Delta | P(all 3 sites < 0) | " + " | ".join(f"Power, H1/H2 rule (tau={t:g})" for t in taus)
+         + " |\n|" + "---|" * (2 + len(taus)) + "\n")
+    body = ""
+    for dl in deltas:
+        pw = " | ".join(f"{power_h1_rule(dl, sd_d, n_per_site, 3, t):.2f}" for t in taus)
+        body += f"| {dl:.2f} | {p_all_sites_favorable(dl, sd_d, n_per_site):.2f} | {pw} |\n"
+    return h + body
+
+
 def render(oe_width: float = 0.2, slope_width: float = 0.2, c_width: float = 0.1) -> str:
     rows = build_table(oe_width, slope_width, c_width)
     wide = build_table(oe_width * 2, 0.3, c_width)
@@ -187,6 +223,10 @@ def render(oe_width: float = 0.2, slope_width: float = 0.2, c_width: float = 0.1
         "### Table S4. Expected 95% CI half-width for primary-endpoint Delta (placeholder SDs of d_i)",
         "",
         format_delta_table(),
+        "### Table S5. Power of the H1/H2 rule (CI upper < 0 and every site < 0): SD of d_i = 0.20 (placeholder), "
+        "3 sites x 333 patients",
+        "",
+        format_power_table(),
     ]
     return "\n".join(parts)
 

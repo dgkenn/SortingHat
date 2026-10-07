@@ -113,12 +113,15 @@ def from_raw_tables(raw: dict[str, pd.DataFrame]) -> dict[str, pd.DataFrame]:
         sess = set(g["SessionID"].astype(str))
         fg = rf[rf["SessionID"].astype(str).isin(sess)] if rf is not None else None
         parts.append(merge_eeg(g, fg, str(site)))
-    out = {"eeg_metadata": pd.concat(parts, ignore_index=True),
+    eeg = pd.concat(parts, ignore_index=True)
+    cohort = set(build_candidates(eeg)["person_id"])         # same cohort filter as the streaming loader
+    out = {"eeg_metadata": eeg,
            "omop_drug_exposure": filter_drugs(raw["omop_drug_exposure"]),
            "omop_measurement": filter_measurements(raw["omop_measurement"])}
     for t in ("omop_note", "imaging"):
         out[t] = raw.get(t, pd.DataFrame())
-    return out
+    return {k: (v if k == "eeg_metadata" or "person_id" not in v else v[v["person_id"].isin(cohort)])
+            for k, v in out.items()}
 
 
 def load_audit_tables(s3, sites: list[str] | None = None, avail: dict | None = None) -> dict[str, pd.DataFrame]:
@@ -146,7 +149,7 @@ def load_audit_tables(s3, sites: list[str] | None = None, avail: dict | None = N
     eeg = pd.concat(parts, ignore_index=True)
     cohort = [int(p) for p in build_candidates(eeg)["person_id"].dropna().unique()]
     out = {"eeg_metadata": eeg}
-    result_cols = [c for a in schema.COLUMN_ALIASES["measurement.result_datetime"] for c in [a]]
+    result_cols = schema.COLUMN_ALIASES["measurement.result_datetime"]
     for table in ("omop_drug_exposure", "omop_measurement", "omop_note", "imaging"):
         spec = data_io.TABLES[table]
         cols = schema.columns(table) + (result_cols if table == "omop_measurement" else [])
@@ -169,13 +172,22 @@ def load_audit_tables(s3, sites: list[str] | None = None, avail: dict | None = N
 
 
 # ---------------------------------------------------------------- helpers
+def acute_adult(eeg: pd.DataFrame) -> tuple[pd.DataFrame, bool]:
+    """Adult EEG sessions in acute care. PatientClass is ASSUMED (not seen in the real tables): when the
+    column is absent or empty the acute-care filter cannot be applied and all adult sessions are used
+    (second return value False; the report says so)."""
+    adult = eeg[eeg["AgeAtVisit"] >= ADULT_AGE]
+    have_class = "PatientClass" in eeg and bool(eeg["PatientClass"].notna().any())
+    return (adult[adult["PatientClass"].isin(ACUTE_CLASSES)] if have_class else adult), have_class
+
+
 def build_candidates(eeg: pd.DataFrame) -> pd.DataFrame:
     """First qualifying EEG per adult patient (acute care, start time present)."""
-    e = eeg[(eeg["AgeAtVisit"] >= ADULT_AGE) & eeg["PatientClass"].isin(ACUTE_CLASSES)
-            & eeg["StartTime"].notna()]
-    e = e.sort_values(["BDSPPatientID", "StartTime"], kind="stable")
-    first = e.groupby("BDSPPatientID", as_index=False).first()
-    return first[["BDSPPatientID", "SiteID", "StartTime"]].rename(columns={"StartTime": "t0"})
+    e, _ = acute_adult(eeg)
+    e = e[e["StartTime"].notna() & e["person_id"].notna()]
+    e = e.sort_values(["person_id", "StartTime"], kind="stable")
+    first = e.groupby("person_id", as_index=False).first()
+    return first[["person_id", "SiteID", "StartTime"]].rename(columns={"StartTime": "t0"})
 
 
 def prop_block(flags: pd.Series, sites: pd.Series) -> tuple[dict, float]:
@@ -214,17 +226,25 @@ def _row(field, needed, criterion, fallback, stop, observed, passed, extra=None)
 # ---------------------------------------------------------------- date shift
 def _alignment(cands, tables):
     """Per-candidate: does any ancillary table sit far from the EEG start?"""
-    t0 = cands.set_index("BDSPPatientID")["t0"]
-    spec = {"notes": ["note_time"], "labs": ["collect_time"], "imaging": ["study_time"],
-            "medications": ["order_time"]}
+    t0 = cands.set_index("person_id")["t0"]
+    spec = {"notes": ("omop_note", "note_datetime"),
+            "labs": ("omop_measurement", "measurement_datetime"),
+            "imaging": ("imaging", "study_datetime"),
+            "medications": ("omop_drug_exposure", "drug_exposure_start_datetime")}
     mis = pd.Series(False, index=t0.index)
     has = pd.Series(False, index=t0.index)
     per_table = {}
-    for name, cols in spec.items():
-        d = tables[name][["BDSPPatientID", cols[0]]].dropna()
-        d = d[d["BDSPPatientID"].isin(t0.index)]
-        d["off"] = ((d[cols[0]] - d["BDSPPatientID"].map(t0)).dt.total_seconds().abs() / 86400.0)
-        med = d.groupby("BDSPPatientID")["off"].median()
+    for name, (tbl, col) in spec.items():
+        df = tables.get(tbl)
+        if df is None or col not in df or not len(df):
+            per_table[name] = (0, 0)
+            continue
+        d = df[["person_id", col]].dropna()
+        if name == "labs" and "kind" in df:
+            d = df.loc[df["kind"] == "lab", ["person_id", col]].dropna()
+        d = d[d["person_id"].isin(t0.index)].copy()
+        d["off"] = ((d[col] - d["person_id"].map(t0)).dt.total_seconds().abs() / 86400.0)
+        med = d.groupby("person_id")["off"].median()
         bad = med > MISALIGN_DAYS
         per_table[name] = (int(bad.sum()), int(len(med)))
         mis.loc[med.index[bad]] = True
@@ -235,15 +255,18 @@ def _alignment(cands, tables):
 def _monotonicity(tables):
     pairs = {
         "eeg_start_before_end": (tables["eeg_metadata"], "StartTime", "EndTime"),
-        "lab_collect_before_result": (tables["labs"], "collect_time", "result_time"),
-        "med_order_before_admin": (tables["medications"], "order_time", "admin_time"),
-        "imaging_study_before_final": (tables["imaging"], "study_time", "report_final_time"),
+        "drug_start_before_end": (tables.get("omop_drug_exposure"), "drug_exposure_start_datetime",
+                                  "drug_exposure_end_datetime"),
+        "imaging_study_before_final": (tables.get("imaging"), "study_datetime", "report_final_datetime"),
     }
     out, tot_n, tot_bad = {}, 0, 0
     for k, (df, a, b) in pairs.items():
-        ok = df[a].notna() & df[b].notna()
-        n = int(ok.sum())
-        bad = int((df.loc[ok, b] < df.loc[ok, a]).sum())
+        if df is None or a not in df or b not in df:
+            n = bad = 0
+        else:
+            ok = df[a].notna() & df[b].notna()
+            n = int(ok.sum())
+            bad = int((df.loc[ok, b] < df.loc[ok, a]).sum())
         out[k] = {"n_pairs": suppress_count(n), "n_violations": suppress_count(bad),
                   "rate": SUPPRESSED if (bad < 11 or n < 11) else round(bad / n, 4)}
         tot_n += n
@@ -253,19 +276,28 @@ def _monotonicity(tables):
 
 # ---------------------------------------------------------------- main audit
 def run_audit(tables: dict[str, pd.DataFrame], seed: int = 0, handcheck_n: int = HANDCHECK_N):
-    """Return ``(report, handcheck_ids)``. ``handcheck_ids`` are record-level: local file only."""
+    """Return ``(report, handcheck_ids)``. ``handcheck_ids`` are record-level: local file only.
+
+    ``tables`` is the analytic dict from ``load_audit_tables`` / ``from_raw_tables`` (raw real-layout tables,
+    recognised by a ``reports_findings`` key, are converted first).
+    """
+    if "reports_findings" in tables:
+        tables = from_raw_tables(tables)
     eeg = tables["eeg_metadata"]
     cands = build_candidates(eeg)
-    cand_ids = set(cands["BDSPPatientID"])
-    site_of = cands.set_index("BDSPPatientID")["SiteID"]
+    cand_ids = set(cands["person_id"])
+    site_of = cands.set_index("person_id")["SiteID"]
     rows = []
+    empty = pd.DataFrame()
 
     # 1. EEG start present (acute-care adult EEGs)
-    acute = eeg[(eeg["AgeAtVisit"] >= ADULT_AGE) & eeg["PatientClass"].isin(ACUTE_CLASSES)]
+    acute, have_class = acute_adult(eeg)
     blk, raw = prop_block(acute["StartTime"].notna(), acute["SiteID"])
+    note1 = "" if have_class else " [PatientClass absent: all adult EEGs, acute-care filter NOT applied]"
     rows.append(_row("EEG start date and time of day", "t0, every analysis",
                      "Present for >=95% of acute-care EEGs", "Stop; no study", True,
-                     blk, raw >= 0.95, {"observed_text": _fmt(blk)}))
+                     blk, raw >= 0.95, {"observed_text": _fmt(blk) + note1,
+                                        "acute_care_filter_applied": have_class}))
 
     # 2. Date-shift consistency (automated part + human hand-check sample)
     mis, per_table = _alignment(cands, tables)
@@ -299,44 +331,65 @@ def run_audit(tables: dict[str, pd.DataFrame], seed: int = 0, handcheck_n: int =
                               "a human must confirm note/lab/EEG times line up. Automated checks "
                               "cannot detect a shift applied identically to every table.")}))
 
-    # 3. Medication administration times
-    m = tables["medications"]
-    m = m[m["BDSPPatientID"].isin(cands["BDSPPatientID"]) & m["med_class"].isin(SEDATION_CLASSES)].copy()
-    m["t0"] = m["BDSPPatientID"].map(cands.set_index("BDSPPatientID")["t0"])
-    dt_h = (m["order_time"] - m["t0"]).dt.total_seconds() / 3600
-    m = m[(dt_h >= -48) & (dt_h <= 1)]
-    per_pt = m.groupby("BDSPPatientID")["admin_time"].apply(lambda s: s.notna().any())
-    blk, raw = prop_block(per_pt, site_of.loc[per_pt.index])
+    # 3. Medication administration times. drug_exposure has no order-time column and the semantics of
+    # drug_exposure_start_datetime are UNKNOWN; the end datetime (an administration-interval record) is the proxy.
+    m = tables.get("omop_drug_exposure", empty)
+    if len(m) and "drug_exposure_end_datetime" in m:
+        m = m[m["person_id"].isin(cand_ids)].copy()
+        m["t0"] = m["person_id"].map(cands.set_index("person_id")["t0"])
+        dt_h = (m["drug_exposure_start_datetime"] - m["t0"]).dt.total_seconds() / 3600
+        m = m[(dt_h >= -48) & (dt_h <= 1)]
+        per_pt = m.groupby("person_id")["drug_exposure_end_datetime"].apply(lambda x: x.notna().any())
+    else:
+        per_pt = pd.Series(dtype=bool)
+    blk, raw = prop_block(per_pt, site_of.reindex(per_pt.index))
     rows.append(_row("Medication administration times (not just orders)", "Sedation baseline, E4a/E4b",
-                     "Administration times for >=80% of candidates (with a sedation-class order "
-                     "in the 48 h before t0)", "Use orders; label 1B \"approximate\"", False,
+                     "Administration times for >=80% of candidates (proxy: sedation-class drug_exposure in the "
+                     "48 h before t0 with a non-empty drug_exposure_end_datetime; order vs administration "
+                     "semantics of drug_exposure_start_datetime are UNKNOWN)",
+                     "Use orders; label 1B \"approximate\"", False,
                      blk, raw >= 0.80, {"observed_text": _fmt(blk)}))
 
-    # 4. Lab result time
-    lb = tables["labs"]
-    lb = lb[lb["BDSPPatientID"].isin(cand_ids)]
-    blk, raw = prop_block(lb["result_time"].notna(), lb["BDSPPatientID"].map(site_of))
+    # 4. Lab result time: the real measurement table has NO result-time column (only measurement_datetime /
+    # measurement_date); pass only if a candidate alias column exists and is filled.
+    meas = tables.get("omop_measurement", empty)
+    lb = meas[meas["kind"] == "lab"] if len(meas) and "kind" in meas else meas
+    lb = lb[lb["person_id"].isin(cand_ids)] if len(lb) else lb
+    res_col = next((c for c in schema.COLUMN_ALIASES["measurement.result_datetime"] if c in meas.columns), None)
+    if res_col and len(lb):
+        blk, raw = prop_block(lb[res_col].notna(), lb["person_id"].map(site_of))
+        extra = {"observed_text": _fmt(blk), "result_lag_minutes": _lag(lb, res_col)}
+    else:
+        blk, raw = {"result_time_column_present": False}, float("nan")
+        extra = {"observed_text": "no result-time column in measurement (collection time only)"}
     rows.append(_row("Lab result or verification time", "Study 1B",
-                     "Result time present (operationalised: >=95% of candidate lab rows)",
+                     "Result time present (operationalised: >=95% of candidate lab rows; needs a result-time "
+                     "column, none is known in OMOP measurement)",
                      "Collection time plus assay lag; label 1B \"approximate\"", False,
-                     blk, raw >= 0.95, {"observed_text": _fmt(blk),
-                                        "result_lag_minutes": _lag(lb)}))
+                     blk, bool(res_col) and raw >= 0.95, extra))
 
-    # 5. Imaging report finalization time
-    im = tables["imaging"]
-    im = im[im["BDSPPatientID"].isin(cand_ids)]
-    blk, raw = prop_block(im["report_final_time"].notna(), im["BDSPPatientID"].map(site_of))
+    # 5. Imaging report finalization time (ASSUMED table and column)
+    im = tables.get("imaging", empty)
+    if len(im) and "report_final_datetime" in im:
+        im = im[im["person_id"].isin(cand_ids)]
+        blk, raw = prop_block(im["report_final_datetime"].notna(), im["person_id"].map(site_of))
+        txt = _fmt(blk)
+    else:
+        blk, raw, txt = {"imaging_table_or_column_found": False}, float("nan"), "imaging table/column not found"
     rows.append(_row("Imaging report finalization time", "Study 1B, H5",
                      "Present (operationalised: >=95% of candidate imaging studies)", "Drop H5", False,
-                     blk, raw >= 0.95, {"observed_text": _fmt(blk)}))
+                     blk, raw >= 0.95, {"observed_text": txt}))
 
-    # 6. GCS / FOUR / RASS within +-6 h
-    sc = tables["clinical_scores"]
-    sc = sc[sc["BDSPPatientID"].isin(cand_ids) & sc["score_type"].isin(["GCS", "FOUR", "RASS"])].copy()
-    sc["off_h"] = (sc["score_time"] - sc["BDSPPatientID"].map(cands.set_index("BDSPPatientID")["t0"])
-                   ).dt.total_seconds().abs() / 3600
-    near = set(sc.loc[sc["off_h"] <= 6, "BDSPPatientID"])
-    flags = cands["BDSPPatientID"].isin(near)
+    # 6. GCS / FOUR / RASS within +-6 h (measurement rows whose source text matches the score regex)
+    sc = meas[meas["kind"] == "score"] if len(meas) and "kind" in meas else meas
+    sc = sc[sc["person_id"].isin(cand_ids)].copy() if len(sc) else sc
+    if len(sc):
+        sc["off_h"] = (sc["measurement_datetime"] - sc["person_id"].map(cands.set_index("person_id")["t0"])
+                       ).dt.total_seconds().abs() / 3600
+        near = set(sc.loc[sc["off_h"] <= 6, "person_id"])
+    else:
+        near = set()
+    flags = cands["person_id"].isin(near)
     blk, raw = prop_block(flags, cands["SiteID"])
     rows.append(_row("GCS, FOUR or RASS near EEG", "Inclusion, 1A baseline",
                      "Score within +-6 h for >=50% of candidates",
@@ -354,22 +407,22 @@ def run_audit(tables: dict[str, pd.DataFrame], seed: int = 0, handcheck_n: int =
                      len(big) >= 3,
                      {"observed_text": f"{len(big)} of {len(counts)} adult sites have >=300 candidates"}))
 
-    # 8. Timestamped notes
-    nt = tables["notes"]
-    nt = nt[nt["BDSPPatientID"].isin(cand_ids) & nt["note_time"].notna()]
-    flags = cands["BDSPPatientID"].isin(set(nt["BDSPPatientID"]))
+    # 8. Timestamped notes (OMOP note.note_datetime; ASSUMED table)
+    nt = tables.get("omop_note", empty)
+    nt = nt[nt["person_id"].isin(cand_ids) & nt["note_datetime"].notna()] if len(nt) else nt
+    flags = cands["person_id"].isin(set(nt["person_id"]) if len(nt) else set())
     blk, raw = prop_block(flags, cands["SiteID"])
     rows.append(_row("Timestamped notes", "ACI onset, silver labels",
                      "Present (operationalised: >=95% of candidates have >=1 timestamped note)", "Stop",
                      True, blk, raw >= 0.95, {"observed_text": _fmt(blk)}))
 
     # Hand-check sampling list (record-level -> local file only)
-    elig = set(tables["notes"].dropna(subset=["note_time"])["BDSPPatientID"]) & \
-        set(tables["labs"].dropna(subset=["collect_time"])["BDSPPatientID"]) & cand_ids
-    elig = sorted(elig)
+    labs_ids = set(lb["person_id"]) if len(lb) else set()
+    notes_ids = set(nt["person_id"]) if len(nt) else set()
+    elig = sorted((labs_ids & notes_ids) & cand_ids)
     rng = np.random.default_rng(seed)
     k = min(handcheck_n, len(elig))
-    ids = [elig[j] for j in sorted(rng.choice(len(elig), size=k, replace=False))] if k else []
+    ids = [str(elig[j]) for j in sorted(rng.choice(len(elig), size=k, replace=False))] if k else []
 
     stop_ok = all(r["passed"] for r in rows if r["stop_row"])
     report = {
@@ -386,8 +439,8 @@ def run_audit(tables: dict[str, pd.DataFrame], seed: int = 0, handcheck_n: int =
     return report, ids
 
 
-def _lag(lb: pd.DataFrame) -> dict:
-    d = (lb["result_time"] - lb["collect_time"]).dt.total_seconds() / 60
+def _lag(lb: pd.DataFrame, res_col: str) -> dict:
+    d = (lb[res_col] - lb["measurement_datetime"]).dt.total_seconds() / 60
     return safe_quantiles(d[d >= 0].dropna().values)
 
 
@@ -428,19 +481,106 @@ def to_markdown(report: dict) -> str:
     return "\n".join(L)
 
 
+# ---------------------------------------------------------------- schema dry run (names only)
+def probe_schema(s3, sites: list[str] | None = None) -> dict:
+    """Which expected tables/columns exist, by NAME ONLY (CSV header line / parquet footer; no values, no
+    rows). One unit per table (per site for per-site CSV tables). Safe to emit: contains table, site and
+    column names only."""
+    sites = sites or data_io.discover_sites(s3)
+    units = []
+    for table in schema.TABLE_NAMES:
+        spec = data_io.TABLES[table]
+        for site in (sites if spec.kind == "csv_site" else [None]):
+            try:
+                actual = data_io.table_columns(s3, table, site)
+            except Exception as exc:  # noqa: BLE001 - report the class only; never echo an error message
+                actual, err = None, type(exc).__name__
+            else:
+                err = None
+            exp = schema.SCHEMA[table]
+            unit = {"table": table, "site": site, "location": spec.pattern, "found": actual is not None,
+                    "n_expected": len(exp)}
+            if err:
+                unit["error"] = err
+            if actual is not None:
+                have = set(actual)
+                unit["present"] = [c for c, *_ in exp if c in have]
+                unit["missing"] = [{"column": c, "provenance": prov,
+                                    "closest_actual_name": (difflib.get_close_matches(c, actual, 1, 0.6) or [None])[0]}
+                                   for c, _, prov, _ in exp if c not in have]
+                unit["n_unlisted_columns"] = len(have - {c for c, *_ in exp})
+            units.append(unit)
+    def _n(prov):
+        return sum(1 for u in units for m in u.get("missing", []) if m["provenance"] == prov)
+    return {"audit": "Phase 0a schema dry run (names only)", "sites": sites, "units": units,
+            "n_tables_not_found": sum(1 for u in units if not u["found"]),
+            "n_missing_confirmed": _n(schema.CONFIRMED), "n_missing_named": _n(schema.NAMED),
+            "n_missing_assumed": _n(schema.ASSUMED), "still_unknown": schema.UNKNOWN_FIELDS}
+
+
+def dry_run_markdown(rep: dict) -> str:
+    L = ["# Phase 0a schema dry run (names only)", "",
+         f"Sites checked: {', '.join(rep['sites']) or 'none'}. Only table and column NAMES are read and shown; "
+         "no values, no rows.", "",
+         f"- Tables/files not found: {rep['n_tables_not_found']}",
+         f"- Missing CONFIRMED columns (schema.py is wrong or the release differs): {rep['n_missing_confirmed']}",
+         f"- Missing NAMED columns (may simply not exist): {rep['n_missing_named']}",
+         f"- Missing ASSUMED columns (placeholders to remap): {rep['n_missing_assumed']}", "",
+         "| Table | Site | Found | Expected | Present | Missing | Unlisted cols |", "|---|---|---|---|---|---|---|"]
+    for u in rep["units"]:
+        L.append(f"| {u['table']} | {u['site'] or ''} | {'yes' if u['found'] else 'NO'} | {u['n_expected']} | "
+                 f"{len(u.get('present', []))} | {len(u.get('missing', []))} | {u.get('n_unlisted_columns', '')} |")
+    L += ["", "## Missing columns", ""]
+    any_missing = False
+    for u in rep["units"]:
+        if not u["found"]:
+            L.append(f"- **{u['table']}**{' / ' + u['site'] if u['site'] else ''}: NOT FOUND at `{u['location']}`")
+            any_missing = True
+        for m in u.get("missing", []):
+            near = f" (closest actual name: `{m['closest_actual_name']}`)" if m["closest_actual_name"] else ""
+            L.append(f"- {u['table']}{' / ' + u['site'] if u['site'] else ''}: `{m['column']}` [{m['provenance']}]{near}")
+            any_missing = True
+    if not any_missing:
+        L.append("- none")
+    L += ["", "## Still unknown (no column named anywhere in the source)", ""] + [f"- {x}" for x in rep["still_unknown"]]
+    return "\n".join(L) + "\n"
+
+
+# ---------------------------------------------------------------- CLI
 def main(argv: list[str] | None = None) -> int:
     ap = argparse.ArgumentParser(description=__doc__, formatter_class=argparse.RawDescriptionHelpFormatter)
-    ap.add_argument("--data", required=True, help="directory with HEEDB-shaped tables")
-    ap.add_argument("--out", required=True, help="output directory")
+    src = ap.add_mutually_exclusive_group(required=True)
+    src.add_argument("--data", help="local directory in the HEEDB layout (synthetic data or a local mirror)")
+    src.add_argument("--s3", action="store_true", help="read the real BDSP access point (human-run only)")
+    ap.add_argument("--profile", help="AWS profile for --s3 (else HEEDB_AWS_PROFILE / AWS_PROFILE / default chain)")
+    ap.add_argument("--sites", nargs="+", help="site codes (default: every site with an eeg-metadata CSV)")
+    ap.add_argument("--out", help="output directory (required unless --dry-run-schema)")
+    ap.add_argument("--dry-run-schema", action="store_true",
+                    help="report which expected tables/columns exist vs missing (names only) and exit")
     ap.add_argument("--seed", type=int, default=0, help="seed for the hand-check sample")
     ap.add_argument("--handcheck-n", type=int, default=HANDCHECK_N)
-    ap.add_argument("--strict", action="store_true", help="exit 1 if a Stop row fails")
+    ap.add_argument("--strict", action="store_true",
+                    help="exit 1 if a Stop row fails (dry run: if a CONFIRMED column is missing)")
     a = ap.parse_args(argv)
+    if not a.dry_run_schema and not a.out:
+        ap.error("--out is required unless --dry-run-schema")
 
-    agent_safety.assert_not_restricted_in_agent(a.data)
-    tables = load_tables(a.data)
+    if a.data:
+        agent_safety.assert_not_restricted_in_agent(a.data)
+    s3 = data_io.open_store(a.data, profile=a.profile)       # make_client refuses inside an agent session
+
+    if a.dry_run_schema:
+        rep = probe_schema(s3, a.sites)
+        text = dry_run_markdown(rep)
+        if a.out:
+            safe_write_json(Path(a.out) / "schema_dry_run.json", rep)
+            safe_write_text(Path(a.out) / "schema_dry_run.md", text)
+        safe_print(text.rstrip())
+        return 1 if a.strict and (rep["n_missing_confirmed"] or rep["n_tables_not_found"]) else 0
+
+    tables = load_audit_tables(s3, a.sites)
     report, ids = run_audit(tables, a.seed, a.handcheck_n)
-    known = set(tables["eeg_metadata"]["BDSPPatientID"].astype(str))
+    known = {str(p) for p in tables["eeg_metadata"]["person_id"].dropna().unique()}
 
     out = Path(a.out)
     safe_write_json(out / "field_audit.json", report, known)

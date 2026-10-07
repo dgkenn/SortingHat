@@ -242,7 +242,7 @@ def columns_by_provenance(table: str, *provs: str) -> list[str]:
 def parse_datetimes(s: pd.Series) -> pd.Series:
     """Parse ``YYYY-MM-DD[ HH:MM:SS[.ffffff]]`` text (mixed precision allowed); bad cells become NaT."""
     if pd.api.types.is_datetime64_any_dtype(s):
-        return s
+        return s.astype("datetime64[us]")
     out = pd.to_datetime(s.astype("object").where(s.notna(), None), format="mixed", errors="coerce")
     return out.astype("datetime64[us]")       # one resolution so mixed-source frames subtract cleanly
 

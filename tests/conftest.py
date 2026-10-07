@@ -11,6 +11,7 @@ def synth():
 
 @pytest.fixture(scope="session")
 def synth_dir(tmp_path_factory, synth):
+    """Synthetic data written in the real HEEDB layout (EEG/..., OMOP/Merged/<table>/*.parquet)."""
     d = tmp_path_factory.mktemp("synthetic")
-    write_tables(synth[0], d, synth[1], fmt="csv")
+    write_tables(synth[0], d, synth[1])
     return d

@@ -68,7 +68,7 @@ DATE_COLS = {"omop_note": "note_date", "omop_measurement": "measurement_date"}  
 
 
 def _ts(base: pd.Timestamp, hours: float) -> pd.Timestamp:
-    return base + pd.Timedelta(minutes=float(hours) * 60.0)
+    return (base + pd.Timedelta(minutes=float(hours) * 60.0)).round("us")   # microsecond precision, like the real text
 
 
 def _dates(rows, tbl):
