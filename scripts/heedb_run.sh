@@ -18,6 +18,9 @@
 # the traffic.
 #
 # Optional environment (names only; this script never reads or prints a credential value):
+#   BDSP_AWS_ACCESS_KEY_ID / BDSP_AWS_SECRET_ACCESS_KEY
+#                       BDSP key pair stored as environment secrets (e.g. in a cloud
+#                       environment's settings); mapped to AWS_* for the child, takes precedence.
 #   HEEDB_AWS_PROFILE   AWS profile to use (exported to the child as AWS_PROFILE). The source
 #                       project used a profile literally named "physionet".
 #
@@ -51,6 +54,16 @@ fi
 # "prox"). This is the same test as the source project's common/awsenv.py. Unlike the source
 # wrapper (which unset them unconditionally), a genuine key exported under the standard names is
 # left alone, so the wrapper cannot silently discard credentials you meant to use.
+# BDSP keys stored as environment secrets under their own names (so they never collide with a
+# sandbox's placeholder AWS_* values) take precedence: they are mapped onto the standard names
+# for the child only. Values are never printed.
+if [ -n "${BDSP_AWS_ACCESS_KEY_ID:-}" ] && [ -n "${BDSP_AWS_SECRET_ACCESS_KEY:-}" ]; then
+    echo "heedb_run.sh: using BDSP_AWS_* credentials for the child." >&2
+    exec env -u AWS_SESSION_TOKEN -u AWS_PROFILE \
+        AWS_ACCESS_KEY_ID="$BDSP_AWS_ACCESS_KEY_ID" \
+        AWS_SECRET_ACCESS_KEY="$BDSP_AWS_SECRET_ACCESS_KEY" "$@"
+fi
+
 key="${AWS_ACCESS_KEY_ID:-}"
 if [ -n "$key" ] && ! [[ "$key" =~ ^(AKIA|ASIA)[A-Z0-9]{16}$ ]]; then
     echo "heedb_run.sh: ambient AWS_ACCESS_KEY_ID is not an AWS key id (length ${#key}); dropping AWS_* for the child." >&2
