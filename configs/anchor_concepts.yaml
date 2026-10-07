@@ -136,6 +136,7 @@ measurement_items:
     name_regex: 'ph.*arterial|arterial.*ph|\bph\b.*\bart\b|\bart\b.*\bph\b|\bpha\b|\babg\b.*ph'
     name_exclude: 'venous|\bvbg\b|urine|ur\b|csf|cerebro|fluid|stool|capillary|cord|mixed|gastric|salivary|tissue|\bpo2\b'
     unit: "pH"
+    unit_optional: true          # pH is unitless: a missing / blank unit is accepted
     plausible: [6.3, 7.9]
     conversions: {"pH": {mul: 1}}
   calcium:

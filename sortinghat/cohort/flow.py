@@ -14,9 +14,10 @@ suppressing the excluded count alone is not enough. Two protections:
   the only one, the smallest other part is suppressed too (complementary suppression), so it cannot be derived
   from the total.
 
-Known limit (documented in docs/cohort_spec.md): sites are not complementarily suppressed against the "ALL"
-table, so a site-level cell that is suppressed could in principle be derived from ALL minus the other sites. A
-site whose starting count is < 11 is withheld entirely.
+* **Sites.** Differencing also works across tables (ALL minus the other sites). Sites whose FINAL count is < 11 are
+  pooled with the smallest other site until every group has >= 11 (groups are labelled "S1+S2"), and in a partition
+  an "ALL" cell is suppressed when exactly one site group's cell is suppressed. A group is withheld only if even the
+  pooled total is < 11.
 """
 
 from __future__ import annotations
@@ -73,12 +74,26 @@ class FlowRecorder:
                 "checks": self.checks}
 
 
-def _site_view(steps: list[Step], site: str) -> list[tuple[str, str, int, bool]]:
-    out = []
-    for s in steps:
-        n = sum(s.remaining.values()) if site == ALL else s.remaining.get(site, 0)
-        out.append((s.label, s.unit, n, s.start))
-    return out
+def _site_view(steps: list[Step], members: list[str]) -> list[tuple[str, str, int, bool]]:
+    return [(s.label, s.unit, sum(s.remaining.get(m, 0) for m in members), s.start) for s in steps]
+
+
+def pool_sites(sites: list[str], steps: list[Step], k: int = SUPPRESS_BELOW) -> list[list[str]]:
+    """Groups of sites for disclosure control: a site whose final count is < k is pooled with the smallest other
+    group until every group has >= k (or only one group is left)."""
+    final = {s: (steps[-1].remaining.get(s, 0) if steps else 0) for s in sites}
+    fin = lambda g: sum(final[x] for x in g)          # noqa: E731
+    groups = [[s] for s in sites]
+    while len(groups) > 1:
+        small = [g for g in groups if fin(g) < k]
+        if not small:
+            break
+        g = min(small, key=fin)
+        groups.remove(g)
+        other = min(groups, key=fin)
+        other.extend(g)
+        other.sort()
+    return groups
 
 
 def merged_rows(view: list[tuple[str, str, int, bool]], k: int = SUPPRESS_BELOW) -> list[dict]:
@@ -121,13 +136,21 @@ def merged_rows(view: list[tuple[str, str, int, bool]], k: int = SUPPRESS_BELOW)
     return rows
 
 
-def suppress_parts(parts: dict[str, int], k: int = SUPPRESS_BELOW) -> dict[str, int | str]:
-    """Suppress parts < k; if exactly one part is suppressed also suppress the smallest other part."""
-    shown: dict[str, int | str] = {p: suppress_count(n, k) for p, n in parts.items()}
-    hidden = [p for p, v in shown.items() if v == SUPPRESSED]
-    if len(hidden) == 1 and len(parts) > 1:
-        rest = sorted((n, p) for p, n in parts.items() if p != hidden[0])
-        shown[rest[0][1]] = SUPPRESSED
+def suppress_parts(parts: dict[str, int], k: int = SUPPRESS_BELOW, forced: set[str] | None = None
+                   ) -> dict[str, int | str]:
+    """Suppress parts < k (and any in ``forced``). Complementary suppression: while exactly one part is hidden, or
+    the hidden parts sum to < k (the total would reveal that small sum), also hide the smallest shown part."""
+    shown: dict[str, int | str] = {p: (SUPPRESSED if forced and p in forced else suppress_count(n, k))
+                                   for p, n in parts.items()}
+    while True:
+        hidden = [p for p, v in shown.items() if v == SUPPRESSED]
+        left = sorted((n, p) for p, n in parts.items() if shown[p] != SUPPRESSED)
+        if not hidden or not left:
+            break
+        if len(hidden) == 1 or sum(parts[p] for p in hidden) < k:
+            shown[left[0][1]] = SUPPRESSED
+        else:
+            break
     return shown
 
 
@@ -138,22 +161,33 @@ def flow_report(raw: dict, config: dict | None = None, k: int = SUPPRESS_BELOW) 
                                    "patients/sessions are merged into the next row (or the previous one) so they "
                                    "cannot be recovered by subtraction",
                     "sites": {}, "partitions": {}, "checks": raw.get("checks", {})}
-    for site in [ALL, *raw["sites"]]:
-        view = _site_view(steps, site)
-        if not view or view[0][2] < k:
-            report["sites"][site] = {WITHHELD: f"starting count < {k}"}
+    groups = pool_sites(raw["sites"], steps, k)
+    labelled = [("+".join(g), g) for g in groups]
+    if any(len(g) > 1 for g in groups):
+        report["pooled_site_groups"] = [lab for lab, g in labelled if len(g) > 1]
+    for lab, members in [(ALL, raw["sites"]), *labelled]:
+        view = _site_view(steps, members)
+        if not view or view[0][2] < k or view[-1][2] < 0:
+            report["sites"][lab] = {WITHHELD: f"starting count < {k}"}
             continue
         rows = []
         for r in merged_rows(view, k):
             rows.append({"step": r["step"], "unit": r["unit"],
                          "n_excluded": None if r["n_excluded"] is None else suppress_count(r["n_excluded"], k),
                          "n_remaining": WITHHELD if r.get("remaining_withheld") else suppress_count(r["n_remaining"], k)})
-        report["sites"][site] = {"rows": rows}
+        report["sites"][lab] = {"rows": rows}
     for p in raw["partitions"]:
+        parts = list(p["parts"])
+        by_group = {lab: {x: sum(p["parts"][x].get(m, 0) for m in g) for x in parts} for lab, g in labelled}
+        all_counts = {x: sum(by_group[lab][x] for lab, _ in labelled) for x in parts}
         tbl = {}
-        for site in [ALL, *raw["sites"]]:
-            counts = {lab: (sum(v.values()) if site == ALL else v.get(site, 0)) for lab, v in p["parts"].items()}
-            tbl[site] = {WITHHELD: f"total < {k}"} if sum(counts.values()) < k else suppress_parts(counts, k)
+        # ALL cell of a part is withheld when exactly one site group's cell for it is < k (it would be ALL - others)
+        forced = {x for x in parts if sum(1 for lab, _ in labelled if by_group[lab][x] < k) == 1
+                  and all_counts[x] >= k}
+        tbl[ALL] = {WITHHELD: f"total < {k}"} if sum(all_counts.values()) < k else suppress_parts(all_counts, k, forced)
+        for lab, _ in labelled:
+            c = by_group[lab]
+            tbl[lab] = {WITHHELD: f"total < {k}"} if sum(c.values()) < k else suppress_parts(c, k)
         report["partitions"][p["title"]] = tbl
     if config is not None:
         report["config"] = config

@@ -218,8 +218,9 @@ def _partitions(flow: FlowRecorder, t: pd.DataFrame, cfg: CohortConfig) -> None:
     flow.partition("Onset proxy basis (table rows)", {
         "first abnormal score": site[t["onset_basis"] == "abnormal_score"],
         "ED arrival or admission": site[t["onset_basis"] == "visit_start"]})
-    flow.partition("Acute-care basis (table rows)", {
-        "visit setting": site[t["acute_basis"] == "visit"], "service fallback": site[t["acute_basis"] == "service"]})
+    if cfg.use_service_fallback:
+        flow.partition("Acute-care basis (table rows)", {
+            "visit setting": site[t["acute_basis"] == "visit"], "service fallback": site[t["acute_basis"] == "service"]})
     flow.partition("First-EEG order uncertain: an unstamped EEG exists (table rows)", {
         "yes": site[t["n_unstamped_sessions"] > 0], "no": site[t["n_unstamped_sessions"] == 0]})
 

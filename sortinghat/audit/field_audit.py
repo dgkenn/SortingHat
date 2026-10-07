@@ -40,9 +40,21 @@ ADULT_AGE = 18
 # Row filters. drug_source_value / measurement_source_value are free text in the real OMOP tables (no med_class,
 # no score_type column); classes are derived by regex, as the earlier research code did.
 SEDATION_RE = re.compile(r"propofol|midazolam|dexmedetomidine|precedex|fentanyl|ketamine|pentobarbital", re.I)
-SCORE_RE = re.compile(r"glasgow|\bgcs\b|rass|richmond|sedation scale|level of consciousness|eye opening|"
-                      r"best motor response|best verbal response|ramsay|arousal|\bfour score", re.I)
+# Score classes. The Phase 0a row is "GCS, FOUR or RASS"; GCS components (eye / motor / verbal) count as GCS. Other
+# consciousness scales are matched but reported separately and do NOT count towards the criterion.
+SCORE_CLASS_RES = (("GCS", re.compile(r"glasgow|\bgcs\b|eye opening|best motor response|best verbal response", re.I)),
+                   ("FOUR", re.compile(r"\bfour score|full outline of unresponsiveness", re.I)),
+                   ("RASS", re.compile(r"\brass\b|richmond", re.I)),
+                   ("OTHER", re.compile(r"sedation scale|level of consciousness|ramsay|arousal", re.I)))
+PRIMARY_SCORE_CLASSES = ("GCS", "FOUR", "RASS")
+SCORE_RE = re.compile("|".join(r.pattern for _, r in SCORE_CLASS_RES), re.I)
 LAB_RE = re.compile(r"lactate|ammonia|sodium|glucose|creatinine|\bbun\b|\bast\b|\balt\b|\bwbc\b|enolase", re.I)
+SCORE_DOMAINS = ("Measurement", "Observation")          # omop_concept.domain_id of score concepts
+TYPE_VOCABS = ("Drug Type", "Type Concept")             # omop_concept.vocabulary_id of record-provenance concepts
+# drug_type_concept_id semantics (OMOP drug-type / type concepts), from the concept NAME. Checked in this order, so
+# "EHR administration record" is administration and "Prescription dispensed in pharmacy" is an order/dispense record.
+DRUG_ADMIN_RE = re.compile(r"administ|\bmar\b|infusion|given", re.I)
+DRUG_ORDER_RE = re.compile(r"prescri|\border|dispens|medication list|pharmacy", re.I)
 MISALIGN_DAYS = 30.0          # median |event - EEG start| above this => table misaligned
 MISALIGN_MAX_RATE = 0.05      # automated date-shift check tolerance (patients)
 MONOTONIC_MAX_RATE = 0.01     # within-record ordering violations tolerated
@@ -163,15 +175,68 @@ def filter_drugs(d: pd.DataFrame) -> pd.DataFrame:
     return d[d["drug_source_value"].astype("string").str.contains(SEDATION_RE, na=False)]
 
 
-def filter_measurements(d: pd.DataFrame) -> pd.DataFrame:
-    """Keep score and lab rows; ``kind`` is derived from the free-text ``measurement_source_value``."""
-    if "measurement_source_value" not in d:
-        return d.iloc[0:0].assign(kind=pd.Series(dtype=object))
-    v = d["measurement_source_value"].astype("string")
-    score, lab = v.str.contains(SCORE_RE, na=False), v.str.contains(LAB_RE, na=False)
-    out = d[score | lab].copy()
-    out["kind"] = np.where(score[score | lab], "score", "lab")
+def score_class_of(source: pd.Series, concept_ids: pd.Series | None = None,
+                   concept_class: dict | None = None) -> pd.Series:
+    """Score class (GCS / FOUR / RASS / OTHER, else NA) of rows: from the free-text source value first, else from
+    the row's concept id via ``concept_class`` (concept ids can be zero-filled, so the text is primary)."""
+    v = source.astype("string")
+    out = pd.Series(pd.NA, index=source.index, dtype="object")
+    for cls, rx in SCORE_CLASS_RES:
+        hit = out.isna() & v.str.contains(rx, na=False)
+        out[hit] = cls
+    if concept_ids is not None and concept_class:
+        ids = pd.to_numeric(concept_ids, errors="coerce")
+        mapped = ids.map(lambda x: concept_class.get(int(x)) if pd.notna(x) else None)
+        out = out.where(out.notna(), mapped)
     return out
+
+
+def filter_measurements(d: pd.DataFrame, concept_class: dict | None = None) -> pd.DataFrame:
+    """Keep score and lab rows; ``kind`` ('score' / 'lab') and ``score_class`` are derived from the free-text
+    ``measurement_source_value`` and, for scores, from ``measurement_concept_id`` via ``concept_class``."""
+    if "measurement_source_value" not in d:
+        return d.iloc[0:0].assign(kind=pd.Series(dtype=object), score_class=pd.Series(dtype=object))
+    cls = score_class_of(d["measurement_source_value"], d.get("measurement_concept_id"), concept_class)
+    lab = d["measurement_source_value"].astype("string").str.contains(LAB_RE, na=False)
+    keep = cls.notna() | lab
+    out = d[keep].copy()
+    out["score_class"] = cls[keep]
+    out["kind"] = np.where(cls[keep].notna(), "score", "lab")
+    return out
+
+
+def filter_observations(d: pd.DataFrame, concept_class: dict | None = None) -> pd.DataFrame:
+    """Score rows of ``omop_observation`` (same classes as ``filter_measurements``)."""
+    if "observation_source_value" not in d:
+        return d.iloc[0:0].assign(score_class=pd.Series(dtype=object))
+    cls = score_class_of(d["observation_source_value"], d.get("observation_concept_id"), concept_class)
+    out = d[cls.notna()].copy()
+    out["score_class"] = cls[cls.notna()]
+    return out
+
+
+def concept_maps(concept: pd.DataFrame | None) -> tuple[dict, dict]:
+    """``(score_class_by_concept_id, name_by_concept_id)`` from a (filtered) omop_concept frame. Score concepts are
+    Measurement/Observation-domain concepts whose NAME matches a score class."""
+    if concept is None or not len(concept) or not {"concept_id", "concept_name"} <= set(concept):
+        return {}, {}
+    c = concept.dropna(subset=["concept_id"])
+    names = {int(i): n for i, n in zip(c["concept_id"], c["concept_name"])}
+    dom = c["domain_id"].isin(SCORE_DOMAINS) if "domain_id" in c else pd.Series(True, index=c.index)
+    sc = c[dom]
+    cls = score_class_of(sc["concept_name"])
+    return {int(i): k for i, k in zip(sc["concept_id"], cls) if isinstance(k, str)}, names
+
+
+def classify_drug_type(name) -> str:
+    """'administration' / 'order' / 'other' from an OMOP drug-type concept NAME (administration is checked first)."""
+    if not isinstance(name, str):
+        return "unresolved"
+    if DRUG_ADMIN_RE.search(name):
+        return "administration"
+    if DRUG_ORDER_RE.search(name):
+        return "order"
+    return "other"
 
 
 def from_raw_tables(raw: dict[str, pd.DataFrame]) -> dict[str, pd.DataFrame]:
@@ -187,20 +252,120 @@ def from_raw_tables(raw: dict[str, pd.DataFrame]) -> dict[str, pd.DataFrame]:
     if not eeg["PatientClass"].notna().any() and "omop_visit_occurrence" in raw:     # real files have no PatientClass
         eeg["PatientClass"] = derive_patient_class(eeg, raw["omop_visit_occurrence"])
     cohort = set(build_candidates(eeg)["person_id"])         # same cohort filter as the streaming loader
-    out = {"eeg_metadata": eeg,
-           "omop_drug_exposure": filter_drugs(raw["omop_drug_exposure"]),
-           "omop_measurement": filter_measurements(raw["omop_measurement"])}
+    drugs = filter_drugs(raw["omop_drug_exposure"])
+    concept = select_concepts(raw.get("omop_concept"), _type_ids(drugs))
+    score_map, _ = concept_maps(concept)
+    out = {"eeg_metadata": eeg, "omop_drug_exposure": drugs,
+           "omop_measurement": filter_measurements(raw["omop_measurement"], score_map),
+           "omop_observation": filter_observations(raw.get("omop_observation", pd.DataFrame()), score_map),
+           "omop_concept": concept}
     for t in ("omop_note", "imaging"):
         out[t] = raw.get(t, pd.DataFrame())
-    return {k: (v if k == "eeg_metadata" or "person_id" not in v else v[v["person_id"].isin(cohort)])
-            for k, v in out.items()}
+    return {k: (v if k in ("eeg_metadata", "omop_concept") or "person_id" not in v
+                else v[v["person_id"].isin(cohort)]) for k, v in out.items()}
+
+
+def _type_ids(drugs: pd.DataFrame) -> list[int]:
+    if "drug_type_concept_id" not in drugs:
+        return []
+    ids = pd.to_numeric(drugs["drug_type_concept_id"], errors="coerce").dropna().astype("int64").unique()
+    return sorted(int(i) for i in ids if i != 0)
+
+
+def select_concepts(concept: pd.DataFrame | None, type_ids: list[int]) -> pd.DataFrame:
+    """The concepts the audit needs from a whole omop_concept frame: score concepts (Measurement/Observation domain,
+    name matches a score class) and the drug-type concepts in ``type_ids``."""
+    cols = ["concept_id", "concept_name", "domain_id", "vocabulary_id"]
+    if concept is None or not len(concept):
+        return pd.DataFrame(columns=cols)
+    c = concept[[x for x in cols if x in concept]]
+    nm = c["concept_name"].astype("string").str.contains(SCORE_RE, na=False)
+    dom = c["domain_id"].isin(SCORE_DOMAINS) if "domain_id" in c else True
+    return c[(nm & dom) | c["concept_id"].isin(type_ids)].reset_index(drop=True)
+
+
+# ---- streaming helpers (Arrow-side filtering: memory scales with the matching rows, not the table)
+def _arrow_mask(batch, text_col: str | None, pattern: str | None, id_col: str | None, ids):
+    """Boolean Arrow mask: text column matches ``pattern`` (case-insensitive RE2) OR id column is in ``ids``.
+    ``None`` when neither criterion can apply to this batch (then no row is kept)."""
+    import pyarrow as pa
+    import pyarrow.compute as pc
+    names = set(batch.schema.names)
+    masks = []
+    if text_col and pattern and text_col in names:
+        masks.append(pc.match_substring_regex(pc.cast(batch.column(text_col), pa.string()), pattern, ignore_case=True))
+    if id_col and ids and id_col in names:
+        masks.append(pc.is_in(pc.cast(batch.column(id_col), pa.int64(), safe=False),
+                              value_set=pa.array(sorted(int(i) for i in ids), type=pa.int64())))
+    if not masks:
+        return None
+    m = masks[0]
+    for x in masks[1:]:
+        m = pc.or_kleene(m, x)
+    return pc.fill_null(m, False)
+
+
+def _stream(s3, table: str, columns: list[str], cohort, *, text_col=None, pattern=None, id_col=None, ids=None,
+            prefix=None, filtered: bool = False) -> pd.DataFrame:
+    """Stream one OMOP/parquet table part by part for ``cohort``, optionally keeping only rows matching
+    ``pattern`` on ``text_col`` or with ``id_col`` in ``ids`` (applied in Arrow before pandas)."""
+    frames = []
+    kw = {"prefix": prefix} if prefix else {}
+    for batch in data_io.iter_omop_batches(table, person_ids=cohort, columns=columns, s3=s3, **kw):
+        if filtered:
+            mask = _arrow_mask(batch, text_col, pattern, id_col, ids)
+            if mask is None:
+                continue
+            batch = batch.filter(mask)
+            if not batch.num_rows:
+                continue
+        frames.append(batch.to_pandas())
+    return pd.concat(frames, ignore_index=True) if frames else pd.DataFrame()
+
+
+def load_concepts(s3, type_ids: list[int]) -> pd.DataFrame:
+    """Vocabulary rows the audit needs, streamed from ``omop_concept`` (column-pruned, filtered in Arrow):
+    score concepts by NAME (Measurement/Observation domain) and the given drug-type concept ids. Vocabulary
+    metadata only; no patient-level data."""
+    import pyarrow as pa
+    import pyarrow.compute as pc
+    cols = ["concept_id", "concept_name", "domain_id", "vocabulary_id"]
+    frames = []
+    for b in data_io.iter_omop_batches("concept", columns=cols, s3=s3):
+        names = set(b.schema.names)
+        if not {"concept_id", "concept_name"} <= names:
+            continue
+        hit = pc.match_substring_regex(pc.cast(b.column("concept_name"), pa.string()), SCORE_RE.pattern,
+                                       ignore_case=True)
+        if "domain_id" in names:
+            hit = pc.and_kleene(hit, pc.is_in(pc.cast(b.column("domain_id"), pa.string()),
+                                              value_set=pa.array(list(SCORE_DOMAINS))))
+        if type_ids:
+            hit = pc.or_kleene(hit, pc.is_in(pc.cast(b.column("concept_id"), pa.int64(), safe=False),
+                                             value_set=pa.array(type_ids, type=pa.int64())))
+        b = b.filter(pc.fill_null(hit, False))
+        if b.num_rows:
+            frames.append(b.to_pandas())
+    return schema.coerce_types("omop_concept", pd.concat(frames, ignore_index=True)) if frames else pd.DataFrame(
+        columns=cols)
+
+
+# Minimal columns requested per table (data minimisation: nothing the audit does not use is read).
+DRUG_COLS = ["person_id", "drug_exposure_start_datetime", "drug_exposure_end_datetime", "drug_source_value",
+             "drug_type_concept_id"]
+MEAS_COLS = ["person_id", "measurement_datetime", "measurement_date", "measurement_source_value",
+             "measurement_concept_id"]
+OBS_COLS = ["person_id", "observation_concept_id", "observation_datetime", "observation_date",
+            "observation_source_value"]
+NOTE_COLS = ["person_id", "note_datetime", "note_date"]
 
 
 def load_audit_tables(s3, sites: list[str] | None = None, avail: dict | None = None) -> dict[str, pd.DataFrame]:
     """Read what the audit needs from a store (S3 client or ``LocalStore``) in the real layout.
 
     EEG tables are read whole (one row per session). OMOP/imaging parquet is streamed part by part,
-    filtered to the candidate cohort inside Arrow and by regex, so memory scales with the cohort.
+    column-pruned and filtered to the candidate cohort inside Arrow (and, for drugs / measurements /
+    observations, by regex or concept id inside Arrow too), so memory scales with the matching rows.
     """
     sites = sites or data_io.discover_sites(s3)
     parts = []
@@ -232,24 +397,37 @@ def load_audit_tables(s3, sites: list[str] | None = None, avail: dict | None = N
     cohort = [int(p) for p in build_candidates(eeg)["person_id"].dropna().unique()]
     out = {"eeg_metadata": eeg}
     result_cols = schema.COLUMN_ALIASES["measurement.result_datetime"]
-    for table in ("omop_drug_exposure", "omop_measurement", "omop_note", "imaging"):
-        spec = data_io.TABLES[table]
-        cols = schema.columns(table) + (result_cols if table == "omop_measurement" else [])
-        kw = {"prefix": spec.pattern} if spec.kind == "parquet_dir" else {}
-        tname = table[len("omop_"):] if spec.kind == "omop_parquet" else table
-        frames = []
-        for batch in data_io.iter_omop_batches(tname, person_ids=cohort, columns=cols, s3=s3, **kw):
-            frames.append(batch.to_pandas())
-        d = schema.coerce_types(table, pd.concat(frames, ignore_index=True)) if frames else pd.DataFrame(
-            columns=schema.columns(table))
-        if table == "omop_drug_exposure":
-            d = filter_drugs(d)
-        elif table == "omop_measurement":
-            d = filter_measurements(d)
-            for c in result_cols:
-                if c in d:
-                    d[c] = schema.parse_datetimes(d[c])
-        out[table] = d
+
+    d = _stream(s3, "drug_exposure", DRUG_COLS, cohort, text_col="drug_source_value", pattern=SEDATION_RE.pattern,
+                filtered=True)
+    d = schema.coerce_types("omop_drug_exposure", d) if len(d) else pd.DataFrame(columns=DRUG_COLS)
+    out["omop_drug_exposure"] = filter_drugs(d)
+
+    out["omop_concept"] = load_concepts(s3, _type_ids(out["omop_drug_exposure"]))
+    score_map, _ = concept_maps(out["omop_concept"])
+    score_ids = list(score_map)
+
+    m = _stream(s3, "measurement", MEAS_COLS + result_cols, cohort, text_col="measurement_source_value",
+                pattern=SCORE_RE.pattern + "|" + LAB_RE.pattern, id_col="measurement_concept_id", ids=score_ids,
+                filtered=True)
+    m = schema.coerce_types("omop_measurement", m) if len(m) else pd.DataFrame(columns=MEAS_COLS)
+    m = filter_measurements(m, score_map)
+    for c in result_cols:
+        if c in m:
+            m[c] = schema.parse_datetimes(m[c])
+    out["omop_measurement"] = m
+
+    o = _stream(s3, "observation", OBS_COLS, cohort, text_col="observation_source_value", pattern=SCORE_RE.pattern,
+                id_col="observation_concept_id", ids=score_ids, filtered=True)
+    o = schema.coerce_types("omop_observation", o) if len(o) else pd.DataFrame(columns=OBS_COLS)
+    out["omop_observation"] = filter_observations(o, score_map)
+
+    n = _stream(s3, "note", NOTE_COLS, cohort)
+    out["omop_note"] = schema.coerce_types("omop_note", n) if len(n) else pd.DataFrame(columns=NOTE_COLS)
+
+    spec = data_io.TABLES["imaging"]
+    im = _stream(s3, "imaging", schema.columns("imaging"), cohort, prefix=spec.pattern)
+    out["imaging"] = schema.coerce_types("imaging", im) if len(im) else pd.DataFrame(columns=schema.columns("imaging"))
     return out
 
 
