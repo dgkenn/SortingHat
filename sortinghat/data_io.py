@@ -31,15 +31,19 @@ fake client) needs neither.
 
 from __future__ import annotations
 
+import bisect
 import gzip
 import hashlib
 import http.cookiejar
 import io
 import os
+import random
 import re
+import time
 import urllib.parse
 import urllib.request
-from dataclasses import dataclass
+from collections import Counter
+from dataclasses import dataclass, field
 from pathlib import Path
 from typing import Any, Callable, Iterable, Iterator
 
@@ -187,7 +191,137 @@ def make_client(profile: str | None = None, *, read_timeout: int = 600):
     return session.client("s3", region_name=REGION, config=cfg)
 
 
-def list_keys(s3, prefix: str, *, bucket: str | None = None, suffix: str | None = None) -> list[str]:
+# ---------------------------------------------------------------------------------------------------------
+# Resilient S3 reads: every GET (and the Body read, which is where a dropped stream surfaces) is retried
+# ---------------------------------------------------------------------------------------------------------
+# A large read through the sandbox proxy can drop mid-stream (botocore ResponseStreamingError wrapping an
+# IncompleteRead). boto3's own retry layer does NOT cover errors raised while reading ``Body``, so each read here
+# is wrapped: exception classes are matched by NAME (botocore / urllib3 / requests are not imported), full object
+# reads are split into ranged chunks so a retry re-fetches little, and a short body counts as a failed attempt.
+_RETRY_NAMES = frozenset({
+    "ResponseStreamingError", "IncompleteRead", "IncompleteReadError", "ReadTimeoutError", "ReadTimeout",
+    "ConnectTimeoutError", "ConnectTimeout", "ConnectionError", "ConnectionClosedError", "EndpointConnectionError",
+    "ProtocolError", "ProxyError", "ProxyConnectionError", "SSLError", "ChunkedEncodingError", "HTTPClientError",
+    "ConnectionResetError", "ConnectionAbortedError", "BrokenPipeError", "RemoteDisconnected", "TimeoutError",
+    "ShortReadError"})
+_RETRY_CODES = frozenset({"SlowDown", "Throttling", "ThrottlingException", "RequestTimeout", "RequestTimeoutException",
+                          "RequestLimitExceeded", "InternalError", "ServiceUnavailable", "TooManyRequestsException",
+                          "BandwidthLimitExceeded", "429", "500", "502", "503", "504"})
+_NO_RETRY_OS = (FileNotFoundError, PermissionError, IsADirectoryError, NotADirectoryError)
+RETRY_COUNTS: Counter = Counter()          # exception CLASS name -> retries so far (a count, safe to print)
+
+
+class ShortReadError(OSError):
+    """A body shorter than the requested range (a silently truncated stream)."""
+
+
+def is_retryable(exc: BaseException) -> bool:
+    """True for dropped streams / connection problems / throttling / 5xx; False for not-found, denied, bad input."""
+    resp = getattr(exc, "response", None)
+    if isinstance(resp, dict):                         # botocore ClientError
+        code = str(resp.get("Error", {}).get("Code", ""))
+        status = resp.get("ResponseMetadata", {}).get("HTTPStatusCode")
+        return code in _RETRY_CODES or (isinstance(status, int) and (status >= 500 or status == 429))
+    if isinstance(exc, _NO_RETRY_OS):
+        return False
+    if any(c.__name__ in _RETRY_NAMES for c in type(exc).__mro__):
+        return True
+    return isinstance(exc, (OSError, EOFError))        # ConnectionError, TimeoutError, pyarrow ArrowIOError, ...
+
+
+@dataclass
+class RetryPolicy:
+    """Attempts, exponential backoff with jitter (half to full of the cap), injectable clock for tests."""
+    max_attempts: int = 8
+    backoff_s: float = 1.0
+    max_backoff_s: float = 60.0
+    sleep: Callable[[float], None] = time.sleep
+    rand: Callable[[], float] = random.random
+
+    def delay(self, attempt: int) -> float:
+        cap = min(self.max_backoff_s, self.backoff_s * (2 ** (attempt - 1)))
+        return cap * (0.5 + 0.5 * self.rand())
+
+
+DEFAULT_RETRY = RetryPolicy()
+GET_CHUNK_BYTES = 16 << 20           # one ranged GET is at most this big, so a dropped stream re-fetches little
+
+
+def with_retries(fn: Callable[[], Any], policy: RetryPolicy | None = None) -> Any:
+    """Call ``fn()`` until it succeeds, retrying retryable exceptions with jittered exponential backoff."""
+    p = policy or DEFAULT_RETRY
+    for attempt in range(max(1, p.max_attempts)):
+        if attempt:
+            p.sleep(p.delay(attempt))
+        try:
+            return fn()
+        except Exception as exc:  # noqa: BLE001
+            if not is_retryable(exc) or attempt + 1 >= max(1, p.max_attempts):
+                raise
+            RETRY_COUNTS[type(exc).__name__] += 1
+    raise AssertionError("unreachable")
+
+
+_CR_RE = re.compile(r"^bytes\s+(\d+)-(\d+)/(\d+|\*)$")
+
+
+def _content_range_total(value) -> int | None:
+    m = _CR_RE.match(str(value or "").strip())
+    return int(m.group(3)) if m and m.group(3) != "*" else None
+
+
+def get_bytes(s3, bucket: str, key: str, start: int | None = None, end: int | None = None, *,
+              expected: int | None = None, policy: RetryPolicy | None = None) -> tuple[bytes, int | None]:
+    """One GET (ranged when ``start`` is given; ``end`` inclusive) with the body read INSIDE the retry, so a dropped
+    stream is retried. A body of the wrong length (``expected``, else the response ``ContentLength``) is retried too.
+    Returns ``(body, object size from Content-Range or None)``."""
+    def once():
+        kw: dict[str, Any] = {"Bucket": bucket, "Key": key}
+        if start is not None:
+            kw["Range"] = f"bytes={start}-{end}"
+        resp = s3.get_object(**kw)
+        body = resp["Body"].read()
+        want = expected
+        if want is None and isinstance(resp.get("ContentLength"), int):
+            want = resp["ContentLength"]
+        if want is not None and len(body) != want:
+            raise ShortReadError("short body")
+        return body, _content_range_total(resp.get("ContentRange"))
+    return with_retries(once, policy)
+
+
+def _is_invalid_range(exc: BaseException) -> bool:
+    resp = getattr(exc, "response", None)
+    return isinstance(resp, dict) and (str(resp.get("Error", {}).get("Code", "")) == "InvalidRange"
+                                       or resp.get("ResponseMetadata", {}).get("HTTPStatusCode") == 416)
+
+
+def read_object(s3, bucket: str, key: str, *, chunk: int = GET_CHUNK_BYTES, policy: RetryPolicy | None = None) -> bytes:
+    """Whole object as bytes via consecutive ranged GETs of ``chunk`` bytes, each retried independently."""
+    out: list[bytes] = []
+    start, total = 0, None
+    while True:
+        expected = None if total is None else min(chunk, total - start)
+        try:
+            body, t = get_bytes(s3, bucket, key, start, start + chunk - 1, expected=expected, policy=policy)
+        except Exception as exc:  # noqa: BLE001
+            if _is_invalid_range(exc):                  # start is at/after the end (or the object is empty)
+                break
+            raise
+        total = t if t is not None else total
+        out.append(body)
+        start += len(body)
+        if not body or (total is not None and start >= total) or (total is None and len(body) < chunk):
+            break
+    return b"".join(out)
+
+
+def head_size(s3, bucket: str, key: str, *, policy: RetryPolicy | None = None) -> int:
+    return int(with_retries(lambda: s3.head_object(Bucket=bucket, Key=key), policy)["ContentLength"])
+
+
+def list_keys(s3, prefix: str, *, bucket: str | None = None, suffix: str | None = None,
+              policy: RetryPolicy | None = None) -> list[str]:
     """All keys under ``prefix`` (paginated), sorted."""
     bucket = bucket or access_point()
     keys: list[str] = []
@@ -196,7 +330,7 @@ def list_keys(s3, prefix: str, *, bucket: str | None = None, suffix: str | None 
         kw: dict[str, Any] = {"Bucket": bucket, "Prefix": prefix, "MaxKeys": 1000}
         if token:
             kw["ContinuationToken"] = token
-        resp = s3.list_objects_v2(**kw)
+        resp = with_retries(lambda kw=kw: s3.list_objects_v2(**kw), policy)
         keys += [o["Key"] for o in resp.get("Contents", [])]
         if not resp.get("IsTruncated"):
             break

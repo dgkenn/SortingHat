@@ -282,3 +282,12 @@ def test_key_list_edf_keys(scenario):
     assert k.loc[1, "edf_key"].startswith("EEG/bids/S0001/sub-S0001") and k.loc[1, "edf_key"].endswith("_eeg.edf")
     assert not k.loc[1, "task_token_assumed"] and k.loc[38, "task_token_assumed"]      # I-sites: no EEGFolder
     assert k.loc[37, "BidsFolder"] == "sub-S0001" + "37"
+
+
+def test_empty_and_tiny_inputs_do_not_break_the_build():
+    r = build(World())
+    assert len(r.table) == 0 and len(r.keys) == 0 and r.report["sites"]["ALL"] == {"withheld": "starting count < 11"}
+    w = World()
+    w.patient(1)
+    r = build(w)                                                 # one patient: built, but every count is withheld
+    assert len(r.table) == 1 and r.report["sites"]["ALL"] == {"withheld": "starting count < 11"}

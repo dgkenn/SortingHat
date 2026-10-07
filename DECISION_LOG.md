@@ -670,3 +670,15 @@
 - **Decision:** The plan's "Present" criterion for timestamped notes (a Stop row) passes when >=80% of candidates have at least one note with a timestamp.
 - **Rationale:** Notes are needed for ACI onset and silver labels in most, not all, patients; 95% would make a Stop row stricter than the plan's own EEG-start row intends for a secondary field, while 80% still supports both uses. Chosen before the audit was run.
 - **Source:** Phase 0a table; `sortinghat/audit/field_audit.py`.
+
+### D-102 E1 silver anchors from acute structural diagnosis and neurosurgical procedure codes
+- **Date:** 2026-10-07 · **Area:** labels · **Outcome data seen?** No
+- **Decision:** Because HEEDB imaging exists only at sites I0001/I0004 (no EEG there), E1 silver positives use an alternative branch: acute structural ICD-10 codes (I60.*, I61.*, I62.0*, I63.*, S06.2*–S06.6*, G93.5/G93.6 only with one of these) or neurosurgical procedures (craniotomy/craniectomy, EVD, thrombectomy, thrombolysis) within [-72, 24] h of t0; encounter-level code timing is flagged `timing_approximate`. Imaging flags remain defined for future sites.
+- **Rationale:** These codes are objective, not EEG-derived, and are the only structural evidence available at the EEG sites; approximate timing is reported as a sensitivity stratum.
+- **Source:** `docs/research/heedb_schema_dryrun_2026-10-07.md`; `configs/silver_anchors.yaml`; `docs/silver_extraction.md`.
+
+### D-103 H5 (early-EEG subgroup) dropped per Phase 0a fallback
+- **Date:** 2026-10-07 · **Area:** hypotheses · **Outcome data seen?** No
+- **Decision:** H5 is dropped from Study 1: no imaging report finalization time exists at any EEG site. It moves to the prospective programme.
+- **Rationale:** The plan's Phase 0a table specifies "Drop H5" when imaging finalization time is absent.
+- **Source:** Phase 0a table; schema dry run.

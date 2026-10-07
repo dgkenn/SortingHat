@@ -63,6 +63,12 @@ def site_sessions(meta: pd.DataFrame, rf: pd.DataFrame | None, site: str) -> pd.
     return out[SESSION_COLUMNS].reset_index(drop=True)
 
 
+def empty_sessions() -> pd.DataFrame:
+    dt = {"person_id": "Int64", "t0": "datetime64[us]", "t_end": "datetime64[us]", "age_years": float,
+          "duration_raw_s": float}
+    return pd.DataFrame({c: pd.Series(dtype=dt.get(c, object)) for c in SESSION_COLUMNS})
+
+
 def _empty(table: str) -> pd.DataFrame:
     return schema.coerce_types(table, pd.DataFrame({c: pd.Series(dtype=object) for c in schema.columns(table)}))
 
@@ -80,6 +86,8 @@ class FrameSources:
             sess = set(g["SessionID"].astype(str))
             fg = rf[rf["SessionID"].astype(str).isin(sess)] if rf is not None and len(rf) else None
             parts.append(site_sessions(g, fg, str(site)))
+        if not parts:
+            return empty_sessions()
         return pd.concat(parts, ignore_index=True)
 
     def _rows(self, table: str, person_ids) -> pd.DataFrame:
