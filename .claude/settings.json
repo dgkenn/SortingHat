@@ -1,0 +1,20 @@
+{
+  "permissions": {
+    "deny": [
+      "Read(//restricted/**)",
+      "Edit(//restricted/**)",
+      "Read(./data/heedb/**)",
+      "Edit(./data/heedb/**)",
+      "Read(./data/restricted/**)",
+      "Read(**/*.edf)",
+      "Bash(*/restricted/*)",
+      "Bash(*restricted/*)",
+      "Bash(*data/heedb*)",
+      "Bash(*data/restricted*)",
+      "Bash(*$SORTINGHAT_RESTRICTED_ROOT*)",
+      "Bash(*${SORTINGHAT_RESTRICTED_ROOT}*)",
+      "Bash(*field_audit*--data /restricted*)",
+      "Bash(*field_audit*--data *heedb*)"
+    ]
+  }
+}
