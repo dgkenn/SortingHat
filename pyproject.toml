@@ -1,0 +1,21 @@
+[build-system]
+requires = ["setuptools>=68"]
+build-backend = "setuptools.build_meta"
+
+[project]
+name = "sortinghat"
+version = "0.0.1"
+description = "SortingHat: Phase 0 agent-safety and HEEDB field-audit tooling"
+requires-python = ">=3.10"
+dependencies = ["numpy>=1.26", "pandas>=2.1"]
+
+[project.optional-dependencies]
+parquet = ["pyarrow>=14"]
+dev = ["pytest>=8", "pyarrow>=14"]
+
+[tool.setuptools.packages.find]
+include = ["sortinghat*"]
+
+[tool.pytest.ini_options]
+testpaths = ["tests"]
+addopts = "-q"

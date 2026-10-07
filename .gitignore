@@ -1,0 +1,20 @@
+# Synthetic data is safe to share but generated on demand; keep it out of git.
+data/synthetic/
+data/heedb/
+data/restricted/
+out/
+reports/
+**/local_only/
+.claude/settings.local.json
+
+__pycache__/
+*.py[cod]
+.pytest_cache/
+.venv/
+venv/
+*.egg-info/
+build/
+dist/
+.DS_Store
+*.parquet
+*.edf
