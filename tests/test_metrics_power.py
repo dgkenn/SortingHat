@@ -137,3 +137,15 @@ def test_min_n_for_power():
 def test_expected_positives_shows_e7_cannot_reach_100_at_1000():
     pos = pw.expected_positives(pw.PowerConfig(), 1000)
     assert pos["E7"] < 100 and pos["E1"] > 100
+
+
+def test_level_scan_is_nested_and_matches_default_level():
+    cfg = replace(pw.PowerConfig(), gain=0.0)
+    r = pw.level_scan(cfg, 900, reps=400, seed=5)
+    # a higher CI level can only reject less often, and the full rule never exceeds the CI criterion
+    assert r[0.99]["rule"] <= r[0.975]["rule"] <= r[0.95]["rule"]
+    for lv in r.values():
+        assert lv["rule"] <= lv["ci"]
+    # with heterogeneity the 99% level controls rejection better than 95%
+    het = pw.level_scan(replace(cfg, tau_gain=0.015), 1000, reps=800, seed=5)
+    assert het[0.99]["rule"] < het[0.95]["rule"]

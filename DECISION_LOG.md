@@ -616,3 +616,33 @@
 - **Decision:** The silver_anchors.yaml status changes from "PROPOSED — needs co-investigator sign-off" to "SIGNED OFF by project lead 2026-10-07 (delegated decision); re-review with EEG/neurocritical-care co-investigator before Study 1 protocol lock". Per-item notes where clinically uncertain (hepatic and uremic acute-on-chronic, antibiotic pre-treatment for CSF) are kept.
 - **Rationale:** The clinical thresholds and windows were decided by the project lead rather than a clinical co-investigator; the co-investigator's re-review is required before the Study 1 protocol is locked.
 - **Source:** Project lead sign-off of the proposed silver-anchor rules (2026-10-07); Silver labels: the circularity rules; builds on D-009.
+
+### D-093 Evaluation set stays at about 1,000 gold cases, with a 1,500-case optional reserve
+- **Date:** 2026-10-07 · **Area:** hypotheses/labor · **Outcome data seen?** No
+- **Decision:** The consecutive gold evaluation set remains about 1,000 cases (at least ~330 per site, each with at least one assessable primary label). A reserve extension to 1,500 cases is optional, to be decided after the Phase 0 pilot; it is not required for H1/H2.
+- **Rationale:** Simulation (`sortinghat/metrics/power.py`, `docs/research/evaluation_sample_size.md`) gives H1/H2 power of 0.89 at +0.04 AUROC gain and 0.99 at +0.06 at N = 1,000 (80% from about 610), and only about 5 points more at N = 1,500; power at +0.02 is capped near 0.75 by between-site heterogeneity whatever N is. The 1,500 reserve costs 188 to 281 additional physician-hours (2.25 reviews per case at 10 to 15 minutes), so the 570 to 850 hour budget is unchanged. E7 stays exploratory through the enriched set (100 positives at 3% prevalence would need about 3,700 cases).
+- **Source:** SAP section 14; research plan adjudication budget; `docs/research/evaluation_sample_size.md` sections 3, 5, 6.
+
+### D-094 Calibration slope is a precision-reported secondary, not a gate, in Study 1
+- **Date:** 2026-10-07 · **Area:** hypotheses · **Outcome data seen?** No
+- **Decision:** Per-label calibration slope and O/E are reported with bootstrap CIs and calibration plots, with the expected CI width at the achieved N stated beforehand. They never pass or fail a hypothesis, model, site or gate, and no claim of "well calibrated" or slope near 1 is made from them. Slope is reported for labels with at least 100 expected positives (E1, E2, E5, E6); E4a and E7 get O/E only. Builds on SAP section 7.5.
+- **Rationale:** Slope CI width 0.2 needs 2,671 to 15,739 assessable patients (SAP section 14); the expected width at N = 1,000 is 0.41 to 0.57 for E1 to E6. A calibration gate would need about 4,300 to 8,100 cases (roughly 1,600 to 4,600 evaluation-only physician-hours) to protect a property the primary claim does not rest on.
+- **Source:** SAP sections 7.5 and 14; `docs/research/evaluation_sample_size.md` sections 4 and 5.
+
+### D-095 H1/H2 use the 99% within-site bootstrap CI together with the every-site rule
+- **Date:** 2026-10-07 · **Area:** hypotheses · **Outcome data seen?** No
+- **Decision:** H1 and H2 are met when the 99% (two-sided, alpha = 0.01) within-site stratified bootstrap CI for Delta lies below 0 and the Delta point estimate is below 0 at every held-out site. All four intervals stay co-reported at 95%. Refines D-018 and D-023 (the CI level, previously 95%).
+- **Rationale:** In simulation with site-level heterogeneity in the EEG gain (tau = 0.015 AUROC), the 95% rule rejects 6.2% (N = 1,000) and 6.9% (N = 1,500) at a true gain of 0; 97.5% gives 4.5% and 5.5%; 99% gives 3.1% and 3.7%, the only level at or below 5% at both. Power cost at +0.04 is 0.89 to 0.86 (N = 1,000) and 0.92 to 0.91 (N = 1,500); none at +0.06. At tau = 0.03 no level gets below 8.6%, so the co-reported two-stage interval remains the guard against between-site variance.
+- **Source:** `docs/research/evaluation_sample_size.md` section 8; SAP sections 6 and 7.2.
+
+### D-096 EEG minimum channel set is the 10 hairline electrodes
+- **Date:** 2026-10-07 · **Area:** hypotheses · **Outcome data seen?** No
+- **Decision:** The minimum channel set for the 60% usable-data rule is Fp1, Fp2, F7, F8, T3, T4, T5, T6, O1, O2 (the Ceribell-headband hairline electrodes), replacing the earlier assumed 16 non-midline 10-20 channels. `DEFAULT_MINIMUM_CHANNELS` (defined in `sortinghat/eeg/io.py`, imported by `sortinghat/eeg/window.py`) and its tests are updated. The epoch rule (90% of the minimum set clean, i.e. 9 of 10) is unchanged in form.
+- **Rationale:** Every included recording then supports the Ceribell-headband simulation (Study 2) without a separate inclusion set. This can lower the exclusion rate relative to the 16-channel set and makes QC blind to the other nine channels; both are reported in the exclusion counts.
+- **Source:** Project lead instruction (2026-10-07); `configs/montages.yaml` (ceribell_headband); SAP sections 2 and 9.
+
+### D-097 Burst-suppression 5 uV threshold and EEG QC thresholds are provisional
+- **Date:** 2026-10-07 · **Area:** hypotheses · **Outcome data seen?** No
+- **Decision:** The 5 uV burst-suppression envelope threshold and the EEG QC thresholds (flat 0.5 uV, clipping 5%, extreme 500 uV, line-noise ratio 1.0, disconnected rule, 90% epoch-channel fraction) are provisional. They will be fixed from the Phase 0b pilot, using counts and distributions only and no outcome labels or model results, and frozen before any evaluation-set gold label or model output is opened.
+- **Rationale:** The values are untuned defaults; low-voltage traces read as suppressed at 5 uV, and the pilot is the first time real recordings are available. Fixing them from signal properties alone keeps them independent of outcomes.
+- **Source:** `docs/eeg_pipeline.md` (QC and features); SAP section 10, item 9 (freeze order).

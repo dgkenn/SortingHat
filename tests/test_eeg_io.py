@@ -25,8 +25,9 @@ def test_check_channel_set():
     chk = check_channel_set(raw)
     assert not chk.has_19 and chk.missing == ["Pz"] and chk.extra == ["ECG"]
     assert chk.has_minimum            # Pz is not in the minimum set
+    assert DEFAULT_MINIMUM_CHANNELS == ("Fp1", "Fp2", "F7", "F8", "T3", "T4", "T5", "T6", "O1", "O2")
     chk2 = check_channel_set(CANONICAL_19)
-    assert chk2.has_19 and chk2.has_minimum and len(DEFAULT_MINIMUM_CHANNELS) == 16
+    assert chk2.has_19 and chk2.has_minimum and len(DEFAULT_MINIMUM_CHANNELS) == 10
     chk3 = check_channel_set(["Fp1", "Fp2"])
     assert not chk3.has_minimum and "O2" in chk3.missing_minimum
 

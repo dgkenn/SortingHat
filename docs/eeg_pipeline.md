@@ -47,16 +47,17 @@ Primary window = minutes 1-11 (60-660 s). Nested windows start at the primary st
 | line_noise | power at 60 +/- 1 Hz > 1.0 x power 1-40 Hz |
 | disconnected | epoch std < 2 % of the cross-channel median, **or** channel is flat/clipped/line-dominated in >= 50 % of epochs over the QC span (then flagged for the whole span) |
 
-An epoch is usable when >= 90 % of the minimum set (ceil, so 15 of 16 channels) is clean in it; one bad channel
+An epoch is usable when >= 90 % of the minimum set (ceil, so 9 of 10 channels) is clean in it; one bad channel
 does not sink an epoch, two do. Missing minimum channels fail the window. `window_clean_mask` exports the
 per-channel clean mask used by the features.
 
 **Decisions to confirm in the SAP** (all are constructor/config fields):
-1. *Minimum channel set* is not defined in the plan. Assumed: the 16 non-midline 10-20 channels
-   (`DEFAULT_MINIMUM_CHANNELS`); Fz/Cz/Pz are optional. CBraMod uses all 19.
+1. *Minimum channel set* (D-096): the 10 Ceribell-headband hairline electrodes Fp1, Fp2, F7, F8, T3, T4, T5, T6,
+   O1, O2 (`DEFAULT_MINIMUM_CHANNELS`, defined in `sortinghat/eeg/io.py` and imported by `window.py`); the other nine
+   10-20 channels are optional for QC. CBraMod uses all 19.
 2. Epoch rule: 90 % of the minimum set clean (`epoch_channel_frac`).
 3. Thresholds above, especially line-noise ratio and the 0.5 uV flat limit, are untuned. Calibrate on a pilot
-   with counts only, then freeze.
+   with counts only, then freeze (D-097; the 5 uV burst-suppression threshold below is in the same category).
 
 **Aggregate QC output**: `summarize_window_qc` / `write_qc_summary` produce, per window, suppressed n, pass
 proportion (`suppress_proportion`), usable-fraction quantiles (`safe_quantiles`, n >= 11) and flag prevalence,

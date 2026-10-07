@@ -23,7 +23,7 @@ Items marked **[OP]** are operationalizations that the plan does not state; they
 
 - Adults, acute-care encounter (ICU, inpatient, ED), **first qualifying EEG per patient**. One row per patient throughout, so every index-level split is a patient-level split.
 - **Strict cohort** (primary): GCS <= 11 or FOUR <= 12. **Broad EHR-phenotype cohort**: reported separately, never pooled into the primary estimate.
-- **t0 = EEG start.** Primary window = minutes 1 to 11 of the recording, requiring >= 60% usable data on the minimum channel set.
+- **t0 = EEG start.** Primary window = minutes 1 to 11 of the recording, requiring >= 60% usable data on the minimum channel set. **Minimum channel set = the 10 hairline electrodes Fp1, Fp2, F7, F8, T3, T4, T5, T6, O1, O2** (D-096), so every included recording supports the Ceribell-headband simulation; the other nine 10-20 channels are optional for QC.
 - EEG within 24 h of documented acute-consciousness-impairment (ACI) onset; time since onset enters every model as a covariate. Sensitivity windows: <= 6 h, <= 12 h, <= 48 h.
 - Record the **EEG referral indication** as a category (for example "rule out NCSE", "post-arrest", "unexplained AMS"). It is used only in Baseline D.
 - Eligibility depends on the Phase 0a field audit passing its "Stop" rows (plan, Phase 0a). The site criterion is >= 3 adult sites with >= 300 candidates each (`metrics.splits.check_site_requirements`); if it fails, the plan falls back to a grouped split with a weaker claim (D-024).
@@ -55,7 +55,7 @@ Gold labels use the ordinal states absent / possible / probable / definite / una
 
 ### 3.3 Adjudication design
 
-Evaluation set: about 1,000 consecutive gold cases, dual independent review with third-reader resolution. Development cases: single reviewer with a random 20% double-read. Packets are built by deterministic extraction plus an open-weight summarizer on approved compute, after an EEG-sentence filter. Silver labels train models and never score them. The silver-label circularity rules and the circularity audit are as in the plan (Study 1, "Silver labels") and `docs/labels_spec.md`.
+Evaluation set: about 1,000 consecutive gold cases (D-093; a 1,500-case reserve is optional, not required), dual independent review with third-reader resolution. Development cases: single reviewer with a random 20% double-read. Packets are built by deterministic extraction plus an open-weight summarizer on approved compute, after an EEG-sentence filter. Silver labels train models and never score them. The silver-label circularity rules and the circularity audit are as in the plan (Study 1, "Silver labels") and `docs/labels_spec.md`.
 
 ## 4. Comparators, representations and models
 
@@ -104,7 +104,7 @@ alpha = 0.05 two-sided throughout (95% intervals). "CI" refers to the interval d
 
 | ID | Hypothesis | Estimand | Success criterion | Role |
 |---|---|---|---|---|
-| **H1** | EEG improves on severity + t0 sedative exposure | Delta vs Baseline A, strict cohort, leave-one-site-out | Pooled 95% CI for Delta **below 0**, **and** Delta point estimate **below 0 at every held-out site** (D-018, D-023) | Primary, 1A |
+| **H1** | EEG improves on severity + t0 sedative exposure | Delta vs Baseline A, strict cohort, leave-one-site-out | Pooled **99%** within-site bootstrap CI for Delta **below 0** (D-095), **and** Delta point estimate **below 0 at every held-out site** (D-018, D-023) | Primary, 1A |
 | **H2** | EEG improves on the full t0 clinical model | Delta vs Baseline C | Same as H1 | Primary, 1B |
 | **H3** | H1 survives severity matching | Delta vs Baseline A within each of 3 severity strata (GCS/FOUR/NESI strata, cut points fixed before unblinding [OP]) | Delta point estimate **below 0 within at least 2 of 3 strata** (`metrics.hypotheses.h3_severity_stratified`). A stratum with < 50 patients is not estimable and counts as not favorable **[OP, PLACEHOLDER]**. Per-stratum CIs are reported but not part of the rule | Key secondary |
 | **H4** | Identifiability ranking E3 > E2 > E1 > E4a > E5 > E6, with E6 vs E5 near chance | Per-label Delta_k (E3 from the positive-control analysis, others vs Baseline A) ranked most to least negative; Kendall tau-b between predicted and observed ranking with bootstrap CI; pairwise AUROC for E6 vs E5 | **Recorded before unblinding and reported whichever way it falls** (plan). No pass/fail threshold is set by the plan. Reported: observed ranking, tau-b with CI, and pairwise AUROC for E6 vs E5 with CI. "Near chance" is read as the pairwise-AUROC CI containing 0.5 **[OP]** | Boundary map, descriptive |
@@ -115,6 +115,7 @@ Notes.
 
 - H1 and H2 require both a CI excluding zero **and** the per-site condition. A pooled CI below zero with one unfavorable site is reported as "pooled effect not site-transportable" and H1/H2 are not met.
 - With three sites the per-site condition is strict. Section 14 gives its power under stated assumptions.
+- **CI level (D-095):** the H1/H2 interval is the 99% within-site stratified bootstrap (alpha = 0.01), chosen because with simulated between-site heterogeneity (tau = 0.015 AUROC) it is the only tested level (95%, 97.5%, 99%) keeping the rule's null rejection at or below 5% at N = 1,000 and 1,500, at a cost of 0 to 3 power points at +0.04 and none at +0.06 (`docs/research/evaluation_sample_size.md`, section 8). Residual risk under larger heterogeneity is addressed only by the co-reported two-stage interval. All other intervals in this SAP remain 95%.
 - H5 and H6 describe how the gain varies; neither alters the pass/fail status of H1 or H2.
 
 ## 7. Estimation
@@ -137,7 +138,7 @@ Unit of resampling is the **patient**. The per-patient vector d_i carries both m
 | `two_stage` | Sites, then patients within drawn sites | Both | Same coarse-site limitation; the most conservative |
 | `site_t` (sensitivity) | None. Equal-weight mean of site Deltas with a t(S-1) interval | Between-site spread | 2 degrees of freedom for S = 3 |
 
-- **Which interval carries H1/H2:** the **within-site stratified bootstrap** CI, protected against hidden between-site heterogeneity by the per-site favorable condition. Reasoning: with S = 3 the cluster interval cannot support a coverage claim, and the plan answers the within-site concern with "require a favorable effect at every held-out site; report each separately" (plan, Critical evaluation table). **All four intervals are reported side by side** in the main results table (`metrics.bootstrap.delta_ci_all_modes`). If the within-site CI is below 0 but the cluster or two-stage CI includes 0, the report states that the effect is supported for patients at these sites but not shown for a population of sites; H1/H2 status is unchanged. **[OP]** The plan asks for both intervals to be reported but does not say which carries the decision.
+- **Which interval carries H1/H2:** the **within-site stratified bootstrap** CI **at the 99% level** (D-095), protected against hidden between-site heterogeneity by the per-site favorable condition. Reasoning: with S = 3 the cluster interval cannot support a coverage claim, and the plan answers the within-site concern with "require a favorable effect at every held-out site; report each separately" (plan, Critical evaluation table). **All four intervals are reported side by side** in the main results table (`metrics.bootstrap.delta_ci_all_modes`). If the within-site CI is below 0 but the cluster or two-stage CI includes 0, the report states that the effect is supported for patients at these sites but not shown for a population of sites; H1/H2 status is unchanged. **[OP]** The plan asks for both intervals to be reported but does not say which carries the decision.
 - Percentile intervals; B = 10,000 replicates for final analyses (code default 2,000 for development); fixed seed recorded in the analysis log.
 - Patients with undefined d_i (no assessable primary label) are dropped before resampling.
 
@@ -157,13 +158,13 @@ All computed on patients assessable for that label, on the pooled LOSO predictio
 - **ECE**: 10 equal-width bins (primary) and 10 equal-count bins (sensitivity). Binned ECE is biased upward in small samples, is reported with a bootstrap CI, and is never used for model selection (`ece`).
 - **Brier score** and **AUROC** (`brier`, `auroc`).
 - **Risk-coverage curves** per label: cases ranked by confidence max(p, 1 - p); risk = mean log loss (also Brier and 0/1 error) over the top-k most confident cases; AURC reported (`risk_coverage`, `per_label_risk_coverage`).
-- Calibration metrics are **descriptive**. They do not enter H1-H6 or the gate rules. Section 14 shows why: the evaluation set cannot estimate per-label calibration slopes to the precision usually wanted.
+- Calibration metrics are **descriptive**: a precision-reported secondary, not a gate (D-094). They do not enter H1-H6 or the gate rules, no claim of "well calibrated" or slope near 1 is made from them, and the expected CI width at the achieved N is stated beforehand. Slope is reported for labels with >= 100 expected positives (E1, E2, E5, E6); E4a and E7 get O/E only. Section 14 shows why: the evaluation set cannot estimate per-label calibration slopes to the precision usually wanted.
 
 ## 8. Multiplicity
 
 | Family | Hypotheses | Handling |
 |---|---|---|
-| Confirmatory | H1, H2 | Each tested once at alpha = 0.05 on one prespecified primary EEG model and one baseline. They address different claims (1A and 1B), feed different gates (G2 and G3) and are never combined into one claim, so no alpha split between them. A single primary representation (section 4.2) is what prevents a hidden multiplicity across the ladder |
+| Confirmatory | H1, H2 | Each tested once (99% within-site CI plus the every-site rule, D-095; other intervals 95%) on one prespecified primary EEG model and one baseline. They address different claims (1A and 1B), feed different gates (G2 and G3) and are never combined into one claim, so no alpha split between them. A single primary representation (section 4.2) is what prevents a hidden multiplicity across the ladder |
 | Gated secondary | H3, H5 | H3 is interpreted as confirmatory only if H1 is met; H5 only if H2 is met. Otherwise they are reported descriptively. No further alpha adjustment (decision rules are point-estimate rules or single CIs) **[OP]** |
 | Per-label claims for G2 | "At least 3 primary families improve individually" | Holm adjustment across the primary labels on the one-sided bootstrap p-values (`metrics.bootstrap.holm_adjust`). A label counts for G2 if its CI upper bound is below 0 **and** its Holm-adjusted p < 0.05 **[OP]** |
 | Exploratory | H4, H6, ladder rungs, other baselines, subgroups, reduced windows, sensitivity analyses | No multiplicity control. Intervals are nominal 95% and are labeled exploratory. Never used for a gate |
@@ -318,7 +319,7 @@ All numbers below read from the tables above.
 - **Consequence for this SAP:** calibration quantities (slope, intercept, ECE) are descriptive with reported CIs, not decision criteria (section 7.5). The decision rules rest on Delta (a patient-level mean over many cells) and on per-label Delta.
 - **Primary endpoint precision (Table S4).** The CI half-width of Delta is 1.96 x SD(d_i) / sqrt(N). The SD of d_i is unknown before any data exist; the listed SDs (0.10, 0.20, 0.30) are **[PLACEHOLDER]** and the pilot or development data must replace them. With SD 0.20, N = 1,000 gives a half-width of about 0.012 log-loss units.
 - **Per-site condition (Table S5).** With 3 sites of about 333 patients and SD 0.20, a true Delta of -0.02 gives about 0.90 probability that all three site estimates are negative and about 0.84 power for the full H1/H2 rule; -0.01 gives about 0.31. A true Delta of -0.03 gives about 0.99. Between-site heterogeneity (tau = 0.01) lowers the -0.02 case to 0.70. These are normal-theory approximations with placeholder SD and equal site sizes; the simulation is in `power_h1_rule`.
-- **The "about 1,000" target** is therefore justified, if at all, by H1/H2 power for plausible effects and not by calibration precision. Whether to raise N, accept descriptive calibration, or pool sites differently is a decision for the biostatistician after the pilot measures prevalence, assessable fraction, SD(d_i) and LP spread. This SAP does not change N.
+- **The "about 1,000" target** is therefore justified, if at all, by H1/H2 power for plausible effects and not by calibration precision. Whether to raise N, accept descriptive calibration, or pool sites differently is a decision for the biostatistician after the pilot measures prevalence, assessable fraction, SD(d_i) and LP spread. This SAP keeps N at about 1,000 (D-093): simulated H1/H2 power is 0.89 at +0.04 AUROC and 0.99 at +0.06 at N = 1,000, and the 1,500-case reserve adds only about 5 points (`docs/research/evaluation_sample_size.md`). The 1,500 reserve costs 188 to 281 further physician-hours and is optional.
 - E7: the 100-positive rule implies about 10% prevalence at N = 1,000 for E7 to qualify from the evaluation set; otherwise it is exploratory via the enriched set (plan).
 
 ## 15. Deviations and amendments
@@ -341,6 +342,10 @@ Any change after freeze is an amendment with a date, reason and a statement of w
 12. E7 eligibility: >= 100 total positives and at least two sites with >= 1 positive (`metrics.labels.e7_eligible`).
 13. Gating of H3 and H5 interpretation on H1 and H2 (section 8).
 14. Bootstrap B = 10,000 for final analyses.
+    - 14a. H1/H2 CI level = 99% within-site (D-095).
+    - 14b. Evaluation N about 1,000 with an optional 1,500 reserve (D-093); calibration slope is a precision-reported secondary (D-094).
+    - 14c. EEG minimum channel set = 10 hairline electrodes (D-096).
+    - 14d. Burst-suppression 5 uV and EEG QC thresholds are provisional until fixed from the Phase 0b pilot, before any outcome is seen (D-097).
 15. G0 kappa = unweighted binary kappa on the pilot (section 11).
 
 ## 17. References

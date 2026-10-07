@@ -357,6 +357,51 @@ def sensitivity_min_n(cfg: PowerConfig, reps: int, seed: int, scenarios: dict[st
     return rows
 
 
+CI_LEVELS = (0.95, 0.975, 0.99)
+
+
+def level_scan(cfg: PowerConfig, n_total: int, reps: int = 1000, seed: int = 20261007,
+               levels: Sequence[float] = CI_LEVELS, key: int = 11) -> dict[float, dict[str, float]]:
+    """Within-site-CI H1/H2 rule at several two-sided CI levels, on one shared set of simulated studies.
+
+    Returns {level: {"ci": P(upper < 0), "rule": P(upper < 0 and every site < 0)}}.
+    """
+    rng = _cell_seed(seed, n_total, key)
+    chunk = max(1, int(2.5e6 // (max(n_total // cfg.n_sites, 1) * cfg.k)))
+    ci = {lv: [] for lv in levels}
+    rule = {lv: [] for lv in levels}
+    done = 0
+    while done < reps:
+        r = min(chunk, reps - done)
+        n_s, m_s, v_s = simulate_site_stats(cfg, n_total, r, rng)
+        n_tot = n_s.sum(axis=1)
+        est = (n_s * m_s).sum(axis=1) / n_tot
+        se = np.sqrt((n_s * v_s).sum(axis=1)) / n_tot
+        every = np.all(m_s < 0, axis=1)
+        for lv in levels:
+            up = est + stats.norm.ppf(0.5 + lv / 2) * se
+            ci[lv].append(up < 0)
+            rule[lv].append((up < 0) & every)
+        done += r
+    return {lv: {"ci": float(np.concatenate(ci[lv]).mean()), "rule": float(np.concatenate(rule[lv]).mean())}
+            for lv in levels}
+
+
+def level_table(reps: int = 1000, seed: int = 20261007, n_grid: Sequence[int] = (1000, 1500),
+                taus: Sequence[float] = (0.015, 0.03)) -> str:
+    """Null rejection (tau as given) and power at +0.04 / +0.06 (tau 0.015) per CI level."""
+    rows = ("| N | CI level | Null rejection, tau 0.015 | Null rejection, tau 0.03 | Power +0.04 | Power +0.06 |\n"
+            "|---|---|---|---|---|---|\n")
+    for n in n_grid:
+        nul = {t: level_scan(replace(PowerConfig(), gain=0.0, tau_gain=t), n, reps, seed) for t in taus}
+        p4 = level_scan(replace(PowerConfig(), gain=0.04), n, reps, seed, key=12)
+        p6 = level_scan(replace(PowerConfig(), gain=0.06), n, reps, seed, key=13)
+        for lv in CI_LEVELS:
+            rows += (f"| {n:,} | {lv:.1%} | {nul[taus[0]][lv]['rule']:.3f} | {nul[taus[1]][lv]['rule']:.3f} | "
+                     f"{p4[lv]['rule']:.2f} | {p6[lv]['rule']:.2f} |\n")
+    return rows
+
+
 def null_calibration(reps: int = 1000, seed: int = 20261007, n_grid: Sequence[int] = (1000, 3000)) -> str:
     """Rejection rate at a true gain of 0, with and without between-site heterogeneity.
 
@@ -391,6 +436,7 @@ def main(argv=None) -> int:
     ap.add_argument("--seed", type=int, default=20261007)
     ap.add_argument("--sensitivity", action="store_true", help="also print the min-N sensitivity table")
     ap.add_argument("--null", action="store_true", help="also print the zero-effect rejection-rate table")
+    ap.add_argument("--levels", action="store_true", help="also print the CI-level scan for the H1/H2 rule")
     ap.add_argument("--json", type=str, default=None, help="write the raw grid to this path")
     a = ap.parse_args(argv)
     print(render(a.reps, a.seed))
@@ -400,6 +446,9 @@ def main(argv=None) -> int:
     if a.null:
         print("\n### Table P9. Rejection rate at a true AUROC gain of 0 (nominal 0.025 for CI only)\n")
         print(null_calibration(seed=a.seed))
+    if a.levels:
+        print("\n### Table P10. H1/H2 rule (within-site CI + every site) by CI level\n")
+        print(level_table(seed=a.seed))
     if a.json:
         tab = power_table(PowerConfig(), GAINS, N_GRID_EXT, a.reps, a.seed)
         with open(a.json, "w") as fh:

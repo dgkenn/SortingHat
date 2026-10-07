@@ -78,11 +78,11 @@ def test_extreme_threshold_is_500uv(clean):
 def test_single_bad_channel_still_usable_but_many_are_not(clean):
     from sortinghat.eeg.synthetic import apply_artifact
     one = clean.copy()
-    apply_artifact(one, FS, Artifact("flat", ("F3",)), CANONICAL_19)
+    apply_artifact(one, FS, Artifact("flat", ("F7",)), CANONICAL_19)
     q1 = _qc(one)[0]["w"]
     assert q1.passes and q1.usable_fraction == 1.0 and q1.flag_fraction["flat"] > 0
     many = clean.copy()
-    for ch in ("F3", "F4", "C3", "C4"):
+    for ch in ("F7", "F8", "T3", "T4"):
         apply_artifact(many, FS, Artifact("flat", (ch,), 10.0, 28.0), CANONICAL_19)   # 28 of 60 s
     q2 = _qc(many)[0]["w"]
     assert not q2.passes and "usable_below_threshold" in q2.reasons
@@ -119,6 +119,13 @@ def test_missing_minimum_channels_fails(clean):
 
 def test_midline_channels_not_required(clean):
     keep = [i for i, c in enumerate(CANONICAL_19) if c in DEFAULT_MINIMUM_CHANNELS]
+    names = [CANONICAL_19[i] for i in keep]
+    qcs, _ = qc_recording(clean[keep], FS, names, 0.0, WIN)
+    assert qcs["w"].passes
+
+
+def test_non_hairline_channels_not_required(clean):
+    keep = [i for i, c in enumerate(CANONICAL_19) if c not in ("F3", "F4", "C3", "C4", "P3", "P4")]
     names = [CANONICAL_19[i] for i in keep]
     qcs, _ = qc_recording(clean[keep], FS, names, 0.0, WIN)
     assert qcs["w"].passes

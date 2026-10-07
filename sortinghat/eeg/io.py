@@ -24,9 +24,10 @@ CANONICAL_19: tuple[str, ...] = (
     "Fp1", "Fp2", "F7", "F3", "Fz", "F4", "F8", "T3", "C3", "Cz", "C4", "T4",
     "T5", "P3", "Pz", "P4", "T6", "O1", "O2")
 
-# ASSUMPTION (confirm in the SAP): the "minimum channel set" for the >=60% usable rule is the 16 non-midline
-# 10-20 channels (enough for the 16 lateral double-banana chains). Override per call.
-DEFAULT_MINIMUM_CHANNELS: tuple[str, ...] = tuple(c for c in CANONICAL_19 if c not in ("Fz", "Cz", "Pz"))
+# Minimum channel set for the >=60% usable rule (D-096): the 10 Ceribell-headband hairline electrodes, so every
+# included recording supports the headband simulation (configs/montages.yaml, ceribell_headband). Classical
+# T3/T4/T5/T6 labels. The other nine 10-20 channels (F3, F4, C3, C4, P3, P4, Fz, Cz, Pz) are optional for QC.
+DEFAULT_MINIMUM_CHANNELS: tuple[str, ...] = ("Fp1", "Fp2", "F7", "F8", "T3", "T4", "T5", "T6", "O1", "O2")
 
 _ALIASES = {"T7": "T3", "T8": "T4", "P7": "T5", "P8": "T6"}
 _CANON_UPPER = {c.upper(): c for c in CANONICAL_19}

@@ -2,7 +2,7 @@
 
 Status: analysis note for the biostatistician, written before any pilot data exist. Every input below is an assumption to be replaced by pilot measurements. Nothing here changes the SAP (`docs/prereg_study1_sap.md`); it supplies the missing H1/H2 power calculation and a recommendation for the SAP section 14 decision.
 
-Reproduce: `python -m sortinghat.metrics.power --reps 400 --sensitivity --null` (about 6.5 minutes; seeded, so the tables below regenerate exactly). Code: `sortinghat/metrics/power.py`; tests: `tests/test_metrics_power.py`.
+Reproduce: `python -m sortinghat.metrics.power --reps 400 --sensitivity --null --levels` (about 6.5 minutes; seeded, so the tables below regenerate exactly). Code: `sortinghat/metrics/power.py`; tests: `tests/test_metrics_power.py`.
 
 ## 1. Why this note exists
 
@@ -148,3 +148,21 @@ Net effect of the recommendation: **no change to the plan's 570 to 850 hours.** 
 - Monte Carlo SE is up to 0.025 per cell (400 reps); minimum-N figures from the grid are rounded to 10 and are interpolations.
 - Equal site sizes; independent 90% assessability; no covariate shift between development and evaluation sites; the baseline is treated as fixed and correctly calibrated (in practice a baseline fit on development data carries its own estimation error, which would shrink the observed gain).
 - Run after the Phase 0 pilot with measured prevalences, assessable fractions, the realized baseline AUROCs and SD(d_i); `PowerConfig` takes each of these directly.
+
+## 8. CI level for the within-site interval (follow-up)
+
+The full rule's null rejection (7 to 11% at tau 0.015 to 0.03, section 3.4) is too high for a preregistered primary. `power.level_scan` re-evaluates the SAP rule (within-site CI upper bound below 0 and every site below 0) at three two-sided CI levels on shared simulated studies (2,000 reps per cell, same settings as section 2, true gain 0 for the null rows, tau as stated).
+
+| N | CI level | Null rejection, tau 0.015 | Null rejection, tau 0.03 | Power +0.04 | Power +0.06 |
+|---|---|---|---|---|---|
+| 1,000 | 95.0% | 0.062 | 0.108 | 0.89 | 0.99 |
+| 1,000 | 97.5% | 0.045 | 0.097 | 0.88 | 0.99 |
+| 1,000 | 99.0% | 0.031 | 0.086 | 0.86 | 0.99 |
+| 1,500 | 95.0% | 0.069 | 0.106 | 0.92 | 0.99 |
+| 1,500 | 97.5% | 0.055 | 0.102 | 0.92 | 0.99 |
+| 1,500 | 99.0% | 0.037 | 0.093 | 0.91 | 0.99 |
+
+- Only the **99% interval** keeps null rejection at or below 5% at both N for tau = 0.015 (3.1% at N = 1,000, 3.7% at N = 1,500). 97.5% passes at N = 1,000 (4.5%) but fails at N = 1,500 (5.5%); 95% fails at both (6.2%, 6.9%).
+- The power cost is small: at +0.04, 0.89 to 0.86 at N = 1,000 and 0.92 to 0.91 at N = 1,500; at +0.06 there is none (0.99).
+- At tau = 0.03 no level reaches 5% (8.6 to 10.8%). The interval cannot fix between-site variance it does not see; the co-reported two-stage interval (section 3.4: 4 to 8%) is the protection, and the Results must say so. The recommended level is therefore a mitigation under the tau = 0.015 assumption, not a guarantee.
+- Implementation: `bootstrap.paired_bootstrap_delta(..., mode="within_site", alpha=0.01)`; B = 10,000 as already planned so the 0.5th and 99.5th percentiles are stable.
