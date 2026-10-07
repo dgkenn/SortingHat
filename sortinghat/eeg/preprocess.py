@@ -93,6 +93,27 @@ def common_average(data: np.ndarray, exclude: Sequence[bool] | np.ndarray | None
     return data - data[use].mean(axis=0, keepdims=True)
 
 
+def common_average_masked(data: np.ndarray, clean_mask: np.ndarray, epoch_samples: int, start_sample: int = 0,
+                          base_exclude: Sequence[bool] | np.ndarray | None = None) -> np.ndarray:
+    """Common average with a time-varying reference: within each QC epoch only channels that are clean in that
+    epoch enter the mean (so a 1500 uV transient on one channel does not leak into the other 18). Samples outside
+    the mask grid use ``base_exclude`` only. ``clean_mask`` is (C, E) over epochs starting at ``start_sample``."""
+    out = common_average(data, base_exclude)
+    nan_rows = np.isnan(data).any(axis=1)
+    C, E = clean_mask.shape
+    for e in range(E):
+        a = start_sample + e * epoch_samples
+        b = min(data.shape[1], a + epoch_samples)
+        if a < 0 or a >= b:
+            continue
+        use = clean_mask[:, e] & ~nan_rows
+        if base_exclude is not None:
+            use &= ~np.asarray(base_exclude, bool)
+        if use.any():
+            out[:, a:b] = data[:, a:b] - data[use, a:b].mean(axis=0, keepdims=True)
+    return out
+
+
 def bipolar_double_banana(data: np.ndarray, ch_names: Sequence[str],
                           pairs: Sequence[tuple[str, str]] = DOUBLE_BANANA) -> tuple[np.ndarray, list[str]]:
     """Longitudinal bipolar derivations from referential data. Pairs whose electrodes are absent are skipped."""

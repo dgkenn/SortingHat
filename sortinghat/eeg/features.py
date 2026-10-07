@@ -52,7 +52,7 @@ class FeatureConfig:
     bsr_threshold_uv: float = 5.0      # ASSUMPTION: RMS envelope below this = suppressed (calibrate on pilot)
     bsr_env_s: float = 0.25
     bsr_min_s: float = 0.5
-    lzc_max_segments: int = 24
+    lzc_max_segments: int = 10
     per_channel: bool = False
     connectivity: bool = True
     min_segments: int = 5              # fewer clean segments than this -> NaN

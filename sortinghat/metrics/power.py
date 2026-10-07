@@ -273,8 +273,12 @@ def expected_positives(cfg: PowerConfig, n_total: int) -> dict[str, float]:
 # --------------------------------------------------------------------------
 # Reporting
 # --------------------------------------------------------------------------
-def _fmt_n(x: float) -> str:
-    return ">8,000" if not np.isfinite(x) else f"{int(round(x, -1)):,}"
+def _fmt_n(x: float, floor: int = N_GRID_EXT[0]) -> str:
+    if not np.isfinite(x):
+        return f">{N_GRID_EXT[-1]:,}"
+    if x <= floor:
+        return f"<={floor:,}"
+    return f"{int(round(x, -1)):,}"
 
 
 def format_power_table(tab: dict[float, list[dict]], key: str) -> str:
@@ -353,6 +357,21 @@ def sensitivity_min_n(cfg: PowerConfig, reps: int, seed: int, scenarios: dict[st
     return rows
 
 
+def null_calibration(reps: int = 1000, seed: int = 20261007, n_grid: Sequence[int] = (1000, 3000)) -> str:
+    """Rejection rate at a true gain of 0, with and without between-site heterogeneity.
+
+    Nominal rate of "CI upper < 0" for a two-sided 95% CI under a true Delta of 0 is 2.5%.
+    """
+    rows = ("| tau (AUROC) | N | CI only: within_site | CI only: site_t | CI only: two_stage "
+            "| Full rule: within_site | Full rule: site_t | Full rule: two_stage |\n|---|---|---|---|---|---|---|---|\n")
+    for tau in (0.0, 0.015, 0.03):
+        for n in n_grid:
+            c = power_cell(replace(PowerConfig(), gain=0.0, tau_gain=tau), n, reps, seed, key=7)
+            rows += (f"| {tau:g} | {n:,} | " + " | ".join(f"{c[k]:.3f}" for k in (
+                "ci_within_site", "ci_site_t", "ci_two_stage", "rule_within_site", "rule_site_t", "rule_two_stage")) + " |\n")
+    return rows
+
+
 def default_scenarios() -> dict[str, PowerConfig]:
     base = PowerConfig()
     return {
@@ -371,12 +390,16 @@ def main(argv=None) -> int:
     ap.add_argument("--reps", type=int, default=400)
     ap.add_argument("--seed", type=int, default=20261007)
     ap.add_argument("--sensitivity", action="store_true", help="also print the min-N sensitivity table")
+    ap.add_argument("--null", action="store_true", help="also print the zero-effect rejection-rate table")
     ap.add_argument("--json", type=str, default=None, help="write the raw grid to this path")
     a = ap.parse_args(argv)
     print(render(a.reps, a.seed))
     if a.sensitivity:
         print("\n### Table P8. Minimum N for 80% power (full rule, within-site CI), sensitivity scenarios\n")
         print(sensitivity_min_n(PowerConfig(), a.reps, a.seed, default_scenarios()))
+    if a.null:
+        print("\n### Table P9. Rejection rate at a true AUROC gain of 0 (nominal 0.025 for CI only)\n")
+        print(null_calibration(seed=a.seed))
     if a.json:
         tab = power_table(PowerConfig(), GAINS, N_GRID_EXT, a.reps, a.seed)
         with open(a.json, "w") as fh:
