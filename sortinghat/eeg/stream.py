@@ -30,16 +30,21 @@ from dataclasses import dataclass, field
 import numpy as np
 
 from .features import FeatureConfig
-from .io import CANONICAL_19, EDFError, EDFHeader, Recording, read_edf, read_edf_header
+from .io import (CANONICAL_19, DEFAULT_MINIMUM_CHANNELS, EDFError, EDFHeader, Recording, normalize_channel_name,
+                 read_edf, read_edf_header)
 from .pipeline import PAD_S, process_recording
 from .preprocess import PreprocessConfig
-from .window import FLAG_NAMES, QCConfig, WindowQC, all_windows
+from .window import FLAG_NAMES, QCConfig, WindowQC, WindowSpec, all_windows
 
 HEADER_PROBE_BYTES = 64 * 1024          # first GET; an EDF header is 256 * (n_signals + 1) bytes (<= 64 KiB for 255)
 CHUNK_BYTES = 8 * 1024 * 1024           # each data GET is at most this big, so a retry re-fetches little
 MAX_FETCH_BYTES = 256 * 1024 * 1024     # refuse a plan bigger than this (pathological sampling rate x channels)
 DEFAULT_TIMEOUT_S = 300.0               # per recording: fetch + decode + features
 DEFAULT_MAX_ATTEMPTS = 4                # per GET
+ONSET_BLOCK_S = 10.0                    # signal onset is searched on this grid (from the file start)
+ONSET_MIN_ACTIVE = 8                    # of the 10 required electrodes that must be non-constant in a block
+ONSET_MAX_SEARCH_S = 120 * 60.0         # recordings without an onset in the first 120 min are excluded
+ONSET_PROBE_EVERY_S = 60.0              # coarse pass: one block per minute; the minute before a hit is then scanned
 
 
 class FailureReason:
@@ -98,6 +103,7 @@ class StreamResult:
     rows: list[dict] = field(default_factory=list)     # one dict per window (pipeline rows + qc_* columns)
     qc: dict[str, WindowQC] = field(default_factory=dict)
     n_channels: int = 0
+    onset_s: float | None = None             # signal onset, seconds from the file start (per recording: local_only only)
     n_missing_min: int = 0                   # minimum-set channels not found after label normalisation
     n_dead_min: int = 0                      # minimum-set channels exactly constant for the whole segment (reported missing)
     n_invalid_min: int = 0                   # minimum-set channels with a zero calibration range (reported missing)
@@ -453,6 +459,121 @@ def fetch_window(s3, key: str, start_s: float, duration_s: float, *, bucket: str
         raise _StreamError(classify_edf_error(exc)) from None
 
 
+# --------------------------------------------------------------------------------------------
+# Signal onset (t0 = EEG signal onset, D-108): HEEDB files can start with constant padding
+# --------------------------------------------------------------------------------------------
+@dataclass
+class OnsetResult:
+    onset_s: float | None                # seconds from the FILE start; None when no onset was found
+    reason: str | None = None            # FailureReason code when onset_s is None
+    searched_s: float = 0.0
+
+
+def _required_signal_index(hdr: EDFHeader, required=DEFAULT_MINIMUM_CHANNELS) -> list[int]:
+    """Header index of the first signal that normalises to each required electrode (those present)."""
+    first: dict[str, int] = {}
+    for i, lb in enumerate(hdr.labels):
+        if hdr.is_annotation[i]:
+            continue
+        c = normalize_channel_name(lb)
+        if c in required and c not in first:
+            first[c] = i
+    return [first[c] for c in required if c in first]
+
+
+def _active_counts(hdr: EDFHeader, raw: bytes, r_a: int, k0: int, k1: int, block_s: float, idx: list[int]) -> np.ndarray:
+    """Per 10-s block ``k0..k1-1``: how many of the signals ``idx`` are NOT constant (digital samples). A block that
+    the fetched records do not fully cover counts as 0 active."""
+    n = len(raw) // hdr.record_bytes
+    arr = np.frombuffer(raw[: n * hdr.record_bytes], dtype="<i2").reshape(n, -1) if n else np.zeros((0, 1), "<i2")
+    bounds = np.concatenate([[0], np.cumsum(hdr.samples_per_record)])
+    out = np.zeros(k1 - k0, int)
+    for i in idx:
+        x = arr[:, bounds[i]:bounds[i + 1]].reshape(-1)
+        fs = float(hdr.samples_per_record[i]) / hdr.record_duration
+        L = int(round(block_s * fs))
+        for j in range(k1 - k0):
+            a = int(round(((k0 + j) * block_s - r_a * hdr.record_duration) * fs))
+            seg = x[a:a + L]
+            if len(seg) == L and L > 0 and seg.max() != seg.min():
+                out[j] += 1
+    return out
+
+
+def find_signal_onset(s3, key: str, *, bucket: str | None = None, deadline: Deadline | None = None,
+                      stats: FetchStats | None = None, max_attempts: int = DEFAULT_MAX_ATTEMPTS,
+                      backoff_s: float = 1.0, max_backoff_s: float = 30.0, sleep=time.sleep, rand=random.random,
+                      chunk_bytes: int = CHUNK_BYTES, block_s: float = ONSET_BLOCK_S,
+                      min_active: int = ONSET_MIN_ACTIVE, max_search_s: float = ONSET_MAX_SEARCH_S,
+                      probe_every_s: float = ONSET_PROBE_EVERY_S, required=DEFAULT_MINIMUM_CHANNELS) -> OnsetResult:
+    """Start (seconds from the file start) of the FIRST ``block_s`` block, on the grid ``k * block_s``, in which at
+    least ``min_active`` of the ``required`` electrodes are non-constant (digital samples, so a constant non-zero
+    pad is constant too). Searched within the first ``max_search_s`` of the file.
+
+    Cheap: one block per ``probe_every_s`` is fetched (ranged GET of that block's records, all signals); the first
+    probe that is active triggers a full scan of the stretch since the previous (inactive) probe, so the answer is the
+    exact first active block unless an activity burst shorter than ``probe_every_s - block_s`` lies entirely between
+    two probes in the padding. The tail after the last probe is scanned in full. Returns ``OnsetResult(None,
+    'no_signal_onset')`` when nothing qualifies; raises ``_StreamError`` / ``RecordingTimeout`` like ``fetch_window``.
+    """
+    if bucket is None:
+        from ..data_io import access_point
+        bucket = access_point()
+    deadline = deadline or Deadline(None)
+    stats = stats if stats is not None else FetchStats()
+    rg = _Ranged(s3, bucket, key, deadline, stats, max_attempts, backoff_s, max_backoff_s, sleep, rand)
+    hdr, _, n_eff = _read_header(rg, stats)
+    idx = _required_signal_index(hdr, required)
+    if len(idx) < min_active:
+        raise _StreamError(FailureReason.NO_EEG_CHANNELS)
+    limit_s = min(float(max_search_s), n_eff * hdr.record_duration)
+    n_blocks = int(np.floor(limit_s / block_s + 1e-9))
+    stride = max(1, int(round(probe_every_s / block_s)))
+
+    def counts(k0: int, k1: int) -> np.ndarray:
+        r_a = int(np.floor(k0 * block_s / hdr.record_duration + 1e-9))
+        r_b = min(n_eff, int(np.ceil(k1 * block_s / hdr.record_duration - 1e-9)))
+        if r_b <= r_a:
+            return np.zeros(k1 - k0, int)
+        pos, end, parts = hdr.header_bytes + r_a * hdr.record_bytes, hdr.header_bytes + r_b * hdr.record_bytes - 1, []
+        while pos <= end:
+            e = min(end, pos + chunk_bytes - 1)
+            parts.append(rg.get(pos, e))
+            pos = e + 1
+        return _active_counts(hdr, b"".join(parts), r_a, k0, k1, block_s, idx)
+
+    prev = -1                                              # last probed block known to be inactive
+    for k in range(0, n_blocks, stride):
+        deadline.check()
+        if counts(k, k + 1)[0] >= min_active:
+            if k - prev > 1:                               # scan the unprobed blocks between prev and k
+                c = counts(prev + 1, k)
+                hit = np.flatnonzero(c >= min_active)
+                if hit.size:
+                    return OnsetResult((prev + 1 + int(hit[0])) * block_s, None, limit_s)
+            return OnsetResult(k * block_s, None, limit_s)
+        prev = k
+    if n_blocks - prev > 1:                                # tail after the last probe, in full
+        c = counts(prev + 1, n_blocks)
+        hit = np.flatnonzero(c >= min_active)
+        if hit.size:
+            return OnsetResult((prev + 1 + int(hit[0])) * block_s, None, limit_s)
+    return OnsetResult(None, FailureReason.NO_SIGNAL_ONSET, limit_s)
+
+
+def onset_offset_s(s3, key: str, *, bucket: str | None = None, **kw) -> float | None:
+    """Signal-onset offset of one EDF in seconds from the FILE start, or ``None`` (no onset within the search limit, or
+    the file could not be read). Never raises for data / network problems. t0 for the cohort / feature join is
+    ``metadata start + onset offset`` (D-108). The value is per recording: store it only under ``local_only/`` and
+    report it as quantiles."""
+    try:
+        return find_signal_onset(s3, key, bucket=bucket, **kw).onset_s
+    except (_StreamError, RecordingTimeout):
+        return None
+    except Exception:                                      # noqa: BLE001
+        return None
+
+
 def _augment_rows(rows: list[dict], qc: dict[str, WindowQC]) -> list[dict]:
     """Add scalar QC flag columns (flag prevalence among minimum-set cells, coverage, disconnected channels)."""
     out = []
@@ -471,21 +592,40 @@ def stream_features(s3, key: str, *, bucket: str | None = None, windows=None, qc
                     compute_failed: bool = False, timeout_s: float | None = DEFAULT_TIMEOUT_S,
                     max_attempts: int = DEFAULT_MAX_ATTEMPTS, backoff_s: float = 1.0, max_backoff_s: float = 30.0,
                     sleep=time.sleep, rand=random.random, chunk_bytes: int = CHUNK_BYTES,
-                    max_fetch_bytes: int = MAX_FETCH_BYTES, clock=time.monotonic) -> StreamResult:
+                    max_fetch_bytes: int = MAX_FETCH_BYTES, clock=time.monotonic, onset_search: bool = True,
+                    onset_max_search_s: float = ONSET_MAX_SEARCH_S, onset_min_active: int = ONSET_MIN_ACTIVE
+                    ) -> StreamResult:
     """Features for one S3 EDF, reading only the primary window (default minutes 1-11) plus filter padding.
 
+    t0 is the EEG SIGNAL ONSET (D-108), not the file start: with ``onset_search`` (default) the first 10-s block with
+    at least ``onset_min_active`` of the 10 required electrodes non-constant is found within the first
+    ``onset_max_search_s`` (``find_signal_onset``) and every window is placed relative to it (primary = onset + 1 min to
+    onset + 11 min). No onset in the limit -> ``no_signal_onset`` (permanent). ``StreamResult.onset_s`` is the onset
+    offset from the file start. ``onset_search=False`` restores file-start windows.
+
     Never raises for data / network / timeout problems; see ``StreamResult.reason``. ``windows`` defaults to the
-    primary window plus the nested windows (all inside the primary window)."""
+    primary window plus the nested windows (all inside the primary window), relative to t0."""
     t_start = clock()
     windows = dict(windows or all_windows())
-    start = max(0.0, min(w.start_s for w in windows.values()) - PAD_S)
-    end = max(w.end_s for w in windows.values()) + PAD_S
     deadline = Deadline(timeout_s, clock=clock)
     stats = FetchStats()
     res = StreamResult(ok=False)
     stage = "fetch"
     try:
         with deadline.alarm():
+            onset = 0.0
+            if onset_search:
+                on = find_signal_onset(s3, key, bucket=bucket, deadline=deadline, stats=stats,
+                                       max_attempts=max_attempts, backoff_s=backoff_s, max_backoff_s=max_backoff_s,
+                                       sleep=sleep, rand=rand, chunk_bytes=chunk_bytes,
+                                       max_search_s=onset_max_search_s, min_active=onset_min_active)
+                if on.onset_s is None:
+                    raise _StreamError(on.reason or FailureReason.NO_SIGNAL_ONSET)
+                onset = float(on.onset_s)
+            res.onset_s = onset
+            windows = {k: WindowSpec(w.name, w.start_s + onset, w.duration_s) for k, w in windows.items()}
+            start = max(0.0, min(w.start_s for w in windows.values()) - PAD_S)
+            end = max(w.end_s for w in windows.values()) + PAD_S
             rec = fetch_window(s3, key, start, end - start, bucket=bucket, deadline=deadline, stats=stats,
                                max_attempts=max_attempts, backoff_s=backoff_s, max_backoff_s=max_backoff_s,
                                sleep=sleep, rand=rand, chunk_bytes=chunk_bytes, max_fetch_bytes=max_fetch_bytes)
