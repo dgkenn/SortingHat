@@ -8,6 +8,9 @@ Prints table / column / prefix NAMES only: CSV header lines, parquet footers (na
 ``Delimiter='/'`` prefix listings that never enter per-patient folders. No row, value, count, date or ID.
 """
 import sys
+from pathlib import Path
+
+sys.path.insert(0, str(Path(__file__).resolve().parents[1]))     # repo root, so `sortinghat` imports
 
 from sortinghat.audit import field_audit
 
