@@ -43,6 +43,7 @@ START_MISSING = {"S0001": 0.02, "S0002": 0.05, "I0003": 0.02, "I0002": 0.02, "I0
 MAR_COVERAGE = {"S0001": 0.93, "S0002": 0.55, "I0003": 0.85, "I0002": 0.70, "I0008": 0.60, "I0009": 0.60}
 IMG_FINAL_MISSING = {"S0001": 0.04, "S0002": 0.06, "I0003": 0.20, "I0002": 0.08, "I0008": 0.10, "I0009": 0.10}
 SCORE_NEAR = {"S0001": 0.75, "S0002": 0.60, "I0003": 0.35, "I0002": 0.50, "I0008": 0.40, "I0009": 0.40}
+NO_CLASS_TIME_SITES = {"I0002", "I0008", "I0009"}   # no usable time proxy (date-only EEGDate / no reports_findings) when start is missing
 METADATA_START_SITES = {"I0008", "I0009"}        # real start/end live in eeg_metadata (StartDateTime/EndDateTime); no reports_findings
 # canonical names mapped by ANY site variant: a site that lacks one gets it blanked (it has no such header column)
 _MAPPED = {t: {c for v in schema.SITE_VARIANTS.values() for c in ((v.eeg_metadata if t == "eeg_metadata"
@@ -167,7 +168,9 @@ def generate(n_patients: int = 3000, seed: int = 20260101):
                 "BDSPLastModifiedDTS": pd.Timestamp("2026-04-30 06:00:00"),
                 "BidsFlag": "True",
                 # analytic only: in NO real eeg_metadata header (PatientClass is derived from visit_occurrence on disk)
-                "PatientClass": classes[k], "ReferralIndication": str(rng.choice(INDICATIONS)),
+                # (blank where no timestamp of any kind exists to match a visit: start missing at I0002 / I0008 / I0009)
+                "PatientClass": None if (miss and site in NO_CLASS_TIME_SITES) else classes[k],
+                "ReferralIndication": str(rng.choice(INDICATIONS)),
             }
             R["eeg_metadata"].append(_only_available("eeg_metadata", site, row))
             truth["no_start_sessions"] += int(miss)
@@ -178,7 +181,7 @@ def generate(n_patients: int = 3000, seed: int = 20260101):
                       "AgeAtVisit": round(age, 2), "AgeInDaysAtVisit": float(round(age * 365.25)), "SexDSC": sex,
                       schema.SERVICE_EEG: svc, "SiteID": site,
                       "ReportCreationTime": end + pd.Timedelta(hours=float(rng.uniform(1, 30))),
-                      "ReportEEGDateTime": st.normalize() if site == "I0002" else st,
+                      "ReportEEGDateTime": st, "ReportEEGDate": st.normalize(),
                       "ReportProcedureDate": st.normalize(),
                       "ReportEncounterDTS": st - pd.Timedelta(hours=float(rng.uniform(0, 6))),
                       "ReportBeginDTS": st, "ReportExamEndDTS": end,

@@ -58,7 +58,9 @@ def test_cli_through_data_io_matches_in_memory(synth, audit_run):
 def test_start_time_comes_from_findings_and_pid_from_bids_folder(synth, analytic):
     eeg = analytic["eeg_metadata"]
     raw = synth[0]["eeg_metadata"]
-    assert raw["StartTime"].isna().all()                                       # blank in the real table
+    md = raw["SiteID"].isin(["I0008", "I0009"])
+    assert raw.loc[~md, "StartTime"].isna().all()                              # blank in the real table (S-sites, I0002/3)
+    assert raw.loc[md, "StartTime"].notna().mean() > 0.9                       # I0008/I0009: the real start (StartDateTime)
     assert eeg["StartTime"].notna().mean() > 0.9
     assert eeg["person_id"].notna().all()                                      # BDSPPatientID blank for S0001/S0002
     assert set(eeg["person_id"]) == set(synth[0]["omop_person"]["person_id"])

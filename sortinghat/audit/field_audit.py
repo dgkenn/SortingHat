@@ -97,13 +97,15 @@ def visit_class(concept_id, source_value) -> str | None:
 
 def derive_patient_class(eeg: pd.DataFrame, visits: pd.DataFrame) -> pd.Series:
     """``PatientClass`` for each EEG session, derived from ``omop_visit_occurrence`` (no real eeg_metadata header has
-    PatientClass): the visit of the same person with the latest ``visit_start_datetime`` <= the EEG start, kept
-    only if it has not ended before the EEG started. Index = ``eeg`` index; unmatched sessions are ``None``."""
+    PatientClass): the visit of the same person with the latest ``visit_start_datetime`` <= the EEG time
+    (``ClassTime``: the start, else reports_findings ``ReportBeginDTS`` / ``ReportEEGDateTime``), kept only if it
+    has not ended before then. Sessions with no time at all (I0008/I0009 with a missing start) stay unclassified. Index = ``eeg`` index; unmatched sessions are ``None``."""
     out = pd.Series(None, index=eeg.index, dtype=object)
     need = {"person_id", "visit_start_datetime"}
     if not len(visits) or not need <= set(visits):
         return out
-    e = eeg[["person_id", "StartTime"]].dropna().assign(_i=lambda d: d.index)
+    tcol = "ClassTime" if "ClassTime" in eeg else "StartTime"
+    e = eeg[["person_id", tcol]].rename(columns={tcol: "StartTime"}).dropna().assign(_i=lambda d: d.index)
     v = visits.dropna(subset=["person_id", "visit_start_datetime"]).copy()
     if not len(e) or not len(v):
         return out
@@ -138,13 +140,20 @@ def merge_eeg(meta: pd.DataFrame, findings: pd.DataFrame | None, site: str) -> p
     if findings is not None and len(findings):
         f = pd.DataFrame({"person_id": person_ids(findings, site), "SessionID": findings["SessionID"].astype("string"),
                           "f_start": findings.get(START), "f_end": findings.get(END),
-                          "f_age": pd.to_numeric(findings.get("AgeAtVisit"), errors="coerce")})
+                          "f_age": pd.to_numeric(findings.get("AgeAtVisit"), errors="coerce"),
+                          "f_begin": findings["ReportBeginDTS"] if "ReportBeginDTS" in findings else pd.NaT,
+                          "f_eegdt": findings["ReportEEGDateTime"] if "ReportEEGDateTime" in findings else pd.NaT})
         f = f.sort_values("f_start", na_position="last").drop_duplicates(["person_id", "SessionID"])
         m = m.merge(f, on=["person_id", "SessionID"], how="left")
         m["AgeAtVisit"] = m["f_age"].fillna(m["AgeAtVisit"])
         m["StartTime"] = m["f_start"].fillna(m["StartTime"])
         m["EndTime"] = m["f_end"].fillna(m["EndTime"])
-        m = m.drop(columns=["f_start", "f_end", "f_age"])
+        # time used ONLY to match a visit when StartTime is missing (so the class of such a session is still known)
+        m["ClassTime"] = pd.to_datetime(m["StartTime"]).fillna(pd.to_datetime(m["f_begin"])).fillna(
+            pd.to_datetime(m["f_eegdt"])).astype("datetime64[us]")
+        m = m.drop(columns=["f_start", "f_end", "f_age", "f_begin", "f_eegdt"])
+    if "ClassTime" not in m:
+        m["ClassTime"] = m["StartTime"]
     return m
 
 
@@ -213,7 +222,7 @@ def load_audit_tables(s3, sites: list[str] | None = None, avail: dict | None = N
     if not eeg["PatientClass"].notna().any():
         # No real eeg_metadata header has PatientClass: derive it from visit_occurrence for the adult sessions that
         # have a start time (the acute-care cohort is a subset of these), then apply the acute-care filter.
-        e0 = eeg[(eeg["AgeAtVisit"] >= ADULT_AGE) & eeg["StartTime"].notna() & eeg["person_id"].notna()]
+        e0 = eeg[(eeg["AgeAtVisit"] >= ADULT_AGE) & eeg["ClassTime"].notna() & eeg["person_id"].notna()]
         pids = [int(p) for p in e0["person_id"].unique()]
         vcols = ["person_id", "visit_start_datetime", "visit_end_datetime", "visit_concept_id", "visit_source_value"]
         vb = [b.to_pandas() for b in data_io.iter_omop_batches("visit_occurrence", person_ids=pids, columns=vcols, s3=s3)]

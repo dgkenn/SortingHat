@@ -115,7 +115,8 @@ SCHEMA: dict[str, list[tuple[str, str, str, str]]] = {
          (SERVICE_EEG, "str", C, "OR / EMU / Routine / LTM. S-sites only (absent at I0002, I0003)"),
          ("SiteID", "str", C, "S-sites only"),
          ("ReportCreationTime", "datetime", C, "header CreationTime(EEG); every site that has the file"),
-         ("ReportEEGDateTime", "datetime", C, "I0003 header EEGDateTime(Reports); I0002 header EEGDate(Reports) (date only)"),
+         ("ReportEEGDateTime", "datetime", C, "I0003 only; header EEGDateTime(Reports) (possible start-time fallback)"),
+         ("ReportEEGDate", "datetime", C, "I0002 only; header EEGDate(Reports); date only (not a time proxy)"),
          ("ReportProcedureDate", "datetime", C, "I0003 only; header ProcedureDate(Reports)"),
          ("ReportEncounterDTS", "datetime", C, "S-sites only; header EncounterDTS(Reports); encounter timestamp"),
          ("ReportBeginDTS", "datetime", C, "S-sites only; header BeginDTS(Reports); exam begin (possible start-time fallback)"),
@@ -320,7 +321,7 @@ SITE_VARIANTS: dict[str, SiteVariant] = {v.key: v for v in (
                  "DeidentifiedName(Reports)": None},
                 "BDSPPatientID blank in some releases (derive from BidsFolder). eeg_metadata StartTime/EndTime blank."),
     SiteVariant("I0002", ("I0002",), _I0002_EEG,
-                {**_RF_BASE, "CreationTime(EEG)": "ReportCreationTime", "EEGDate(Reports)": "ReportEEGDateTime",
+                {**_RF_BASE, "CreationTime(EEG)": "ReportCreationTime", "EEGDate(Reports)": "ReportEEGDate",
                  "DeidentifiedName(Reports)": None},
                 "No ServiceName, no DateOfDeath, no EEGFolder; reports_findings has no ServiceName(EEG)."),
     SiteVariant("I0003", ("I0003",), _I0003_EEG,
@@ -397,7 +398,7 @@ ROLE_COLUMNS: dict[str, str] = {
     "order vs administration": "omop_drug_exposure.drug_type_concept_id (+ route_source_value, drug_exposure_end_datetime); semantics need a concept join",
     "patient class": "DERIVED from omop_visit_occurrence.visit_concept_id / visit_source_value (+ admitted_from_*) by time overlap",
     "referral / indication": "NONE (nearest: reports_findings.ProcedureDSC(Reports) at S-sites, an EEG-type description)",
-    "EEG start fallbacks": "reports_findings ReportBeginDTS (S-sites), ReportEEGDateTime (I0002 date only, I0003); eeg_metadata StartTime at I0008/I0009",
+    "EEG start fallbacks": "reports_findings ReportBeginDTS (S-sites), ReportEEGDateTime (I0003); I0002 has only the date ReportEEGDate; eeg_metadata StartTime at I0008/I0009",
     "age at visit": "reports_findings.AgeAtVisit; I0003 AgeInDaysAtVisit; I0008/I0009 DateOfBirth with StartTime",
 }
 
