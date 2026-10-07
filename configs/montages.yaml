@@ -1,0 +1,208 @@
+# Study 2 montage geometries (deployable hardware simulated from 19-ch 10-20 recordings)
+# Generated 2026-10-07. See docs/research/montage_geometries.md for sources and caveats.
+# Conventions:
+#   - 10-20 aliases: T3=T7, T4=T8, T5=P7, T6=P8. Source-19 labels use T3/T4/T5/T6.
+#   - confidence: high | medium | low. Unverified items are low; nothing here is guessed silently.
+#   - derivations: [anode, cathode]. Special cathode tokens (resolved at build time):
+#       REF_AFz_APPROX  = 0.25*Fp1 + 0.25*Fp2 + 0.5*Fz
+#       REF_LINKED_EAR  = mean(A1, A2) if present in recording, else fallback in approximation_notes
+#   - vendor_documented_derivations: true only when the derivations come from vendor/peer-reviewed text.
+#   - sampling_rate_hz: device acquisition rate (not the rate the study pipeline resamples to).
+source_channels_19:
+  [Fp1, Fp2, F7, F3, Fz, F4, F8, T3, C3, Cz, C4, T4, T5, P3, Pz, P4, T6, O1, O2]
+
+geometries:
+  full_19ch_1020:
+    name: full_19ch_1020
+    description: "Standard 19-channel 10-20 reference geometry, longitudinal bipolar (double banana) plus midline chain."
+    source_url: https://en.wikipedia.org/wiki/10%E2%80%9320_system_(EEG)
+    confidence: high
+    electrodes: [Fp1, Fp2, F7, F3, Fz, F4, F8, T3, C3, Cz, C4, T4, T5, P3, Pz, P4, T6, O1, O2]
+    reference_scheme: "Source-dependent referential recording (TUEG: mostly linked-ear/average; verify per file); analysis montage is bipolar so reference cancels."
+    sampling_rate_hz: null   # dataset-dependent
+    vendor_documented_derivations: false   # standard clinical convention (double banana)
+    derivations:
+      - [Fp1, F7]
+      - [F7, T3]
+      - [T3, T5]
+      - [T5, O1]
+      - [Fp2, F8]
+      - [F8, T4]
+      - [T4, T6]
+      - [T6, O2]
+      - [Fp1, F3]
+      - [F3, C3]
+      - [C3, P3]
+      - [P3, O1]
+      - [Fp2, F4]
+      - [F4, C4]
+      - [C4, P4]
+      - [P4, O2]
+      - [Fz, Cz]
+      - [Cz, Pz]
+    approximation_notes: "Reference geometry; no approximation."
+
+  ceribell_headband_10el:
+    name: ceribell_headband_10el
+    description: "Ceribell Instant EEG Headband (hairline ring) with Pocket EEG (8 bipolar channels, lateral chains only; no midline, no parasagittal)."
+    source_url:
+      - https://fda.innolitics.com/device/K210805   # 510(k) K210805 comparison table lists the 10 locations (mirror of FDA summary)
+      - https://fda.innolitics.com/device/K191301   # Pocket EEG: 8 channels, 10 electrodes (5 left, 5 right)
+      - https://pmc.ncbi.nlm.nih.gov/articles/PMC7735649/   # DECIDE, Crit Care Med 2020: bipolar montage, channel pairs, 250 Hz, 0.5-100 Hz
+      - https://www.frontiersin.org/journals/neurology/articles/10.3389/fneur.2022.915385/pdf   # 10-electrode array, 8-ch bipolar, lateral chains
+    confidence: medium   # electrode list + channel pairs vendor/peer-reviewed; reference/ground NOT found
+    electrodes: [Fp1, F7, T3, T5, O1, Fp2, F8, T4, T6, O2]
+    reference_scheme: "Bipolar display; amplifier reference and ground sites NOT documented in any source found (unknown). Bipolar derivations are reference-independent, so simulation is unaffected."
+    sampling_rate_hz: 250   # DECIDE paper: 250 Hz, 0.5-100 Hz response (confidence medium; not seen in IFU)
+    vendor_documented_derivations: true   # DECIDE paper states channels "approximately" Fp1-F7, F7-T3, T3-T5, T5-O1 / Fp2-F8, F8-T4, T4-T6, T6-O2
+    derivations:
+      - [Fp1, F7]
+      - [F7, T3]
+      - [T3, T5]
+      - [T5, O1]
+      - [Fp2, F8]
+      - [F8, T4]
+      - [T4, T6]
+      - [T6, O2]
+    approximation_notes: "All 10 electrodes map to standard 10-20 labels (T3/T4/T5/T6 = T7/T8/P7/P8). Vendor papers say the channels 'approximate' these sites because the band is a fixed-spacing hairline ring, so true positions may be slightly displaced (esp. T5/T6, O1/O2 sit near the inion level). Simulate by exact channel subset of the 19-ch recording; optionally test sensitivity with spherical-spline-interpolated sites shifted ~1 cm. Fz/Cz/Pz and the parasagittal chains are removed."
+
+  ceribell_headcap:
+    name: ceribell_headcap
+    description: "Ceribell Instant EEG Headcap (K223086). Variable electrode count; individual labels not published in sources found."
+    source_url: https://fda.innolitics.com/device/K223086
+    confidence: low   # count range only; labels, reference, ground, rate not found
+    electrodes: [Fp1, Fp2, F7, F3, Fz, F4, F8, T3, C3, Cz, C4, T4, T5, P3, Pz, P4, T6, O1, O2]   # ASSUMED upper bound (19); not vendor-documented
+    reference_scheme: "Unknown (not found)."
+    sampling_rate_hz: null
+    vendor_documented_derivations: false
+    derivations:
+      - [Fp1, F7]
+      - [F7, T3]
+      - [T3, T5]
+      - [T5, O1]
+      - [Fp2, F8]
+      - [F8, T4]
+      - [T4, T6]
+      - [T6, O2]
+      - [Fp1, F3]
+      - [F3, C3]
+      - [C3, P3]
+      - [P3, O1]
+      - [Fp2, F4]
+      - [F4, C4]
+      - [C4, P4]
+      - [P4, O2]
+      - [Fz, Cz]
+      - [Cz, Pz]
+    approximation_notes: "510(k) summary states 9 to 19 Ag/AgCl electrodes placed per 10-20 or 10-10, count depends on clinical need (minimum 9). Which sites are used at 9 vs 19 was not found. Treat as identical to full_19ch_1020 until the IFU is obtained; do not report as a distinct geometry in results without that."
+
+  zeto_wr19:
+    name: zeto_wr19
+    description: "Zeto WR19 dry-electrode headset (K172735); full-montage 19 + DRL, 10-20."
+    source_url: https://fda.innolitics.com/device/K172735
+    confidence: medium   # count/system/rate/ground from 510(k); per-site labels not printed in text retrieved
+    electrodes: [Fp1, Fp2, F7, F3, Fz, F4, F8, T3, C3, Cz, C4, T4, T5, P3, Pz, P4, T6, O1, O2]   # inferred: "19 dry electrodes, 10-20 system"
+    reference_scheme: "Up to 19 referential channels (reference site not named); software montages for display. 1 dedicated dry ground/DRL electrode, site not named."
+    sampling_rate_hz: 500
+    vendor_documented_derivations: false
+    derivations:
+      - [Fp1, F7]
+      - [F7, T3]
+      - [T3, T5]
+      - [T5, O1]
+      - [Fp2, F8]
+      - [F8, T4]
+      - [T4, T6]
+      - [T6, O2]
+      - [Fp1, F3]
+      - [F3, C3]
+      - [C3, P3]
+      - [P3, O1]
+      - [Fp2, F4]
+      - [F4, C4]
+      - [C4, P4]
+      - [P4, O2]
+      - [Fz, Cz]
+      - [Cz, Pz]
+    approximation_notes: "Geometrically equivalent to the standard 19 (assumed from '19 electrodes per 10-20'). Differences are hardware only: dry electrodes (higher impedance/noise) and unnamed reference; not simulated by channel deletion."
+
+  brainscope_ahead:
+    name: brainscope_ahead
+    description: "BrainScope Ahead / BrainScope One forehead headset (Ahead 200/300/400/500); disposable Ag/AgCl solid-gel sensor array."
+    source_url:
+      - https://fda.innolitics.com/device/K183241   # Ahead 400: positions Fp1, Fp2, Fpz, AFz, F7, F8, A1, A2; 1 kHz downsampled to 100 Hz
+      - https://fda.innolitics.com/device/K161068   # Ahead 300: same list; same sampling
+    confidence: medium   # list quoted from 510(k) mirrors (K183241, K161068); reference/ground not specified
+    electrodes: [Fp1, Fp2, Fpz, AFz, F7, F8, A1, A2]
+    reference_scheme: "NOT specified in sources. A1/A2 are ear-lobe sites; roles (reference/ground vs recording) unknown. Simulation assumption (not vendor documented): linked-ear reference."
+    sampling_rate_hz: 1000   # downsampled to 100 Hz for algorithm processing
+    vendor_documented_derivations: false
+    derivations:   # ASSUMED referential-to-linked-ear; flagged low
+      - [Fp1, REF_LINKED_EAR]
+      - [Fp2, REF_LINKED_EAR]
+      - [F7, REF_LINKED_EAR]
+      - [F8, REF_LINKED_EAR]
+      - [Fpz, REF_LINKED_EAR]
+      - [AFz, REF_LINKED_EAR]
+    approximation_notes: "Not in 19-ch set: Fpz, AFz, A1, A2. Fpz ~= (Fp1+Fp2)/2 (midline; spherical-spline interpolation preferred, nearest-neighbor average acceptable). AFz ~= 0.25*Fp1 + 0.25*Fp2 + 0.5*Fz (midway Fpz-Fz; or spherical spline). A1/A2: use recorded A1/A2 if the source has them (some TUEG files do); otherwise approximate with the average of all 19 channels (average reference) because T3/T4 are poor proxies for ear-lobe signal; mark results as sensitivity. Directly mappable: Fp1, Fp2, F7, F8. The mapping of the 'five forehead regions' in news reports to these 8 sites is unverified."
+
+  masimo_sedline_psi_legacy:
+    name: masimo_sedline_psi_legacy
+    description: "Physiometrix/Masimo SedLine PSA frontal 4-channel array (K033999, 2004 validation study)."
+    source_url:
+      - https://fda.innolitics.com/device/K033999   # 510(k): F7, F8, Fp1, Fp2, AFz inputs (mirror)
+      - https://www.masimo.fr/siteassets/us/documents/pdf/clinical-evidence/sedline/drover-validation-of-the-eeg-electrode-placement-for-the-patient-state-index-oct-2004.pdf   # final: FP1, FP2, F7, F8, reference AFz
+    confidence: medium   # 2004 source; may not describe the current commercial sensor
+    electrodes: [Fp1, Fp2, F7, F8]
+    reference_scheme: "Referential to AFz (reference). Ground site not documented."
+    sampling_rate_hz: null   # not found
+    vendor_documented_derivations: true   # four channels referenced to AFz (paper abstract)
+    derivations:
+      - [Fp1, REF_AFz_APPROX]
+      - [Fp2, REF_AFz_APPROX]
+      - [F7, REF_AFz_APPROX]
+      - [F8, REF_AFz_APPROX]
+    approximation_notes: "AFz is not in the 19-ch set: AFz ~= 0.25*Fp1 + 0.25*Fp2 + 0.5*Fz (or spherical spline). Cheaper alternative: bipolar Fp1-F7 / Fp2-F8 / Fp1-Fp2 / F7-F8 from the exact channels (loses AFz referencing)."
+
+  masimo_sedline_current:
+    name: masimo_sedline_current
+    description: "Current Masimo SedLine sensor: 6 gelled electrodes, 4 active channels (L1, L2, R1, R2), CT reference, CB ground (per Masimo eIFU). Mapping to 10-20 labels NOT verified."
+    source_url:
+      - https://techdocs.masimo.com/globalassets/techdocs/pdf/lab-8473d-eifu.pdf   # fetch failed (size limit); described via search snippet only
+      - https://clinicaltrials.gov/study/NCT03947060   # protocol: "FP1, FP2, F7, F8, FPZ and AFZ" sensor-array locations (conflicts with 2004 list on FPz)
+    confidence: low
+    electrodes: [Fp1, Fp2, F7, F8]   # presumed same footprint as legacy PSA; unverified for current sensor
+    reference_scheme: "Reference CT, ground CB (vendor labels; scalp sites unverified; legacy reference was AFz)."
+    sampling_rate_hz: null
+    vendor_documented_derivations: false
+    derivations:
+      - [Fp1, REF_AFz_APPROX]
+      - [Fp2, REF_AFz_APPROX]
+      - [F7, REF_AFz_APPROX]
+      - [F8, REF_AFz_APPROX]
+    approximation_notes: "Treat as alias of masimo_sedline_psi_legacy until the eIFU placement figure is read. FPz in the protocol would be (Fp1+Fp2)/2."
+
+  medtronic_bis:
+    name: medtronic_bis
+    description: "Medtronic BIS Quatro / bilateral forehead sensors. Electrode-to-10-20 mapping NOT verified."
+    source_url:
+      - https://www.medtronic.com/en-us/healthcare-professionals/products/patient-monitoring/brain-monitoring/brain-sensors/bis-quatro-sensor.html
+    confidence: low
+    electrodes: []   # intentionally empty: no source found that maps BIS electrodes to 10-20 labels
+    reference_scheme: "Unknown. Quatro has 4 electrodes incl. a distinct ground electrode (patent numbering only)."
+    sampling_rate_hz: null
+    vendor_documented_derivations: false
+    derivations: []
+    approximation_notes: "Do not simulate until the sensor IFU placement diagram (186-0106 / 186-0212) is obtained. If a stand-in is needed, use masimo_sedline_psi_legacy-style frontal subset (Fp1, Fp2, F7, F8) and label it a surrogate, not BIS."
+
+  not_verified_systems:
+    name: not_verified_systems
+    description: "Requested but no electrode specification found in this pass: StatNet, BraiNet templates, Neuronostics/CereScope, Persyst-compatible headsets, EMU rapid-response products, Rhythm."
+    source_url: null
+    confidence: low
+    electrodes: []
+    reference_scheme: unknown
+    sampling_rate_hz: null
+    vendor_documented_derivations: false
+    derivations: []
+    approximation_notes: "Not researched to a source; excluded from simulation."
