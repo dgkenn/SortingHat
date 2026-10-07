@@ -1,0 +1,134 @@
+# Objective-anchor rules for silver positives (research plan v1, "Silver labels: the circularity rules";
+# DECISION_LOG D-009). Every silver positive for E1, E2, E4a, E5, E6, E7 needs >=1 satisfied anchor.
+#
+# STATUS: every clinical threshold and window below is PROPOSED — needs co-investigator sign-off.
+#   Nothing here has been checked against data. LOINC codes are listed only where the author is
+#   confident of the code; `loinc: []` means "map locally". Verify all against the local concept map.
+#
+# Semantics
+#   item          key in the anchor event table (see sortinghat/labels/anchors.py); real extraction maps
+#                 OMOP measurement/drug/condition/procedure rows to these keys (LOINC -> item below).
+#   window_hours  [start, end] relative to t0 (EEG start); negative = before t0. Event time must lie
+#                 in the closed window. Windows are PROPOSED.
+#   test          lab_threshold: value <op> threshold (op in lt, le, gt, ge) in `unit`
+#                 event: item present (optionally value >= 1 as a boolean flag)
+#   all_of/any_of composite rules; `exclude_if_label` removes the positive if that label's anchor fires
+#                 (E6 "without CNS infection").
+#   Anchors may use information after t0 (labels name the cause of the state at t0); the windows bound it.
+version: 1
+status: "PROPOSED — needs co-investigator sign-off"
+t0_definition: "EEG start time"
+
+items:           # item -> LOINC (confident only) and canonical unit
+  ammonia:       {loinc: ["16362-6"], unit: "umol/L"}
+  bun:           {loinc: ["3094-0"],  unit: "mg/dL"}
+  creatinine:    {loinc: ["2160-0"],  unit: "mg/dL"}
+  glucose:       {loinc: ["2345-7", "2339-0", "41653-7"], unit: "mg/dL"}   # serum/plasma, blood, capillary POC
+  sodium:        {loinc: ["2951-2", "2947-0"], unit: "mmol/L"}
+  paco2:         {loinc: ["2019-8"], unit: "mmHg"}
+  ph_arterial:   {loinc: ["2744-1"], unit: "pH"}
+  calcium:       {loinc: ["17861-6"], unit: "mg/dL"}
+  lactate:       {loinc: ["2524-7", "32693-4"], unit: "mmol/L"}
+  wbc:           {loinc: ["6690-2"], unit: "10*3/uL"}
+  temp_c:        {loinc: ["8310-5"], unit: "Cel"}
+  heart_rate:    {loinc: ["8867-4"], unit: "/min"}
+  resp_rate:     {loinc: ["9279-1"], unit: "/min"}
+  blood_culture_pos: {loinc: ["600-7"], unit: "flag"}          # organism identified in blood culture
+  csf_wbc:       {loinc: ["26464-8"], unit: "cells/uL"}
+  csf_protein:   {loinc: ["2880-3"], unit: "mg/dL"}
+  csf_glucose:   {loinc: ["2342-4"], unit: "mg/dL"}
+  csf_culture_pos: {loinc: [], unit: "flag"}
+  csf_pcr_pos:   {loinc: [], unit: "flag"}                      # HSV/VZV/enterovirus/meningitis panel positive
+  csf_autoimmune_ab_pos: {loinc: [], unit: "flag"}              # NMDAR etc. in CSF or serum
+  ethanol_serum: {loinc: ["5643-2"], unit: "mg/dL"}
+  acetaminophen: {loinc: ["3298-7"], unit: "ug/mL"}
+  salicylate:    {loinc: ["4024-6"], unit: "mg/dL"}
+  tox_screen_positive_nontherapeutic: {loinc: [], unit: "flag"} # urine/serum screen for agent not given in hospital
+  antidote_response: {loinc: [], unit: "flag"}                  # naloxone/flumazenil/physostigmine/etc. given AND documented response
+  arrest_event:  {loinc: [], unit: "flag"}                      # CPR procedure / ROSC / cardiac arrest documented
+  profound_shock: {loinc: [], unit: "flag"}                     # sustained MAP<50 or >=2 vasopressors
+  asphyxia_event: {loinc: [], unit: "flag"}                     # hanging/drowning/choking/CO event
+  suspected_infection: {loinc: [], unit: "flag"}                # culture drawn + antibiotics started
+  # Imaging findings parsed from radiology reports (NOT EEG-derived). Flags.
+  imaging_ich:         {loinc: [], unit: "flag"}
+  imaging_sah:         {loinc: [], unit: "flag"}
+  imaging_sdh_edh:     {loinc: [], unit: "flag"}
+  imaging_infarct:     {loinc: [], unit: "flag"}
+  imaging_tbi_contusion: {loinc: [], unit: "flag"}
+  imaging_mass_effect: {loinc: [], unit: "flag"}                # herniation/midline shift/tumour with edema
+
+labels:
+  E1:
+    description: "Acute structural: imaging finding"
+    any_of:
+      - {id: E1_ich,        item: imaging_ich,          test: event, window_hours: [-72, 24]}
+      - {id: E1_sah,        item: imaging_sah,          test: event, window_hours: [-72, 24]}
+      - {id: E1_sdh_edh,    item: imaging_sdh_edh,      test: event, window_hours: [-72, 24]}
+      - {id: E1_infarct,    item: imaging_infarct,      test: event, window_hours: [-72, 24]}
+      - {id: E1_tbi,        item: imaging_tbi_contusion, test: event, window_hours: [-72, 24]}
+      - {id: E1_mass,       item: imaging_mass_effect,  test: event, window_hours: [-72, 24]}
+    sublabel_map: {focal: [imaging_ich, imaging_infarct, imaging_sdh_edh, imaging_tbi_contusion],
+                   diffuse: [imaging_sah, imaging_mass_effect]}
+  E2:
+    description: "Global hypoxic-ischemic: arrest event (or asphyxia / profound shock)"
+    any_of:
+      - {id: E2_arrest,   item: arrest_event,    test: event, window_hours: [-168, 0]}
+      - {id: E2_asphyxia, item: asphyxia_event,  test: event, window_hours: [-168, 0]}
+      - {id: E2_shock,    item: profound_shock,  test: event, window_hours: [-48, 0]}
+  E4a:
+    description: "Exogenous intoxication: toxicology or antidote response"
+    any_of:
+      - {id: E4a_antidote, item: antidote_response, test: event, window_hours: [-6, 6]}
+      - {id: E4a_tox,      item: tox_screen_positive_nontherapeutic, test: event, window_hours: [-24, 6]}
+      - {id: E4a_ethanol,  item: ethanol_serum, test: lab_threshold, op: ge, threshold: 300, unit: "mg/dL", window_hours: [-24, 6]}
+      - {id: E4a_apap,     item: acetaminophen, test: lab_threshold, op: ge, threshold: 150, unit: "ug/mL", window_hours: [-24, 6]}
+      - {id: E4a_salicylate, item: salicylate,  test: lab_threshold, op: ge, threshold: 30, unit: "mg/dL", window_hours: [-24, 6]}
+    note: "Tox positivity for a drug the team gave in hospital is E4b, not E4a; the extractor must drop in-hospital agents."
+  E5:
+    description: "Metabolic/physiologic: lab threshold with timing"
+    any_of:
+      - {id: E5_ammonia,    item: ammonia,     test: lab_threshold, op: ge, threshold: 100, unit: "umol/L", window_hours: [-24, 6]}
+      - {id: E5_bun,        item: bun,         test: lab_threshold, op: ge, threshold: 100, unit: "mg/dL",  window_hours: [-24, 6]}
+      - {id: E5_creatinine, item: creatinine,  test: lab_threshold, op: ge, threshold: 6.0, unit: "mg/dL",  window_hours: [-24, 6]}
+      - {id: E5_glucose_lo, item: glucose,     test: lab_threshold, op: lt, threshold: 50,  unit: "mg/dL",  window_hours: [-12, 6]}
+      - {id: E5_glucose_hi, item: glucose,     test: lab_threshold, op: gt, threshold: 600, unit: "mg/dL",  window_hours: [-24, 6]}
+      - {id: E5_na_lo,      item: sodium,      test: lab_threshold, op: lt, threshold: 120, unit: "mmol/L", window_hours: [-24, 6]}
+      - {id: E5_na_hi,      item: sodium,      test: lab_threshold, op: gt, threshold: 160, unit: "mmol/L", window_hours: [-24, 6]}
+      - {id: E5_paco2,      item: paco2,       test: lab_threshold, op: gt, threshold: 70,  unit: "mmHg",   window_hours: [-12, 6]}
+      - {id: E5_ph_lo,      item: ph_arterial, test: lab_threshold, op: lt, threshold: 7.10, unit: "pH",    window_hours: [-12, 6]}
+      - {id: E5_calcium_hi, item: calcium,     test: lab_threshold, op: gt, threshold: 14,  unit: "mg/dL",  window_hours: [-24, 6]}
+    note: "Hepatic/uremic thresholds additionally need clinician review of acute-on-chronic baselines (PROPOSED)."
+  E6:
+    description: "Systemic infection/inflammation without CNS infection (sepsis-associated)"
+    all_of:
+      - id: E6_suspected_infection
+        item: suspected_infection
+        test: event
+        window_hours: [-72, 24]
+      - any_of:   # organ dysfunction / systemic response (PROPOSED: lactate or >=2 SIRS-like findings)
+          - {id: E6_lactate, item: lactate, test: lab_threshold, op: ge, threshold: 2.0, unit: "mmol/L", window_hours: [-24, 6]}
+          - {id: E6_bacteremia, item: blood_culture_pos, test: event, window_hours: [-72, 24]}
+          - id: E6_sirs2
+            sirs_at_least: 2
+            window_hours: [-24, 6]
+            criteria:
+              - {item: temp_c,     any: [{op: gt, threshold: 38.0}, {op: lt, threshold: 36.0}]}
+              - {item: heart_rate, any: [{op: gt, threshold: 90}]}
+              - {item: resp_rate,  any: [{op: gt, threshold: 20}]}
+              - {item: wbc,        any: [{op: gt, threshold: 12.0}, {op: lt, threshold: 4.0}]}
+    exclude_if_label: E7
+  E7:
+    description: "CNS infection/inflammation: CSF or culture result"
+    any_of:
+      - {id: E7_csf_culture, item: csf_culture_pos, test: event, window_hours: [-72, 72]}
+      - {id: E7_csf_pcr,     item: csf_pcr_pos,     test: event, window_hours: [-72, 72]}
+      - {id: E7_autoimmune_ab, item: csf_autoimmune_ab_pos, test: event, window_hours: [-168, 168]}
+      - id: E7_csf_pleocytosis
+        all_of:
+          - {id: E7_csf_wbc, item: csf_wbc, test: lab_threshold, op: ge, threshold: 20, unit: "cells/uL", window_hours: [-72, 72]}
+          - id: E7_csf_support
+            any_of:
+              - {id: E7_csf_protein, item: csf_protein, test: lab_threshold, op: gt, threshold: 100, unit: "mg/dL", window_hours: [-72, 72]}
+              - {id: E7_csf_glucose, item: csf_glucose, test: lab_threshold, op: lt, threshold: 40,  unit: "mg/dL", window_hours: [-72, 72]}
+              - {id: E7_blood_culture, item: blood_culture_pos, test: event, window_hours: [-72, 72]}
+    note: "Cell-count rule is PROPOSED; traumatic taps and antibiotics pre-treatment need clinician rules."
