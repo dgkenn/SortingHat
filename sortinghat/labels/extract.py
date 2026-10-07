@@ -872,6 +872,8 @@ def _item_windows(anchor_cfg: dict) -> dict[str, list[float]]:
                 walk(c)
         if "item" in n:
             out[n["item"]] = n["window_hours"]
+            if n.get("rbc_correct"):                           # the same-tap RBC row rides on the WBC window
+                out[n["rbc_correct"]["item"]] = n["window_hours"]
     for lab in anchor_cfg["labels"].values():
         walk(lab)
     return out
@@ -921,6 +923,30 @@ def _apply_banned(ev: pd.DataFrame, ctx: _Ctx) -> pd.DataFrame:
     return ev[keep]
 
 
+def _anchor_table(ev: pd.DataFrame, case_ids: list, anchor_cfg: dict) -> pd.DataFrame:
+    """``anchors.silver_anchor_table`` on the events that can matter. ``anchors.py`` evaluates every rule per case with
+    pandas (~0.05 s per case), so cases with no event inside any anchor window skip it: they cannot fire, all labels False."""
+    wins = _item_windows(anchor_cfg)
+    labs = list(anchor_cfg["labels"])
+    if len(ev):
+        lo = ev["item"].map(lambda i: wins[i][0] if i in wins else np.inf).astype(float)
+        hi = ev["item"].map(lambda i: wins[i][1] if i in wins else -np.inf).astype(float)
+        rel = ev[(ev["hours_from_t0"] >= lo) & (ev["hours_from_t0"] <= hi)]
+    else:
+        rel = ev
+    have = set(rel["case_id"]) if len(rel) else set()
+    active = [c for c in case_ids if c in have]
+    t = silver_anchor_table(rel, case_ids=active, cfg=anchor_cfg) if active else \
+        pd.DataFrame(columns=labs, dtype=bool)
+    table = t.reindex(case_ids).fillna(False).astype(bool)
+    table.index.name = "case_id"
+    fired = dict(t.attrs.get("fired", {}))
+    for c in case_ids:
+        fired.setdefault(c, {lab: [] for lab in labs})
+    table.attrs["fired"] = fired
+    return table
+
+
 # ================================================================================================ result
 @dataclass
 class SilverResult:
@@ -959,7 +985,7 @@ def extract_silver(source, cohort: pd.DataFrame, *, config: ExtractConfig | None
             ev = ev.assign(acute=True)               # our rows are acute-filtered by code (chronic codes excluded)
         ev = pd.concat([ev, x], ignore_index=True)
     ev_for_anchors = ev[[c for c in ev.columns if c not in INTERNAL_EVENT_COLUMNS]]
-    table = silver_anchor_table(ev_for_anchors, case_ids=list(cases["case_id"]), cfg=anchor_cfg)
+    table = _anchor_table(ev_for_anchors, list(cases["case_id"]), anchor_cfg)
     lstat = label_status(cm, anchor_cfg)
     labels = table[[l for l in SILVER_CIRCULARITY_LABELS if l in table.columns]].astype("boolean")
     for lab, st in lstat.items():

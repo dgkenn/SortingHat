@@ -689,3 +689,21 @@ def test_runs_on_the_synthetic_generator_output():
     assert set(EVENT_COLUMNS) <= set(res.events.columns)
     rep = ex.silver_report(res)
     assert_aggregate_only(rep)
+
+
+# -------------------------------------------------------------------------------------------- config switches
+def test_unused_items_are_skipped_unless_requested_and_temperature_converts():
+    fx = Fx(); p = fx.person(1)
+    fx.lab(p, -2, "Temperature", 102.2, "degF")
+    assert len(fx.run().events) == 0                                                 # temp is used by no rule: not extracted
+    res = fx.run(config=ex.ExtractConfig(include_unused_items=True))
+    t = res.events[res.events["item"] == "temp_c"]
+    assert len(t) == 1 and t["value"].iloc[0] == pytest.approx(39.0, abs=1e-3)
+
+
+def test_name_fallback_can_be_switched_off():
+    fx = Fx(); p = fx.person(1)
+    fx.concept(9001, "Glucose [Mass/volume] in Serum or Plasma", "Measurement", "LOINC", "2345-7")
+    fx.lab(p, -2, "GLUCOSE", 30, "mg/dL")                                           # name only: concept id is zero-filled
+    assert fx.run().labels.loc["1", "E5"]
+    assert not fx.run(config=ex.ExtractConfig(allow_name_fallback=False)).labels.loc["1", "E5"]
