@@ -1,4 +1,4 @@
-"""Signal-onset search (D-108): files with leading constant padding / mid-file gaps, on SYNTHETIC EDFs only."""
+"""t0 = first sustained live segment (D-109): leading padding, short live blips, pauses, on SYNTHETIC EDFs only."""
 import importlib.util
 from pathlib import Path
 
@@ -74,46 +74,74 @@ def test_onset_after_leading_padding(tmp_path):
     r = onset(build(tmp_path, [("pad", 300), ("sig", 150)]))
     assert r.onset_s == 300.0 and r.reason is None
     assert onset(build(tmp_path, [("sig", 100)])).onset_s == 0.0
-    assert onset(build(tmp_path, [("pad", 305), ("sig", 100)])).onset_s == 300.0     # block containing the transition
-    assert onset(build(tmp_path, [("pad", 70), ("sig", 100)])).onset_s == 70.0       # between two coarse probes
+    # <= 3 constant 2-s epochs of the 30 still qualify (90% rule): a 305 s pad leaves 2 constant epochs in window 300
+    assert onset(build(tmp_path, [("pad", 305), ("sig", 100)])).onset_s == 300.0
+    assert onset(build(tmp_path, [("pad", 70), ("sig", 100)])).onset_s == 70.0       # window 60 has 5 constant epochs
     assert onset(build(tmp_path, [("pad", 125), ("sig", 100)])).onset_s == 120.0
+    assert onset(build(tmp_path, [("pad", 128), ("sig", 100)])).onset_s == 130.0     # window 120: 4 constant epochs
 
 
-def test_no_onset_when_always_constant_or_beyond_limit(tmp_path):
+def test_short_live_blip_then_hold_is_not_an_onset(tmp_path):
+    # 15 s of live signal at the start, then 200 s of constant hold, then the real recording
+    r = onset(build(tmp_path, [("sig", 15), ("pad", 200), ("sig", 300)]))
+    assert r.onset_s == 210.0                      # window 210 has 2 constant epochs (214); the blip never qualified
+    # a 50-s blip (long, but shorter than a 60-s segment) followed by a hold is not an onset either
+    r = onset(build(tmp_path, [("sig", 50), ("pad", 200), ("sig", 300)]))
+    assert r.onset_s == 250.0                      # window 0 holds the blip plus 5 constant epochs (> 3)
+
+
+def test_pause_inside_the_window_is_judged_by_the_90_percent_rule(tmp_path):
+    # a 6-s pause = 3 constant epochs of 30: the window still qualifies at t = 0
+    assert onset(build(tmp_path, [("sig", 30), ("pad", 6), ("sig", 300)])).onset_s == 0.0
+    # an 8-s pause = 4 constant epochs: every window holding all of it fails; the first clean window starts at 40
+    assert onset(build(tmp_path, [("sig", 30), ("pad", 8), ("sig", 300)])).onset_s == 40.0
+
+
+def test_no_onset_when_always_constant_blips_only_or_beyond_limit(tmp_path):
     r = onset(build(tmp_path, [("pad", 200)]))
-    assert r.onset_s is None and r.reason == FailureReason.NO_SIGNAL_ONSET
+    assert r.onset_s is None and r.reason == FailureReason.NO_SUSTAINED_SIGNAL
+    r = onset(build(tmp_path, [("sig", 20), ("pad", 200), ("sig", 20), ("pad", 200)]))      # only blips
+    assert r.onset_s is None and r.reason == FailureReason.NO_SUSTAINED_SIGNAL
+    r = onset(build(tmp_path, [("sig", 50)]))                                                # shorter than a segment
+    assert r.onset_s is None
     r = onset(build(tmp_path, [("pad", 400), ("sig", 100)]), max_search_s=300)
-    assert r.onset_s is None and r.reason == FailureReason.NO_SIGNAL_ONSET
+    assert r.onset_s is None and r.reason == FailureReason.NO_SUSTAINED_SIGNAL
     assert onset(build(tmp_path, [("pad", 400), ("sig", 100)]), max_search_s=600).onset_s == 400.0
-    assert FailureReason.NO_SIGNAL_ONSET in FailureReason.PERMANENT
+    assert FailureReason.NO_SUSTAINED_SIGNAL in FailureReason.PERMANENT
 
 
-def test_needs_eight_of_ten_required_electrodes(tmp_path):
+def test_needs_eight_of_ten_required_electrodes_live(tmp_path):
     required_idx = [CANONICAL_19.index(c) for c in DEFAULT_MINIMUM_CHANNELS]
     optional_idx = [i for i in range(19) if i not in required_idx]
-    # 7 required + all 9 optional active for 100 s: not enough; then 8 required: onset
     seven = optional_idx + required_idx[:7]
     eight = optional_idx + required_idx[:8]
-    blob = build(tmp_path, [("sig", 100)], active=seven)
-    assert onset(blob).onset_s is None
-    p = tmp_path
-    blob2 = np.concatenate([_signal(100)[:], _signal(100, 3)], axis=1)
-    for ch in range(19):                                              # first 100 s: only 7 required channels active
+    assert onset(build(tmp_path, [("sig", 100)], active=seven)).onset_s is None
+    dig = np.concatenate([_signal(100), _signal(100, 3)], axis=1)
+    for ch in range(19):                                              # first 100 s: 7 required live; then 8
         if ch not in seven:
-            blob2[ch, : int(100 * FS)] = PAD_CODE
+            dig[ch, : int(100 * FS)] = PAD_CODE
         if ch not in eight:
-            blob2[ch, int(100 * FS):] = PAD_CODE
-    b = write_edf_raw(p / "g.edf", blob2, LABELS, FS, phys_min=-R, phys_max=R).read_bytes()
-    assert onset(b).onset_s == 100.0
+            dig[ch, int(100 * FS):] = PAD_CODE
+    b = write_edf_raw(tmp_path / "g.edf", dig, LABELS, FS, phys_min=-R, phys_max=R).read_bytes()
+    assert onset(b).onset_s == 100.0                                  # the 8th channel needs 27 live epochs in the window
 
 
-def test_mid_file_gap_does_not_move_the_onset(tmp_path):
+def test_mid_file_gap_after_onset_does_not_move_the_onset(tmp_path):
     blob = build(tmp_path, [("pad", 200), ("sig", 100), ("pad", 100), ("sig", 100)])
     assert onset(blob).onset_s == 200.0
 
 
+def test_probe_pass_but_window_fail_continues_the_search(tmp_path):
+    # live in alternate 10-s blocks for a while (every probe passes the coarse test, no 60-s window does), then solid
+    parts = []
+    for k in range(12):
+        parts += [("sig", 10), ("pad", 10)]
+    blob = build(tmp_path, parts + [("sig", 200)])
+    assert onset(blob).onset_s == 240.0
+
+
 def test_few_bytes_are_fetched_for_long_padding(tmp_path):
-    blob = build(tmp_path, [("pad", 1800), ("sig", 30)])
+    blob = build(tmp_path, [("pad", 1800), ("sig", 120)])
     s3 = FakeS3({KEY: blob})
     r = find_signal_onset(s3, KEY, bucket=BUCKET)
     assert r.onset_s == 1800.0
@@ -155,13 +183,14 @@ def test_stream_places_windows_relative_to_onset(tmp_path):
 def test_stream_no_onset_is_a_permanent_reason(tmp_path):
     r = stream_features(FakeS3({KEY: build(tmp_path, [("pad", 200)])}), KEY, bucket=BUCKET, windows=SHORT,
                         sleep=lambda s: None)
-    assert (not r.ok) and r.reason == FailureReason.NO_SIGNAL_ONSET and not r.retryable
+    assert (not r.ok) and r.reason == FailureReason.NO_SUSTAINED_SIGNAL and not r.retryable
 
 
 def test_stream_window_past_end_after_onset_is_handled(tmp_path):
-    blob = build(tmp_path, [("pad", 100), ("sig", 50)])
+    blob = build(tmp_path, [("pad", 100), ("sig", 70)])
     r = stream_features(FakeS3({KEY: blob}), KEY, bucket=BUCKET, windows=SHORT, sleep=lambda s: None)
-    assert r.ok and r.onset_s == 100.0 and not r.rows[0]["qc_pass"]          # only 50 s after onset: window exceeds
+    assert r.ok and r.onset_s == 100.0                                       # only 70 s after t0: window ends 10 s late
+    assert "window_exceeds_recording" in r.qc["w"].reasons and r.qc["w"].coverage_fraction < 1.0
 
 
 def test_script_stores_onset_and_prints_quantiles_only(tmp_path, monkeypatch, capsys):

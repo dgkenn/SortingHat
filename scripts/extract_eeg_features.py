@@ -16,9 +16,9 @@ Input (must live under a ``local_only/`` directory; never printed). CSV / TSV / 
 An optional ``recording_id`` column gives the opaque ID stored with the rows (default: salted-free SHA-256 prefix of
 the key). Sharding is by hash of that ID (``--shard k --of n``), so it is stable if the list grows.
 
-t0 is the EEG SIGNAL ONSET, not the file start (D-108): windows are placed relative to the first 10-s block with >= 8 of the
-10 required electrodes non-constant (searched within the first 120 min; none -> failure ``no_signal_onset``). The onset
-offset (seconds from the file start) is stored per recording in column ``onset_offset_s`` of the local_only parts, so the
+t0 is the start of the first SUSTAINED live segment, not the file start (D-109): the first 60-s period (10-s grid) in which
+>= 8 of the 10 required electrodes are non-constant in >= 90% of 2-s epochs, searched within the first 120 min of the file
+(none -> failure ``no_sustained_signal``); windows are placed relative to it (primary = t0 + 1 to t0 + 11 min). The offset (seconds from the file start) is stored per recording in column ``onset_offset_s`` of the local_only parts, so the
 cohort / feature join uses t0 = metadata start + onset_offset_s; stdout carries its quantiles only. ``--no-onset`` restores
 file-start windows.
 
@@ -163,7 +163,7 @@ def summarize(attempted: int, n_ok: int, reasons: Counter, elapsed: list[float],
         },
         "windows": {},
     }
-    if onsets is not None:            # signal onset (D-108), minutes from the FILE start; quantiles only
+    if onsets is not None:            # t0 offset (D-109), minutes from the FILE start; quantiles only
         out["onset_offset_minutes_quantiles"] = safe_quantiles([o / 60.0 for o in onsets])
         out["n_onset_after_file_start"] = suppress_count(sum(o > 0 for o in onsets)) if len(onsets) >= 11 else "<11"
     if chan:                          # recordings with >= 1 minimum-set channel missing / dead / zero-calibrated
@@ -194,7 +194,7 @@ def main(argv=None, s3=None) -> int:
     ap.add_argument("--windows", default=None, help="comma-separated subset of primary,20s,1min,2min,5min,10min "
                     "(default all; the byte range fetched is the same up to the longest window requested)")
     ap.add_argument("--no-onset", action="store_true",
-                    help="place windows from the FILE start instead of the EEG signal onset (D-108; default: onset)")
+                    help="place windows from the FILE start instead of the sustained-signal t0 (D-109; default: t0)")
     ap.add_argument("--compute-failed", action="store_true", help="features even for windows failing QC")
     ap.add_argument("--summary", default=None, help="aggregate JSON (safe_write_json)")
     args = ap.parse_args(argv)

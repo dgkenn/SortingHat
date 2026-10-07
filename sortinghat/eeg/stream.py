@@ -41,10 +41,12 @@ CHUNK_BYTES = 8 * 1024 * 1024           # each data GET is at most this big, so 
 MAX_FETCH_BYTES = 256 * 1024 * 1024     # refuse a plan bigger than this (pathological sampling rate x channels)
 DEFAULT_TIMEOUT_S = 300.0               # per recording: fetch + decode + features
 DEFAULT_MAX_ATTEMPTS = 4                # per GET
-ONSET_BLOCK_S = 10.0                    # signal onset is searched on this grid (from the file start)
-ONSET_MIN_ACTIVE = 8                    # of the 10 required electrodes that must be non-constant in a block
-ONSET_MAX_SEARCH_S = 120 * 60.0         # recordings without an onset in the first 120 min are excluded
-ONSET_PROBE_EVERY_S = 60.0              # coarse pass: one block per minute; the minute before a hit is then scanned
+ONSET_BLOCK_S = 10.0                    # t0 is searched on this grid (from the file start)
+ONSET_SEGMENT_S = 60.0                  # a live segment is a 60-s period ...
+ONSET_EPOCH_S = 2.0                     # ... of 2-s epochs ...
+ONSET_EPOCH_FRAC = 0.9                  # ... in which a channel is live when >= 90% of the epochs are non-constant
+ONSET_MIN_ACTIVE = 8                    # of the 10 required electrodes that must be live
+ONSET_MAX_SEARCH_S = 120 * 60.0         # recordings without a sustained live segment in 120 min are excluded
 
 
 class FailureReason:
@@ -60,7 +62,7 @@ class FailureReason:
     DISCONTINUOUS = "edf_discontinuous"
     NO_EEG_CHANNELS = "no_eeg_channels"
     UNSUPPORTED_UNITS = "edf_unsupported_units"
-    NO_SIGNAL_ONSET = "no_signal_onset"          # no 10-s block with >= 8 of the 10 required electrodes non-constant
+    NO_SUSTAINED_SIGNAL = "no_sustained_signal"  # no 60-s live segment (>= 8 of 10 required electrodes) in 120 min
     INVALID_SCALING = "edf_invalid_scaling"      # every EEG channel has a zero physical / digital range
     DECODE_ERROR = "edf_decode_error"
     TOO_SHORT = "recording_too_short"        # no data records at or after the window start
@@ -68,7 +70,7 @@ class FailureReason:
     PROCESSING_ERROR = "processing_error"
 
     PERMANENT = frozenset({NOT_FOUND, ACCESS_DENIED, AUTH_ERROR, S3_CLIENT_ERROR, HEADER_INVALID, DISCONTINUOUS,
-                           NO_EEG_CHANNELS, UNSUPPORTED_UNITS, INVALID_SCALING, NO_SIGNAL_ONSET, DECODE_ERROR, TOO_SHORT, TOO_LARGE})
+                           NO_EEG_CHANNELS, UNSUPPORTED_UNITS, INVALID_SCALING, NO_SUSTAINED_SIGNAL, DECODE_ERROR, TOO_SHORT, TOO_LARGE})
 
 
 ALL_REASONS = tuple(v for k, v in vars(FailureReason).items() if k.isupper() and isinstance(v, str))
@@ -460,7 +462,8 @@ def fetch_window(s3, key: str, start_s: float, duration_s: float, *, bucket: str
 
 
 # --------------------------------------------------------------------------------------------
-# Signal onset (t0 = EEG signal onset, D-108): HEEDB files can start with constant padding
+# t0 = start of the first sustained live segment (D-109; D-108 was a single live block): HEEDB files can start with
+# constant padding or a short live blip before the real recording
 # --------------------------------------------------------------------------------------------
 @dataclass
 class OnsetResult:
@@ -481,22 +484,26 @@ def _required_signal_index(hdr: EDFHeader, required=DEFAULT_MINIMUM_CHANNELS) ->
     return [first[c] for c in required if c in first]
 
 
-def _active_counts(hdr: EDFHeader, raw: bytes, r_a: int, k0: int, k1: int, block_s: float, idx: list[int]) -> np.ndarray:
-    """Per 10-s block ``k0..k1-1``: how many of the signals ``idx`` are NOT constant (digital samples). A block that
-    the fetched records do not fully cover counts as 0 active."""
+def _epoch_nonconst(hdr: EDFHeader, raw: bytes, r_a: int, e0: int, e1: int, epoch_s: float, idx: list[int]) -> np.ndarray:
+    """(len(idx), e1 - e0) bool: is epoch ``e`` (``[e * epoch_s, (e + 1) * epoch_s)`` from the FILE start) of signal
+    ``idx[row]`` NON-constant in its digital samples? ``raw`` holds whole records starting at record ``r_a``. An epoch the
+    records do not fully cover counts as constant (not live)."""
     n = len(raw) // hdr.record_bytes
     arr = np.frombuffer(raw[: n * hdr.record_bytes], dtype="<i2").reshape(n, -1) if n else np.zeros((0, 1), "<i2")
     bounds = np.concatenate([[0], np.cumsum(hdr.samples_per_record)])
-    out = np.zeros(k1 - k0, int)
-    for i in idx:
+    out = np.zeros((len(idx), e1 - e0), bool)
+    for row, i in enumerate(idx):
         x = arr[:, bounds[i]:bounds[i + 1]].reshape(-1)
         fs = float(hdr.samples_per_record[i]) / hdr.record_duration
-        L = int(round(block_s * fs))
-        for j in range(k1 - k0):
-            a = int(round(((k0 + j) * block_s - r_a * hdr.record_duration) * fs))
-            seg = x[a:a + L]
-            if len(seg) == L and L > 0 and seg.max() != seg.min():
-                out[j] += 1
+        L = int(round(epoch_s * fs))
+        if L <= 0:
+            continue
+        a0 = int(round((e0 * epoch_s - r_a * hdr.record_duration) * fs))
+        seg = x[max(0, a0):a0 + (e1 - e0) * L]
+        k = len(seg) // L
+        if k and a0 >= 0:
+            ep = seg[: k * L].reshape(k, L)
+            out[row, :k] = ep.max(axis=1) != ep.min(axis=1)
     return out
 
 
@@ -504,18 +511,23 @@ def find_signal_onset(s3, key: str, *, bucket: str | None = None, deadline: Dead
                       stats: FetchStats | None = None, max_attempts: int = DEFAULT_MAX_ATTEMPTS,
                       backoff_s: float = 1.0, max_backoff_s: float = 30.0, sleep=time.sleep, rand=random.random,
                       chunk_bytes: int = CHUNK_BYTES, block_s: float = ONSET_BLOCK_S,
-                      min_active: int = ONSET_MIN_ACTIVE, max_search_s: float = ONSET_MAX_SEARCH_S,
-                      probe_every_s: float = ONSET_PROBE_EVERY_S, required=DEFAULT_MINIMUM_CHANNELS,
+                      segment_s: float = ONSET_SEGMENT_S, epoch_s: float = ONSET_EPOCH_S,
+                      epoch_frac: float = ONSET_EPOCH_FRAC, min_active: int = ONSET_MIN_ACTIVE,
+                      max_search_s: float = ONSET_MAX_SEARCH_S, required=DEFAULT_MINIMUM_CHANNELS,
                       allow_discontinuous: bool = False) -> OnsetResult:
-    """Start (seconds from the file start) of the FIRST ``block_s`` block, on the grid ``k * block_s``, in which at
-    least ``min_active`` of the ``required`` electrodes are non-constant (digital samples, so a constant non-zero
-    pad is constant too). Searched within the first ``max_search_s`` of the file.
+    """t0 (D-109): start, in seconds from the FILE start, of the first SUSTAINED live segment: the first ``segment_s``
+    (60 s) period, scanned on a ``block_s`` (10 s) grid, in which at least ``min_active`` (8) of the 10 ``required``
+    electrodes are non-constant (digital samples) in at least ``epoch_frac`` (90%) of its ``epoch_s`` (2 s) epochs,
+    searched within the first ``max_search_s`` (120 min). A short live blip, or a pad that is constant for 4 or more of
+    the 30 epochs of every candidate window, does not qualify.
 
-    Cheap: one block per ``probe_every_s`` is fetched (ranged GET of that block's records, all signals); the first
-    probe that is active triggers a full scan of the stretch since the previous (inactive) probe, so the answer is the
-    exact first active block unless an activity burst shorter than ``probe_every_s - block_s`` lies entirely between
-    two probes in the padding. The tail after the last probe is scanned in full. Returns ``OnsetResult(None,
-    'no_signal_onset')`` when nothing qualifies; raises ``_StreamError`` / ``RecordingTimeout`` like ``fetch_window``.
+    Exact and cheap. Every 60-s window on the grid contains exactly one probe block (blocks 0, 6, 12, ... of 10 s). A
+    qualifying channel has at most 3 constant epochs of the 30, so at least ``need_probe`` (2) of the 5 epochs of its probe
+    block are non-constant: a probe block where fewer than ``min_active`` channels satisfy that cannot belong to a
+    qualifying window and costs one 10-s ranged GET. Only a probe that passes is refined: the records of its 6 candidate
+    windows (110 s) are fetched once and each window is tested exactly, in increasing start order, so the first success is
+    the minimum. Returns ``OnsetResult(None, 'no_sustained_signal')`` when none qualifies; raises ``_StreamError`` /
+    ``RecordingTimeout`` like ``fetch_window``.
     """
     if bucket is None:
         from ..data_io import access_point
@@ -529,43 +541,43 @@ def find_signal_onset(s3, key: str, *, bucket: str | None = None, deadline: Dead
         raise _StreamError(FailureReason.NO_EEG_CHANNELS)
     limit_s = min(float(max_search_s), n_eff * hdr.record_duration)
     n_blocks = int(np.floor(limit_s / block_s + 1e-9))
-    stride = max(1, int(round(probe_every_s / block_s)))
+    bps = max(1, int(round(segment_s / block_s)))                  # blocks per segment (6)
+    epb = max(1, int(round(block_s / epoch_s)))                    # epochs per block (5)
+    n_seg_ep = bps * epb                                           # epochs per segment (30)
+    need_ep = int(np.ceil(epoch_frac * n_seg_ep - 1e-9))           # live epochs a live channel needs (27)
+    need_probe = max(1, need_ep - (n_seg_ep - epb))                # of the probe block's epochs (2)
 
-    def counts(k0: int, k1: int) -> np.ndarray:
-        r_a = int(np.floor(k0 * block_s / hdr.record_duration + 1e-9))
-        r_b = min(n_eff, int(np.ceil(k1 * block_s / hdr.record_duration - 1e-9)))
+    def epochs(b0: int, b1: int) -> np.ndarray:                    # non-constant flags for blocks b0..b1-1
+        r_a = int(np.floor(b0 * block_s / hdr.record_duration + 1e-9))
+        r_b = min(n_eff, int(np.ceil(b1 * block_s / hdr.record_duration - 1e-9)))
         if r_b <= r_a:
-            return np.zeros(k1 - k0, int)
+            return np.zeros((len(idx), (b1 - b0) * epb), bool)
         pos, end, parts = hdr.header_bytes + r_a * hdr.record_bytes, hdr.header_bytes + r_b * hdr.record_bytes - 1, []
         while pos <= end:
             e = min(end, pos + chunk_bytes - 1)
             parts.append(rg.get(pos, e))
             pos = e + 1
-        return _active_counts(hdr, b"".join(parts), r_a, k0, k1, block_s, idx)
+        return _epoch_nonconst(hdr, b"".join(parts), r_a, b0 * epb, b1 * epb, epoch_s, idx)
 
-    prev = -1                                              # last probed block known to be inactive
-    for k in range(0, n_blocks, stride):
+    for p in range(0, n_blocks, bps):
         deadline.check()
-        if counts(k, k + 1)[0] >= min_active:
-            if k - prev > 1:                               # scan the unprobed blocks between prev and k
-                c = counts(prev + 1, k)
-                hit = np.flatnonzero(c >= min_active)
-                if hit.size:
-                    return OnsetResult((prev + 1 + int(hit[0])) * block_s, None, limit_s)
-            return OnsetResult(k * block_s, None, limit_s)
-        prev = k
-    if n_blocks - prev > 1:                                # tail after the last probe, in full
-        c = counts(prev + 1, n_blocks)
-        hit = np.flatnonzero(c >= min_active)
-        if hit.size:
-            return OnsetResult((prev + 1 + int(hit[0])) * block_s, None, limit_s)
-    return OnsetResult(None, FailureReason.NO_SIGNAL_ONSET, limit_s)
+        if int((epochs(p, p + 1).sum(axis=1) >= need_probe).sum()) < min_active:
+            continue
+        g_lo, g_hi = max(0, p - bps + 1), min(p, n_blocks - bps)   # windows that contain probe block p
+        if g_hi < g_lo:
+            continue
+        e = epochs(g_lo, g_hi + bps)
+        for g in range(g_lo, g_hi + 1):
+            w = e[:, (g - g_lo) * epb:(g - g_lo) * epb + n_seg_ep]
+            if int((w.sum(axis=1) >= need_ep).sum()) >= min_active:
+                return OnsetResult(g * block_s, None, limit_s)
+    return OnsetResult(None, FailureReason.NO_SUSTAINED_SIGNAL, limit_s)
 
 
 def onset_offset_s(s3, key: str, *, bucket: str | None = None, **kw) -> float | None:
     """Signal-onset offset of one EDF in seconds from the FILE start, or ``None`` (no onset within the search limit, or
     the file could not be read). Never raises for data / network problems. t0 for the cohort / feature join is
-    ``metadata start + onset offset`` (D-108). The value is per recording: store it only under ``local_only/`` and
+    ``metadata start + onset offset`` (D-109). The value is per recording: store it only under ``local_only/`` and
     report it as quantiles."""
     try:
         return find_signal_onset(s3, key, bucket=bucket, **kw).onset_s
@@ -598,11 +610,12 @@ def stream_features(s3, key: str, *, bucket: str | None = None, windows=None, qc
                     ) -> StreamResult:
     """Features for one S3 EDF, reading only the primary window (default minutes 1-11) plus filter padding.
 
-    t0 is the EEG SIGNAL ONSET (D-108), not the file start: with ``onset_search`` (default) the first 10-s block with
-    at least ``onset_min_active`` of the 10 required electrodes non-constant is found within the first
-    ``onset_max_search_s`` (``find_signal_onset``) and every window is placed relative to it (primary = onset + 1 min to
-    onset + 11 min). No onset in the limit -> ``no_signal_onset`` (permanent). ``StreamResult.onset_s`` is the onset
-    offset from the file start. ``onset_search=False`` restores file-start windows.
+    t0 is the start of the first SUSTAINED live segment (D-109), not the file start: with ``onset_search`` (default) the
+    first 60-s period (10-s grid) in which at least ``onset_min_active`` of the 10 required electrodes are non-constant in
+    >= 90% of 2-s epochs is found within the first ``onset_max_search_s`` (``find_signal_onset``) and every window is
+    placed relative to it (primary = t0 + 1 min to t0 + 11 min). None in the limit -> ``no_sustained_signal``
+    (permanent). ``StreamResult.onset_s`` is the t0 offset from the file start. ``onset_search=False`` restores
+    file-start windows.
 
     Never raises for data / network / timeout problems; see ``StreamResult.reason``. ``windows`` defaults to the
     primary window plus the nested windows (all inside the primary window), relative to t0."""
@@ -621,7 +634,7 @@ def stream_features(s3, key: str, *, bucket: str | None = None, windows=None, qc
                                        sleep=sleep, rand=rand, chunk_bytes=chunk_bytes,
                                        max_search_s=onset_max_search_s, min_active=onset_min_active)
                 if on.onset_s is None:
-                    raise _StreamError(on.reason or FailureReason.NO_SIGNAL_ONSET)
+                    raise _StreamError(on.reason or FailureReason.NO_SUSTAINED_SIGNAL)
                 onset = float(on.onset_s)
             res.onset_s = onset
             windows = {k: WindowSpec(w.name, w.start_s + onset, w.duration_s) for k, w in windows.items()}

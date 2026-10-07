@@ -33,7 +33,7 @@ from .io import (CANONICAL_19, DEFAULT_MINIMUM_CHANNELS, SCALING_OK, EDFHeader, 
                  drop_dead_channels, is_bipolar_label, normalize_channel_name, read_edf, select_channels)
 from .pipeline import PAD_S
 from .stream import (ONSET_MAX_SEARCH_S, FailureReason, RecordingTimeout, _StreamError, fetch_raw_window,
-                     find_signal_onset, _active_counts, _required_signal_index)
+                     find_signal_onset)
 from .window import QCConfig, WindowQC, WindowSpec, line_noise_ratio, primary_window, qc_recording
 
 REQUIRED = DEFAULT_MINIMUM_CHANNELS
@@ -138,7 +138,7 @@ def aggregate_paths(infos: list[PathInfo], n_available: int | None = None) -> di
 
 
 # ---------------------------------------------------------------------------------------------------------
-# C. signals (file-start window AND the window after the EEG signal onset, D-108)
+# C. signals (file-start window AND the window after t0 = first sustained live segment, D-109)
 # ---------------------------------------------------------------------------------------------------------
 @dataclass
 class ChannelEpochs:
@@ -190,7 +190,6 @@ class SignalInfo:
     file_start: WindowStats = field(default_factory=WindowStats)         # primary window at 60-660 s of the FILE
     after_onset: WindowStats | None = None                                # primary window at onset + 60-660 s
     onset_s: float | None = None                                          # seconds from the file start
-    onset_sustain: float | None = None            # share of the 6 blocks after the onset that are active (>= 8 of 10)
     onset_status: str = "not_run"                 # found | none_within_limit | no_channels | error | not_run
 
     # file-start window accessors (names used by the first diagnostics)
@@ -397,7 +396,7 @@ def inspect_signals(s3, ref: RecordingRef, *, bucket: str | None = None, policy=
     info.file_start = _window_stats(raw, first, pw, qc_cfg)
     info.file_start.cause = _cause(info, info.file_start)
 
-    # signal onset (D-108) and the primary window placed after it
+    # t0 (D-109) and the primary window placed after it
     try:
         on = find_signal_onset(s3, res.key, bucket=bucket, max_attempts=max_attempts, max_search_s=onset_max_search_s,
                                allow_discontinuous=True, **kw)
@@ -408,14 +407,6 @@ def inspect_signals(s3, ref: RecordingRef, *, bucket: str | None = None, policy=
     except Exception:  # noqa: BLE001
         info.onset_status = "error"
     if info.onset_s is not None:
-        try:                                       # is the onset a sustained signal or a short burst before more padding?
-            rw = fetch_raw_window(s3, res.key, info.onset_s, 60.0, bucket=bucket, max_attempts=max_attempts,
-                                  allow_discontinuous=True, **kw)
-            k0 = int(round(info.onset_s / 10.0))
-            c = _active_counts(rw.hdr, rw.data, rw.plan.r0, k0, k0 + 6, 10.0, _required_signal_index(rw.hdr))
-            info.onset_sustain = float((c >= 8).mean())
-        except Exception:  # noqa: BLE001
-            info.onset_sustain = None
         if info.onset_s == 0.0:
             info.after_onset = info.file_start
         else:
@@ -604,16 +595,13 @@ def aggregate_signals(infos: list[SignalInfo], n_available: int | None = None) -
         "primary_pass": tc(sum(bool(i.passes_primary) for i in ok)),
         "primary_reason_counts": {r: tc(c) for r, c in sorted(Counter(r for i in ok for r in i.reasons).items())},
         "signal_onset": {
-            "definition": "first 10-s block (grid from file start) with >= 8 of 10 required electrodes non-constant, "
-                          "searched within the first 120 min; primary window = onset + 1 to onset + 11 min",
+            "definition": "t0 = start of the first 60-s period (10-s grid from file start) in which >= 8 of 10 required "
+                          "electrodes are non-constant in >= 90% of 2-s epochs, searched within the first 120 min; "
+                          "primary window = t0 + 1 to t0 + 11 min",
             "onset_status": dist(i.onset_status for i in ok),
-            "n_no_signal_onset_within_120_min": tc(sum(i.onset_status == "none_within_limit" for i in ok)),
+            "n_no_sustained_signal_within_120_min": tc(sum(i.onset_status == "none_within_limit" for i in ok)),
             "n_onset_after_file_start": tc(sum(1 for i in ok if i.onset_s and i.onset_s > 0)),
             "onset_offset_minutes_from_file_start_quantiles": safe_quantiles(onsets),
-            "share_of_next_6_blocks_active_after_onset_quantiles": safe_quantiles(
-                [i.onset_sustain for i in ok if i.onset_sustain is not None]),
-            "n_onset_not_sustained_under_half_of_next_60s_active": tc(sum(
-                1 for i in ok if i.onset_sustain is not None and i.onset_sustain < 0.5)),
         },
         "after_onset": _after_onset_block(infos, tc),
     }

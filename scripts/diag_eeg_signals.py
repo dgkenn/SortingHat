@@ -20,9 +20,10 @@ and reports ONLY:
   * one technical cause per recording, and the primary-window usable-fraction quantiles and QC reason counts using
     the fixed normaliser / dead-channel handling.
 
-Since D-108 (t0 = EEG signal onset) it also reports, for the window placed AFTER the signal onset (first 10-s block with >= 8 of
-10 required electrodes non-constant, searched within 120 min): onset-offset quantiles (minutes from file start), the number
-with no onset in 120 min, the exactly-constant epoch share per electrode, the technical cause, and for recordings still below
+Since D-109 (t0 = start of the first sustained live segment: the first 60-s period, 10-s grid, with >= 8 of 10 required
+electrodes non-constant in >= 90% of 2-s epochs, searched within 120 min) it also reports, for the window placed AFTER t0:
+t0-offset quantiles (minutes from file start), the number with no sustained segment in 120 min, the post-fix usable-fraction
+quantiles and pass count, the exactly-constant epoch share per electrode, the technical cause, and for recordings still below
 the 0.6 usable threshold the share of minimum-set cells removed by each QC rule (flat / clipping / extreme > 500 uV / line
 noise / disconnected) plus required-channel amplitude (uV) and line-noise-ratio quantiles.
 

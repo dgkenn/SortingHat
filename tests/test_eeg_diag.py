@@ -276,10 +276,8 @@ def test_signal_onset_diagnostics(onset_bucket):
     infos = [diag.inspect_signals(s3, r, bucket="b", policy=FAST, sleep=lambda s: None) for r in refs]
     rep = diag.aggregate_signals(infos, n_av)
     on = rep["signal_onset"]
-    assert on["n_no_signal_onset_within_120_min"] == k[3]
+    assert on["n_no_sustained_signal_within_120_min"] == k[3]
     assert on["n_onset_after_file_start"] == k[1] + k[2]
-    assert on["n_onset_not_sustained_under_half_of_next_60s_active"] == 0          # every onset here is real signal
-    assert on["share_of_next_6_blocks_active_after_onset_quantiles"]["q10"] == 1.0
     q = on["onset_offset_minutes_from_file_start_quantiles"]
     assert q["q10"] == 0.0 and q["q90"] == 5.0                       # 0, 2 and 5 min offsets
     a = rep["after_onset"]
