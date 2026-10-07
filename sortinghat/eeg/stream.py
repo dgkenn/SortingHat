@@ -505,7 +505,8 @@ def find_signal_onset(s3, key: str, *, bucket: str | None = None, deadline: Dead
                       backoff_s: float = 1.0, max_backoff_s: float = 30.0, sleep=time.sleep, rand=random.random,
                       chunk_bytes: int = CHUNK_BYTES, block_s: float = ONSET_BLOCK_S,
                       min_active: int = ONSET_MIN_ACTIVE, max_search_s: float = ONSET_MAX_SEARCH_S,
-                      probe_every_s: float = ONSET_PROBE_EVERY_S, required=DEFAULT_MINIMUM_CHANNELS) -> OnsetResult:
+                      probe_every_s: float = ONSET_PROBE_EVERY_S, required=DEFAULT_MINIMUM_CHANNELS,
+                      allow_discontinuous: bool = False) -> OnsetResult:
     """Start (seconds from the file start) of the FIRST ``block_s`` block, on the grid ``k * block_s``, in which at
     least ``min_active`` of the ``required`` electrodes are non-constant (digital samples, so a constant non-zero
     pad is constant too). Searched within the first ``max_search_s`` of the file.
@@ -522,7 +523,7 @@ def find_signal_onset(s3, key: str, *, bucket: str | None = None, deadline: Dead
     deadline = deadline or Deadline(None)
     stats = stats if stats is not None else FetchStats()
     rg = _Ranged(s3, bucket, key, deadline, stats, max_attempts, backoff_s, max_backoff_s, sleep, rand)
-    hdr, _, n_eff = _read_header(rg, stats)
+    hdr, _, n_eff = _read_header(rg, stats, allow_discontinuous)
     idx = _required_signal_index(hdr, required)
     if len(idx) < min_active:
         raise _StreamError(FailureReason.NO_EEG_CHANNELS)

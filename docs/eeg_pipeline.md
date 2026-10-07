@@ -131,12 +131,30 @@ an optional `numba` step is a possible later optimisation. Install the optional 
 * **Streaming summary** now also prints counts of recordings with a missing / dead / zero-calibration minimum-set channel and the
   number recovered by the key fallback (by pattern name).
 
+### t0 = EEG signal onset (D-108)
+
+HEEDB files can start with constant padding (setup / gap), so the file start is not the EEG start. `stream.find_signal_onset`
+finds the first 10-s block (grid from the file start) with >= 8 of the 10 required electrodes non-constant (digital samples),
+within the first 120 min. It fetches one block per minute with ranged GETs and scans the minute before the first hit in full, so
+long padding costs about a sixth of its bytes (a burst shorter than 50 s lying entirely between two probes in the padding would be
+missed). No onset -> failure `no_signal_onset` (permanent). `stream_features` places every window relative to the onset
+(primary = onset + 1 to onset + 11 min); `StreamResult.onset_s` and the `onset_offset_s` column of the local_only feature parts
+hold the offset in seconds from the FILE start (per recording, never printed; stdout shows quantiles). **The cohort / feature join
+must use t0 = metadata start + onset offset**; `stream.onset_offset_s(s3, key)` returns the offset alone (None = excluded).
+`--no-onset` on the extractor restores file-start windows.
+
 ### Diagnostics (human-run, aggregates only)
 
 ```
 HEEDB_AWS_PROFILE=<profile> python3 scripts/diag_eeg_paths.py   --site S0001 --n 60 --seed 0
 HEEDB_AWS_PROFILE=<profile> python3 scripts/diag_eeg_signals.py --site S0001 --n 60 --seed 0
 ```
+
+`diag_eeg_signals.py` reports both the file-start window and the window after the signal onset: onset-offset quantiles (minutes),
+the number with no onset within 120 min, the exactly-constant epoch share per electrode after onset, and for recordings whose
+usable fraction is still below 0.6 a breakdown by QC rule (flat / clipping / extreme > 500 uV / line noise / disconnected, as the
+mean share of minimum-set cells), required-channel amplitude (std, 99th percentile of |x - median|, uV) and line-noise-ratio
+quantiles. Everything is aggregate-only.
 
 Both sample adult sessions from `eeg_metadata` (identifiers used in code only) and print no key, folder name or ID.
 Small cells: counts of TECHNICAL FILE properties (files with a header quirk, folders without a `.edf`, label counts) use

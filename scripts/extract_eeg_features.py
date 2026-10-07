@@ -16,6 +16,12 @@ Input (must live under a ``local_only/`` directory; never printed). CSV / TSV / 
 An optional ``recording_id`` column gives the opaque ID stored with the rows (default: salted-free SHA-256 prefix of
 the key). Sharding is by hash of that ID (``--shard k --of n``), so it is stable if the list grows.
 
+t0 is the EEG SIGNAL ONSET, not the file start (D-108): windows are placed relative to the first 10-s block with >= 8 of the
+10 required electrodes non-constant (searched within the first 120 min; none -> failure ``no_signal_onset``). The onset
+offset (seconds from the file start) is stored per recording in column ``onset_offset_s`` of the local_only parts, so the
+cohort / feature join uses t0 = metadata start + onset_offset_s; stdout carries its quantiles only. ``--no-onset`` restores
+file-start windows.
+
 Resumable: parts (``part-*.parquet``) and ledgers (``ledger-*.csv``) in ``--out-dir`` list finished recordings;
 a rerun skips recordings that succeeded or failed permanently (``--retry-permanent`` retries those too).
 Run one process per shard for parallelism. A crash between the part write and the ledger write can duplicate a
@@ -119,7 +125,7 @@ def load_done(out_dir: Path, retry_permanent: bool) -> set[str]:
 
 
 def fixed_columns(feat_cfg: FeatureConfig) -> list[str]:
-    qc_cols = ["qc_clean_cell_fraction", "qc_coverage_fraction", "qc_n_disconnected",
+    qc_cols = ["onset_offset_s", "qc_clean_cell_fraction", "qc_coverage_fraction", "qc_n_disconnected",
                *[f"qc_flag_{k}" for k in FLAG_NAMES]]
     return ["recording_id", "window", "qc_pass", "usable_fraction", *qc_cols, *feature_names(feat_cfg)]
 
@@ -137,7 +143,7 @@ def write_part(rows: list[dict], cols: list[str], out_dir: Path, tag: str) -> No
 def summarize(attempted: int, n_ok: int, reasons: Counter, elapsed: list[float], bytes_: list[int],
               fetch_s: list[float], proc_s: list[float], retries: int, usable: dict[str, list[float]],
               passes: dict[str, list[bool]], wall_s: float, skipped: int, chan: Counter | None = None,
-              resolved: Counter | None = None) -> dict:
+              resolved: Counter | None = None, onsets: list[float] | None = None) -> dict:
     n_fail = attempted - n_ok
     show_ok = suppress_count(n_ok) if (n_fail == 0 or n_fail >= 11) else "<11"      # no recovery by subtraction
     out = {
@@ -157,6 +163,9 @@ def summarize(attempted: int, n_ok: int, reasons: Counter, elapsed: list[float],
         },
         "windows": {},
     }
+    if onsets is not None:            # signal onset (D-108), minutes from the FILE start; quantiles only
+        out["onset_offset_minutes_quantiles"] = safe_quantiles([o / 60.0 for o in onsets])
+        out["n_onset_after_file_start"] = suppress_count(sum(o > 0 for o in onsets)) if len(onsets) >= 11 else "<11"
     if chan:                          # recordings with >= 1 minimum-set channel missing / dead / zero-calibrated
         out["minimum_set_channel_problems"] = {k: suppress_count(v) for k, v in sorted(chan.items())}
     if resolved:                      # not_found recordings recovered by the fallback key resolution, by pattern NAME
@@ -184,6 +193,8 @@ def main(argv=None, s3=None) -> int:
     ap.add_argument("--retry-permanent", action="store_true")
     ap.add_argument("--windows", default=None, help="comma-separated subset of primary,20s,1min,2min,5min,10min "
                     "(default all; the byte range fetched is the same up to the longest window requested)")
+    ap.add_argument("--no-onset", action="store_true",
+                    help="place windows from the FILE start instead of the EEG signal onset (D-108; default: onset)")
     ap.add_argument("--compute-failed", action="store_true", help="features even for windows failing QC")
     ap.add_argument("--summary", default=None, help="aggregate JSON (safe_write_json)")
     args = ap.parse_args(argv)
@@ -229,6 +240,7 @@ def main(argv=None, s3=None) -> int:
     buf_rows: list[dict] = []
     buf_ledger: list[list] = []
     n_ok = retries = 0
+    onsets: list[float] = []
     chan: Counter = Counter()
     resolved: Counter = Counter()
     t_wall = time.monotonic()
@@ -246,7 +258,8 @@ def main(argv=None, s3=None) -> int:
         from sortinghat import data_io
         for rid, key, parts in todo:
             res = stream_features(s3, key, timeout_s=args.timeout, max_attempts=args.max_attempts,
-                                  compute_failed=args.compute_failed, feat_cfg=feat_cfg, windows=windows)
+                                  compute_failed=args.compute_failed, feat_cfg=feat_cfg, windows=windows,
+                                  onset_search=not args.no_onset)
             if res.reason == FailureReason.NOT_FOUND and parts is not None:
                 # documented key missing: try the other task token / name variants, then list ONLY this recording's
                 # own session folder (data_io.resolve_edf_key). Keys are never printed; only the pattern name counts.
@@ -256,7 +269,8 @@ def main(argv=None, s3=None) -> int:
                     found = None
                 if found is not None and found.found and found.key != key:
                     res = stream_features(s3, found.key, timeout_s=args.timeout, max_attempts=args.max_attempts,
-                                          compute_failed=args.compute_failed, feat_cfg=feat_cfg, windows=windows)
+                                          compute_failed=args.compute_failed, feat_cfg=feat_cfg, windows=windows,
+                                          onset_search=not args.no_onset)
                     if res.ok:
                         resolved[found.pattern] += 1
             elapsed.append(res.elapsed_s)
@@ -269,7 +283,8 @@ def main(argv=None, s3=None) -> int:
                 chan["any_zero_calibration"] += res.n_invalid_min > 0
                 fetch_s.append(res.fetch_s)
                 proc_s.append(res.process_s)
-                buf_rows += [{"recording_id": rid, **r} for r in res.rows]
+                onsets.append(float(res.onset_s or 0.0))
+                buf_rows += [{"recording_id": rid, "onset_offset_s": float(res.onset_s or 0.0), **r} for r in res.rows]
                 for r in res.rows:
                     usable.setdefault(r["window"], []).append(float(r["usable_fraction"]))
                     passes.setdefault(r["window"], []).append(bool(r["qc_pass"]))
@@ -285,7 +300,7 @@ def main(argv=None, s3=None) -> int:
     wall = time.monotonic() - t_wall
 
     summ = summarize(len(todo), n_ok, reasons, elapsed, bytes_, fetch_s, proc_s, retries, usable, passes, wall,
-                     skipped, +chan, +resolved)
+                     skipped, +chan, +resolved, onsets if not args.no_onset else None)
     safe_print(f"shard {args.shard}/{args.of} | attempted: {summ['attempted']} | already done (skipped): "
                f"{summ['already_done_skipped']} | succeeded: {summ['succeeded']} | failed: {summ['failed']} "
                f"| success rate: {summ['success_rate']}")
@@ -295,6 +310,9 @@ def main(argv=None, s3=None) -> int:
         safe_print(f"  key fallback resolved via {r}: {c}")
     for r, c in summ.get("minimum_set_channel_problems", {}).items():
         safe_print(f"  recordings with minimum-set channel problem {r}: {c}")
+    if "onset_offset_minutes_quantiles" in summ:
+        safe_print("signal onset offset from file start, minutes (quantiles; n after file start:",
+                   summ["n_onset_after_file_start"], "):", summ["onset_offset_minutes_quantiles"])
     t = summ["throughput"]
     safe_print("throughput (not patient data): wall s/recording", t["wall_seconds_per_recording"],
                "| mean fetch s", t["mean_fetch_seconds"], "| mean process s", t["mean_process_seconds"],

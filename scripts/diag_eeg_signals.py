@@ -20,6 +20,12 @@ and reports ONLY:
   * one technical cause per recording, and the primary-window usable-fraction quantiles and QC reason counts using
     the fixed normaliser / dead-channel handling.
 
+Since D-108 (t0 = EEG signal onset) it also reports, for the window placed AFTER the signal onset (first 10-s block with >= 8 of
+10 required electrodes non-constant, searched within 120 min): onset-offset quantiles (minutes from file start), the number
+with no onset in 120 min, the exactly-constant epoch share per electrode, the technical cause, and for recordings still below
+the 0.6 usable threshold the share of minimum-set cells removed by each QC rule (flat / clipping / extreme > 500 uV / line
+noise / disconnected) plus required-channel amplitude (uV) and line-noise-ratio quantiles.
+
 Small cells: ``sortinghat.safe_output``. EXCEPTION (``safe_output.technical_count``): counts of technical file
 properties print exactly when the sample has at least 50 recordings, else n < 11 prints as "<11". Pooled fractions
 and quantiles need at least 11 recordings behind them.

@@ -148,6 +148,21 @@ def epoch_artifact_flags(data: np.ndarray, fs: float, ch_names: Sequence[str], s
     return EpochFlags(list(ch_names), float(start_s), cfg.epoch_s, flags, n_exp)
 
 
+def line_noise_ratio(ep: np.ndarray, fs: float, cfg: QCConfig | None = None) -> np.ndarray:
+    """(C, E) ratio power(line +-1 Hz) / power(1-40 Hz) per channel x epoch for ``ep`` of shape (C, E, L): the quantity
+    ``epoch_artifact_flags`` compares with ``cfg.line_ratio``. Zeros when the sampling rate is too low to see the line."""
+    cfg = cfg or QCConfig()
+    C, E, L = ep.shape
+    if not (fs / 2 > cfg.line_hz + 2) or L == 0:
+        return np.zeros((C, E))
+    ep = np.nan_to_num(ep)
+    P = np.abs(np.fft.rfft((ep - ep.mean(axis=2, keepdims=True)) * np.hanning(L), axis=2)) ** 2
+    f = np.fft.rfftfreq(L, 1.0 / fs)
+    bl = (f >= cfg.line_hz - 1) & (f <= cfg.line_hz + 1)
+    bb = (f >= 1) & (f <= 40)
+    return P[:, :, bl].sum(axis=2) / np.maximum(P[:, :, bb].sum(axis=2), 1e-12)
+
+
 @dataclass
 class WindowQC:
     window: str

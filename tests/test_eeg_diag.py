@@ -227,3 +227,80 @@ def test_scripts_refuse_real_client_inside_agent_session(monkeypatch):
     monkeypatch.setenv("CLAUDECODE", "1")
     mod = _load_script("diag_eeg_paths")
     assert mod.main(["--site", SITE]) == 2                          # make_client refuses; only the class name is printed
+
+
+# ---- signal onset (D-108) -------------------------------------------------------------------------------
+def _padded_blob(segments, seed=0):
+    g = 2 * R / 65535.0
+    parts = []
+    for k, (kind, sec) in enumerate(segments):
+        n = int(sec * FS)
+        if kind == "pad":
+            parts.append(np.full((19, n), 1234, "<i2"))
+        else:
+            x = np.random.default_rng(seed + k).standard_normal((19, n)) * 20.0
+            parts.append(np.clip(np.round((x + R) / g - 32768), -32768, 32767).astype("<i2"))
+    return write_edf_raw_bytes(np.concatenate(parts, axis=1))
+
+
+def write_edf_raw_bytes(dig, _cache={}):
+    import tempfile
+    with tempfile.TemporaryDirectory() as d:
+        return write_edf_raw(Path(d) / "x.edf", dig, [f"EEG {c}-Ref" for c in CANONICAL_19], FS, phys_min=-R,
+                             phys_max=R).read_bytes()
+
+
+@pytest.fixture(scope="module")
+def onset_bucket():
+    blobs = {
+        0: _padded_blob([("sig", 760)]),
+        1: _padded_blob([("pad", 120), ("sig", 760)]),
+        2: _padded_blob([("pad", 300), ("sig", 100), ("pad", 400), ("sig", 200)]),    # signal, then a mid-file gap
+        3: _padded_blob([("pad", 400)]),                                              # never any signal
+    }
+    n = 52
+    rows = ["SiteID,BDSPPatientID,BidsFolder,SessionID,EEGFolder,AgeAtVisit"]
+    obj = {}
+    for i in range(n):
+        bf, sid = f"sub-{SITE}{2000 + i}", str(i + 1)
+        rows.append(f"{SITE},{2000 + i},{bf},{sid},,40")
+        obj[f"EEG/bids/{SITE}/{bf}/ses-{sid}/eeg/{bf}_ses-{sid}_task-EEG_eeg.edf"] = blobs[i % 4]
+    obj[f"EEG/eeg-metadata/{SITE}_eeg_metadata_2026_04_30.csv"] = ("\n".join(rows) + "\n").encode()
+    return obj, {k: sum(1 for i in range(n) if i % 4 == k) for k in range(4)}
+
+
+def test_signal_onset_diagnostics(onset_bucket):
+    obj, k = onset_bucket
+    s3 = FlakyS3(dict(obj), p=0.0)
+    refs, n_av = diag.sample_adult_recordings(s3, SITE, 60, seed=0)
+    infos = [diag.inspect_signals(s3, r, bucket="b", policy=FAST, sleep=lambda s: None) for r in refs]
+    rep = diag.aggregate_signals(infos, n_av)
+    on = rep["signal_onset"]
+    assert on["n_no_signal_onset_within_120_min"] == k[3]
+    assert on["n_onset_after_file_start"] == k[1] + k[2]
+    q = on["onset_offset_minutes_from_file_start_quantiles"]
+    assert q["q10"] == 0.0 and q["q90"] == 5.0                       # 0, 2 and 5 min offsets
+    a = rep["after_onset"]
+    assert a["n_with_onset_and_window"] == k[0] + k[1] + k[2]
+    assert a["n_usable_below_threshold"] == k[2]                     # the mid-file gap removes ~2/3 of the window
+    assert a["primary_pass"] == k[0] + k[1]
+    assert a["technical_cause_per_recording"]["no_technical_problem"] == k[0] + k[1]
+    assert a["technical_cause_per_recording"].get("required_channel_constant_whole_window", 0) == 0
+    assert a["technical_cause_per_recording"]["low_usable_other_artifacts"] == k[2]
+    bd = a["qc_rule_breakdown_usable_below_threshold"]
+    flags = bd["mean_share_of_minimum_set_cells_flagged_by_rule"]
+    assert flags["flat"] > 0.5 and flags["extreme"] == 0.0 and flags["clipping"] == 0.0
+    assert set(flags) == {"flat", "clipping", "extreme", "line_noise", "disconnected"}
+    assert bd["n_recordings"] == k[2] and 0.5 < bd["mean_unusable_epoch_fraction"] <= 1.0
+    assert 5 < bd["required_channel_std_uv_quantiles"]["q50"] < 100
+    assert "line_noise_ratio_quantiles" in bd and bd["line_noise_ratio_quantiles"]["q50"] < 1.0
+    # before the fix: the file-start window sees padding / the gap instead of the EEG
+    fs_cause = rep["technical_cause_per_recording"]
+    assert fs_cause.get("required_channel_constant_whole_window", 0) >= k[2]
+    # constant epochs after onset are far fewer than at file start
+    c_after = a["exactly_constant_epochs_by_electrode"]["Fp1"]["frac_epochs_const_digital"]
+    c_start = rep["primary_window_exactly_constant_epochs_by_electrode"]["Fp1"]["frac_epochs_const_digital"]
+    assert 0 < c_after < c_start
+    text = json.dumps(rep)
+    assert "sub-" not in text and "ses-" not in text and SITE not in text
+    assert_aggregate_only(rep)

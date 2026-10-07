@@ -707,3 +707,8 @@
 - **Rationale:** No EEG referral-indication field exists in any real HEEDB header at any site (`ReferralIndication` is ASSUMED only), so Baseline D has no input and the plan's "indication field only" comparator cannot be built.
 - **Source:** `docs/research/heedb_schema_dryrun_2026-10-07.md`; `docs/heedb_schema_real.md` section B1; `docs/cohort_spec.md` C-17.
 
+### D-108 t0 is the EEG signal onset, not the file start
+- **Date:** 2026-10-07 · **Area:** eeg · **Outcome data seen?** No (signal properties only)
+- **Decision:** For every recording t0 = EEG signal onset = the start of the first 10-s block (grid from the file start) in which at least 8 of the 10 required electrodes (Fp1 Fp2 F7 F8 T3 T4 T5 T6 O1 O2) are non-constant, searched within the first 120 min of the file. Recordings with no such block are excluded with reason `no_signal_onset`. The primary window is onset + 1 min to onset + 11 min and the nested windows start at its start. The cohort / feature join uses t0 = metadata start + onset offset (`stream.find_signal_onset` / `onset_offset_s`; stored as `onset_offset_s` in the local_only feature parts).
+- **Rationale:** A real-data diagnostic (S0001, n = 60) found 24 recordings with all 10 required channels digitally constant over the whole of minutes 1-11 and a median usable fraction of 0: files contain setup / gap padding before the real signal, so the file start is not the EEG start. Placing the window by signal onset, a property of the signal alone, restores minutes 1-11 of actual EEG without looking at any label or outcome.
+- **Source:** `scripts/diag_eeg_signals.py` aggregate output (coordinator report); `docs/eeg_pipeline.md`; Study 1 window definition (minutes 1-11).
