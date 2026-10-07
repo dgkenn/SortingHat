@@ -19,6 +19,7 @@ replaces anything odd-looking or id-like with ``<other>``.
 
 from __future__ import annotations
 
+import os
 import re
 from collections import Counter
 from dataclasses import dataclass, field
@@ -28,11 +29,11 @@ import pandas as pd
 
 from .. import data_io
 from ..safe_output import SUPPRESSED, assert_aggregate_only, safe_quantiles, suppress_count, technical_count
-from .io import (CANONICAL_19, DEFAULT_MINIMUM_CHANNELS, SCALING_OK, EDFHeader, channel_scaling_status,
+from .io import (CANONICAL_19, DEFAULT_MINIMUM_CHANNELS, SCALING_OK, EDFHeader, _uv_scale, channel_scaling_status,
                  drop_dead_channels, is_bipolar_label, normalize_channel_name, read_edf, select_channels)
 from .pipeline import PAD_S
 from .stream import (ONSET_MAX_SEARCH_S, FailureReason, RecordingTimeout, _StreamError, fetch_raw_window,
-                     find_signal_onset)
+                     find_signal_onset, _active_counts, _required_signal_index)
 from .window import QCConfig, WindowQC, WindowSpec, line_noise_ratio, primary_window, qc_recording
 
 REQUIRED = DEFAULT_MINIMUM_CHANNELS
@@ -145,6 +146,8 @@ class ChannelEpochs:
     n_const_digital: int = 0                      # all digital samples equal (scaling fine)
     n_const_scaling: int = 0                      # epoch constant only because the calibration range is zero
     n_zero_valued: int = 0                        # constant digital AND physical value 0 (zero-filled)
+    n_const_rail: int = 0                         # constant digital value == the signal's header digital min or max
+    n_const_other: int = 0                        # constant, neither a rail nor zero-valued
 
 
 @dataclass
@@ -159,6 +162,10 @@ class WindowStats:
     amp_p99_uv: list[float] = field(default_factory=list)        # per required channel: 99th pct of |x - median|
     line_ratio: list[float] = field(default_factory=list)        # per required channel: median epoch line-noise ratio
     cause: str = "unknown"
+    xcheck_status: str = "not_run"                # ok | rate_mismatch | unavailable | error:<Class> | not_run
+    xcheck_max_abs_diff_uv: list[float] = field(default_factory=list)   # per required channel: ours vs pyedflib
+    xcheck_corr: list[float] = field(default_factory=list)              # per required channel (non-constant pairs)
+    xcheck_n_constant_pairs: int = 0
 
 
 @dataclass
@@ -177,9 +184,13 @@ class SignalInfo:
     n_pmin_eq_pmax: int = 0
     req_dmin_eq_dmax: int = 0
     req_pmin_eq_pmax: int = 0
+    hetero_spr: bool = False                      # non-annotation signals do not all have the same samples per record
+    n_distinct_spr: int = 0
+    req_calibration: list[str] = field(default_factory=list)   # per required channel "dim|pmin|pmax|dmin|dmax"
     file_start: WindowStats = field(default_factory=WindowStats)         # primary window at 60-660 s of the FILE
     after_onset: WindowStats | None = None                                # primary window at onset + 60-660 s
     onset_s: float | None = None                                          # seconds from the file start
+    onset_sustain: float | None = None            # share of the 6 blocks after the onset that are active (>= 8 of 10)
     onset_status: str = "not_run"                 # found | none_within_limit | no_channels | error | not_run
 
     # file-start window accessors (names used by the first diagnostics)
@@ -226,8 +237,67 @@ def _channel_epochs(h: EDFHeader, i: int, raw_records: np.ndarray, r0: int, star
     gain = (h.phys_max[i] - h.phys_min[i]) / (h.dig_max[i] - h.dig_min[i])
     phys = (ep[:, 0].astype(np.float64) - h.dig_min[i]) * gain + h.phys_min[i]
     # zero-filled: the constant is digital 0 or within one quantisation step of physical 0
-    out.n_zero_valued = int((const & ((ep[:, 0] == 0) | (np.abs(phys) <= abs(gain) + 1e-12))).sum())
+    zero = (ep[:, 0] == 0) | (np.abs(phys) <= abs(gain) + 1e-12)
+    rail = (ep[:, 0] == int(h.dig_min[i])) | (ep[:, 0] == int(h.dig_max[i]))
+    out.n_zero_valued = int((const & zero).sum())
+    out.n_const_rail = int((const & rail).sum())
+    out.n_const_other = int((const & ~zero & ~rail).sum())
     return out
+
+
+def _mini_edf(raw) -> bytes:
+    """The fetched records as a self-contained plain EDF (header patched to the fetched record count, EDF+ marker
+    blanked so pyedflib reads annotations as an ordinary signal). Record 0 of it is record ``raw.plan.r0`` of the file."""
+    h = raw.hdr
+    n = len(raw.data) // h.record_bytes
+    head = bytearray(raw.header_seg[: h.header_bytes])
+    head[192:236] = b" " * 44
+    head[236:244] = str(n).encode("ascii").ljust(8)
+    return bytes(head) + raw.data[: n * h.record_bytes]
+
+
+def _crosscheck(raw, first: dict[str, int], rec0, ws: WindowStats) -> None:
+    """Decode the required channels of ``rec0`` (our ranged reader) AND with pyedflib on the same in-memory records
+    (an anonymous ``memfd``, never a disk file) and record max |difference| (uV) and correlation per channel."""
+    try:
+        import pyedflib
+    except Exception:  # noqa: BLE001
+        ws.xcheck_status = "unavailable"
+        return
+    if not hasattr(os, "memfd_create"):
+        ws.xcheck_status = "unavailable"
+        return
+    h = raw.hdr
+    fd = None
+    try:
+        fd = os.memfd_create("edf_xcheck")
+        os.write(fd, _mini_edf(raw))
+        with pyedflib.EdfReader(f"/proc/self/fd/{fd}") as ref:
+            skipped = 0
+            for c, i in first.items():
+                if c not in rec0.ch_names:
+                    continue
+                if abs(float(h.fs[i]) - rec0.fs) > 1e-9:
+                    skipped += 1
+                    continue
+                theirs = ref.readSignal(i) * _uv_scale(h.phys_dim[i])
+                a = int(round((rec0.offset_s - raw.plan.r0 * h.record_duration) * rec0.fs))
+                ours = rec0.data[rec0.ch_names.index(c)]
+                t = theirs[a:a + len(ours)]
+                if len(t) != len(ours):
+                    ws.xcheck_status = "length_mismatch"
+                    return
+                ws.xcheck_max_abs_diff_uv.append(float(np.max(np.abs(ours - t))) if len(ours) else 0.0)
+                if np.std(ours) > 0 and np.std(t) > 0:
+                    ws.xcheck_corr.append(float(np.corrcoef(ours, t)[0, 1]))
+                else:
+                    ws.xcheck_n_constant_pairs += 1
+            ws.xcheck_status = "rate_mismatch" if skipped and not ws.xcheck_max_abs_diff_uv else "ok"
+    except Exception as exc:  # noqa: BLE001
+        ws.xcheck_status = "error:" + type(exc).__name__
+    finally:
+        if fd is not None:
+            os.close(fd)
 
 
 def _window_stats(raw, first: dict[str, int], pw: WindowSpec, qc_cfg: QCConfig | None) -> WindowStats:
@@ -242,6 +312,8 @@ def _window_stats(raw, first: dict[str, int], pw: WindowSpec, qc_cfg: QCConfig |
     try:
         rec = read_edf(raw.sparse(), start_s=start, duration_s=pw.end_s + PAD_S - start, channels=list(CANONICAL_19),
                        allow_discontinuous=True)
+        rec0 = rec
+        _crosscheck(raw, first, rec0, ws)
         rec = drop_dead_channels(select_channels(rec))
         notes = {"dead": rec.meta.get("dead_channels", []), "invalid_scaling": rec.meta.get("invalid_scaling_channels", [])}
         qcs, _ = qc_recording(rec.data, rec.fs, rec.ch_names, rec.offset_s, {"primary": pw}, cfg,
@@ -318,6 +390,10 @@ def inspect_signals(s3, ref: RecordingRef, *, bucket: str | None = None, policy=
     info.rates = sorted({float(h.fs[i]) for i in first.values()})
     info.req_dmin_eq_dmax = sum(h.dig_max[i] == h.dig_min[i] for i in first.values())
     info.req_pmin_eq_pmax = sum(h.phys_max[i] == h.phys_min[i] for i in first.values())
+    spr = {int(h.samples_per_record[i]) for i in eeg_idx}
+    info.n_distinct_spr, info.hetero_spr = len(spr), len(spr) > 1
+    info.req_calibration = [f"{h.phys_dim[i] or '-'}|{h.phys_min[i]:g}|{h.phys_max[i]:g}|{h.dig_min[i]:g}|{h.dig_max[i]:g}"
+                            for i in first.values()]
     info.file_start = _window_stats(raw, first, pw, qc_cfg)
     info.file_start.cause = _cause(info, info.file_start)
 
@@ -332,6 +408,14 @@ def inspect_signals(s3, ref: RecordingRef, *, bucket: str | None = None, policy=
     except Exception:  # noqa: BLE001
         info.onset_status = "error"
     if info.onset_s is not None:
+        try:                                       # is the onset a sustained signal or a short burst before more padding?
+            rw = fetch_raw_window(s3, res.key, info.onset_s, 60.0, bucket=bucket, max_attempts=max_attempts,
+                                  allow_discontinuous=True, **kw)
+            k0 = int(round(info.onset_s / 10.0))
+            c = _active_counts(rw.hdr, rw.data, rw.plan.r0, k0, k0 + 6, 10.0, _required_signal_index(rw.hdr))
+            info.onset_sustain = float((c >= 8).mean())
+        except Exception:  # noqa: BLE001
+            info.onset_sustain = None
         if info.onset_s == 0.0:
             info.after_onset = info.file_start
         else:
@@ -374,6 +458,26 @@ def _label_ok(lb: str) -> bool:
     return bool(_LABEL_OK.match(lb)) and not data_io.looks_id_like(lb)
 
 
+def _share(num: int, den: int):
+    return round(num / den, 4) if den else None
+
+
+def _xcheck_block(stats: list[WindowStats], tc) -> dict:
+    """Aggregate of our-reader-vs-pyedflib agreement over recordings (needs >= MIN_POOL recordings for quantiles)."""
+    done = [w for w in stats if w.xcheck_status == "ok"]
+    diff = [w.xcheck_max_abs_diff_uv for w in done]
+    corr = [w.xcheck_corr for w in done]
+    return {
+        "status": {k: tc(c) for k, c in sorted(Counter(w.xcheck_status for w in stats).items())},
+        "n_recordings_compared": tc(len(done)),
+        "max_abs_difference_uv_quantiles": _pooled_q(diff),
+        "n_recordings_with_any_difference_over_1e-6_uv": tc(sum(any(d > 1e-6 for d in r) for r in diff)),
+        "correlation_quantiles": _pooled_q(corr),
+        "n_recordings_with_any_correlation_below_0.999": tc(sum(any(c < 0.999 for c in r) for r in corr)),
+        "n_constant_pairs_not_correlated": tc(sum(w.xcheck_n_constant_pairs for w in done)),
+    }
+
+
 def _const_block(stats: list[WindowStats], tc) -> dict:
     out: dict = {}
     for ch in REQUIRED:
@@ -388,6 +492,12 @@ def _const_block(stats: list[WindowStats], tc) -> dict:
             "frac_epochs_const_digital": round(sum(e.n_const_digital for e in es) / tot, 4),
             "frac_epochs_const_by_zero_calibration": round(sum(e.n_const_scaling for e in es) / tot, 4),
             "frac_epochs_zero_valued": round(sum(e.n_zero_valued for e in es) / tot, 4),
+            "of_constant_epochs_share_at_header_digital_rail": _share(sum(e.n_const_rail for e in es),
+                                                                    sum(e.n_const_digital for e in es)),
+            "of_constant_epochs_share_zero_valued": _share(sum(e.n_zero_valued for e in es),
+                                                          sum(e.n_const_digital for e in es)),
+            "of_constant_epochs_share_other_nonzero_value": _share(sum(e.n_const_other for e in es),
+                                                                  sum(e.n_const_digital for e in es)),
             "n_recordings_all_epochs_const": tc(sum((e.n_const_digital + e.n_const_scaling) == e.n_epochs for e in es)),
             "n_recordings_over_half_epochs_const": tc(sum((e.n_const_digital + e.n_const_scaling) * 2 > e.n_epochs
                                                           for e in es)),
@@ -434,6 +544,7 @@ def _after_onset_block(infos: list[SignalInfo], tc) -> dict:
         "reason_counts": {r: tc(c) for r, c in sorted(Counter(r for w in ws_all for r in w.reasons).items())},
         "exactly_constant_epochs_by_electrode": _const_block(ws_all, tc),
         "technical_cause_per_recording": {k: tc(c) for k, c in sorted(Counter(w.cause for w in ws_all).items())},
+        "pyedflib_crosscheck": _xcheck_block(ws_all, tc),
         "qc_rule_breakdown_all_recordings": breakdown(ws_all),
         "qc_rule_breakdown_usable_below_threshold": breakdown(fail),
     }
@@ -479,6 +590,14 @@ def aggregate_signals(infos: list[SignalInfo], n_available: int | None = None) -
             "required_electrodes_dmin_eq_dmax": tc(sum(i.req_dmin_eq_dmax for i in ok)),
             "required_electrodes_pmin_eq_pmax": tc(sum(i.req_pmin_eq_pmax for i in ok)),
         },
+        "samples_per_record": {
+            "recordings_with_heterogeneous_samples_per_record": tc(sum(i.hetero_spr for i in ok)),
+            "n_distinct_samples_per_record_among_non_annotation_signals": dist(i.n_distinct_spr for i in ok),
+        },
+        "required_channel_calibration_dim_pmin_pmax_dmin_dmax": {
+            k: tc(c) for k, c in sorted(Counter(k for i in ok for k in set(i.req_calibration)).items(),
+                                        key=lambda kv: (-kv[1], kv[0]))[:12]},
+        "pyedflib_crosscheck_file_start_window": _xcheck_block([i.file_start for i in ok], tc),
         "primary_window_exactly_constant_epochs_by_electrode": _const_block([i.file_start for i in ok], tc),
         "technical_cause_per_recording": dist(i.cause for i in ok),
         "primary_usable_fraction_quantiles": safe_quantiles([i.usable_primary for i in ok if i.usable_primary is not None]),
@@ -491,6 +610,10 @@ def aggregate_signals(infos: list[SignalInfo], n_available: int | None = None) -
             "n_no_signal_onset_within_120_min": tc(sum(i.onset_status == "none_within_limit" for i in ok)),
             "n_onset_after_file_start": tc(sum(1 for i in ok if i.onset_s and i.onset_s > 0)),
             "onset_offset_minutes_from_file_start_quantiles": safe_quantiles(onsets),
+            "share_of_next_6_blocks_active_after_onset_quantiles": safe_quantiles(
+                [i.onset_sustain for i in ok if i.onset_sustain is not None]),
+            "n_onset_not_sustained_under_half_of_next_60s_active": tc(sum(
+                1 for i in ok if i.onset_sustain is not None and i.onset_sustain < 0.5)),
         },
         "after_onset": _after_onset_block(infos, tc),
     }

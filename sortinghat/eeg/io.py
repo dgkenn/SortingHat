@@ -223,6 +223,19 @@ def channel_scaling_status(h: EDFHeader, i: int) -> str:
     return SCALING_OK
 
 
+def decode_signal_uv(h: EDFHeader, records: np.ndarray, i: int) -> np.ndarray:
+    """Signal ``i`` of the data records ``records`` (n_records x samples-per-record-of-ALL-signals, int16) as one
+    continuous microvolt series. The record stride is the sum over ALL signals of their own samples per record (an
+    EDF mixes rates freely); signal ``i`` owns columns ``sum(spr[:i]) .. sum(spr[:i+1])`` of every record."""
+    bounds = np.concatenate([[0], np.cumsum(h.samples_per_record)])
+    dig = records[:, bounds[i]:bounds[i + 1]].astype(np.float64).reshape(-1)
+    span = h.dig_max[i] - h.dig_min[i]
+    if span == 0:
+        raise EDFError("invalid channel scaling (digital min == max)")
+    gain = (h.phys_max[i] - h.phys_min[i]) / span
+    return ((dig - h.dig_min[i]) * gain + h.phys_min[i]) * _uv_scale(h.phys_dim[i])
+
+
 def read_edf(src, start_s: float = 0.0, duration_s: float | None = None, channels: list[str] | None = None,
              keep_nonstandard: bool = False, allow_discontinuous: bool = False) -> Recording:
     """Read an EDF interval as channels x samples in uV.
@@ -278,13 +291,7 @@ def read_edf(src, start_s: float = 0.0, duration_s: float | None = None, channel
         bounds = np.concatenate([[0], np.cumsum(h.samples_per_record)])
         sigs, rates = [], []
         for i in names:
-            dig = arr[:, bounds[i]:bounds[i + 1]].astype(np.float64).reshape(-1)
-            span = h.dig_max[i] - h.dig_min[i]
-            if span == 0:                                  # keep_nonstandard signals are not scaling-checked above
-                raise EDFError("invalid channel scaling (digital min == max)")
-            gain = (h.phys_max[i] - h.phys_min[i]) / span
-            phys = (dig - h.dig_min[i]) * gain + h.phys_min[i]
-            sigs.append(phys * _uv_scale(h.phys_dim[i]))
+            sigs.append(decode_signal_uv(h, arr, i))
             rates.append(float(h.fs[i]))
         fs = max(rates)
         if len(set(rates)) > 1:

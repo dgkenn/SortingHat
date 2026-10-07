@@ -251,3 +251,51 @@ def write_edf_raw(path, dig: np.ndarray, labels: Sequence[str], fs: float, *, ph
             if ann:
                 fh.write(b"+0\x14\x14")
     return p
+
+
+@dataclass
+class SigSpec:
+    """One EDF signal for ``write_edf_multirate``: ``dig`` is int16, length ``n_records * spr`` (ignored for
+    annotations, which get a time-keeping TAL per record)."""
+    label: str
+    spr: int                                   # samples per data record
+    dig: np.ndarray | None = None
+    pmin: float = -3276.7
+    pmax: float = 3276.7
+    dmin: int = -32768
+    dmax: int = 32767
+    dim: str = "uV"
+    annotation: bool = False
+
+
+def write_edf_multirate(path, sigs: Sequence[SigSpec], n_records: int, record_s: float = 1.0,
+                        reserved: str = "") -> Path:
+    """EDF with HETEROGENEOUS samples per record (EEG 256 Hz next to ECG 512 Hz, osat 1 Hz, DC 8 Hz, an EDF+
+    annotation signal) in any signal order, to test that record strides and per-signal offsets are exact."""
+    ns = len(sigs)
+    hdr = bytearray()
+    hdr += _asc("0", 8) + _asc("X X X X", 80) + _asc("Startdate X X X X", 80)
+    hdr += _asc("01.01.20", 8) + _asc("00.00.00", 8) + _asc(str(256 * (ns + 1)), 8)
+    hdr += _asc(reserved, 44) + _asc(str(n_records), 8) + _asc(_fmt(record_s, 8).strip(), 8) + _asc(str(ns), 4)
+
+    def field(vals, w):
+        return b"".join(_asc(str(v), w) for v in vals)
+
+    hdr += field([s.label for s in sigs], 16) + field(["AgCl"] * ns, 80)
+    hdr += field(["" if s.annotation else s.dim for s in sigs], 8)
+    hdr += field(["-1" if s.annotation else _fmt(s.pmin, 8).strip() for s in sigs], 8)
+    hdr += field(["1" if s.annotation else _fmt(s.pmax, 8).strip() for s in sigs], 8)
+    hdr += field(["-32768" if s.annotation else s.dmin for s in sigs], 8)
+    hdr += field(["32767" if s.annotation else s.dmax for s in sigs], 8)
+    hdr += field([""] * ns, 80) + field([s.spr for s in sigs], 8) + field([""] * ns, 32)
+    assert len(hdr) == 256 * (ns + 1), len(hdr)
+    with open(path, "wb") as fh:
+        fh.write(hdr)
+        for r in range(n_records):
+            for s in sigs:
+                if s.annotation:
+                    tal = f"+{r * record_s:g}\x14\x14\x00".encode("ascii")
+                    fh.write(tal.ljust(2 * s.spr, b"\x00"))
+                else:
+                    fh.write(np.asarray(s.dig[r * s.spr:(r + 1) * s.spr], dtype="<i2").tobytes())
+    return Path(path)

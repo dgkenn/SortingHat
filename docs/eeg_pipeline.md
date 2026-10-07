@@ -156,6 +156,13 @@ usable fraction is still below 0.6 a breakdown by QC rule (flat / clipping / ext
 mean share of minimum-set cells), required-channel amplitude (std, 99th percentile of |x - median|, uV) and line-noise-ratio
 quantiles. Everything is aggregate-only.
 
+It also reports reader cross-checks: the number of recordings with heterogeneous samples per record, with an EDF+ annotation
+signal, the required channels' calibration strings (dimension, pmin, pmax, dmin, dmax), the share of constant epochs sitting at the
+header digital rail vs zero vs another value, whether the onset is sustained (share of the next six 10-s blocks active), and
+`pyedflib_crosscheck`: our ranged decode vs pyedflib on the same in-memory records (an anonymous memfd, never a disk file), as
+quantiles of max |difference| (uV) and correlation. `tests/test_edf_multirate.py` proves exact agreement on synthetic EDFs with
+EEG 256 Hz, ECG 512 Hz, osat 1/record, DC 8 Hz and an annotation signal, record duration 1 s and 0.5 s.
+
 Both sample adult sessions from `eeg_metadata` (identifiers used in code only) and print no key, folder name or ID.
 Small cells: counts of TECHNICAL FILE properties (files with a header quirk, folders without a `.edf`, label counts) use
 `safe_output.technical_count`: exact when the sample has at least 50 recordings (so "7 of 60" is shown as 7), otherwise n < 11

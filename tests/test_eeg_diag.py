@@ -278,6 +278,8 @@ def test_signal_onset_diagnostics(onset_bucket):
     on = rep["signal_onset"]
     assert on["n_no_signal_onset_within_120_min"] == k[3]
     assert on["n_onset_after_file_start"] == k[1] + k[2]
+    assert on["n_onset_not_sustained_under_half_of_next_60s_active"] == 0          # every onset here is real signal
+    assert on["share_of_next_6_blocks_active_after_onset_quantiles"]["q10"] == 1.0
     q = on["onset_offset_minutes_from_file_start_quantiles"]
     assert q["q10"] == 0.0 and q["q90"] == 5.0                       # 0, 2 and 5 min offsets
     a = rep["after_onset"]
@@ -304,3 +306,65 @@ def test_signal_onset_diagnostics(onset_bucket):
     text = json.dumps(rep)
     assert "sub-" not in text and "ses-" not in text and SITE not in text
     assert_aggregate_only(rep)
+
+
+# ---- heterogeneous samples per record + pyedflib cross-check ---------------------------------------------
+def test_multirate_edf_crosscheck_with_pyedflib_and_rail_split(tmp_path_factory):
+    pytest.importorskip("pyedflib")
+    from test_edf_multirate import build as build_multirate
+    d = tmp_path_factory.mktemp("mr")
+    blob_a = build_multirate(d, 1.0)[0].read_bytes()
+    blob_b = build_multirate(d, 0.5)[0].read_bytes()
+    rows = ["SiteID,BDSPPatientID,BidsFolder,SessionID,EEGFolder,AgeAtVisit"]
+    obj = {}
+    for i in range(52):
+        bf, sid = f"sub-{SITE}{3000 + i}", str(i + 1)
+        rows.append(f"{SITE},{3000 + i},{bf},{sid},,40")
+        obj[f"EEG/bids/{SITE}/{bf}/ses-{sid}/eeg/{bf}_ses-{sid}_task-EEG_eeg.edf"] = blob_a if i % 2 else blob_b
+    obj[f"EEG/eeg-metadata/{SITE}_eeg_metadata_2026_04_30.csv"] = ("\n".join(rows) + "\n").encode()
+    s3 = FlakyS3(obj, p=0.0)
+    refs, n_av = diag.sample_adult_recordings(s3, SITE, 60, seed=0)
+    infos = [diag.inspect_signals(s3, r, bucket="b", policy=FAST, sleep=lambda s: None) for r in refs]
+    rep = diag.aggregate_signals(infos, n_av)
+    assert rep["samples_per_record"]["recordings_with_heterogeneous_samples_per_record"] == 52
+    assert rep["recordings_with_annotation_signal"] == 52
+    for blockname in ("pyedflib_crosscheck_file_start_window",):
+        x = rep[blockname]
+        assert x["status"] == {"ok": 52} and x["n_recordings_compared"] == 52
+        assert x["max_abs_difference_uv_quantiles"]["q90"] < 1e-6
+        assert x["correlation_quantiles"]["q10"] > 0.999999
+        assert x["n_recordings_with_any_difference_over_1e-6_uv"] == 0
+    assert rep["after_onset"]["pyedflib_crosscheck"]["n_recordings_compared"] == 52
+    assert rep["required_electrode_found_after_normalisation"]["Fp1"] == 52
+    assert "uV|-3276.7|3276.7|-32768|32767" in rep["required_channel_calibration_dim_pmin_pmax_dmin_dmax"]
+    assert "frac_epochs_const_digital" in rep["primary_window_exactly_constant_epochs_by_electrode"]["Fp1"]
+
+
+def test_rail_vs_other_constant_values_are_split(tmp_path):
+    """Constant epochs at the header digital min / max (an amplifier rail) are told apart from other constants."""
+    g = 2 * R / 65535.0
+
+    def blob(code):
+        x = np.random.default_rng(0).standard_normal((19, int(130 * FS))) * 20.0
+        dig = np.clip(np.round((x + R) / g - 32768), -32768, 32767).astype("<i2")
+        dig[0:10, int(60 * FS):] = code                                   # 10 channels constant from 60 s on
+        return write_edf_raw(tmp_path / f"r{code}.edf", dig, [f"EEG {c}-Ref" for c in CANONICAL_19], FS, phys_min=-R,
+                             phys_max=R).read_bytes()
+
+    out = {}
+    for name, code in (("rail", 32767), ("other", 1234)):
+        b = blob(code)
+        rows = ["SiteID,BDSPPatientID,BidsFolder,SessionID,EEGFolder,AgeAtVisit"]
+        obj = {}
+        for i in range(12):
+            bf = f"sub-{SITE}{4000 + i}"
+            rows.append(f"{SITE},{4000 + i},{bf},{i + 1},,40")
+            obj[f"EEG/bids/{SITE}/{bf}/ses-{i + 1}/eeg/{bf}_ses-{i + 1}_task-EEG_eeg.edf"] = b
+        obj[f"EEG/eeg-metadata/{SITE}_eeg_metadata_2026_04_30.csv"] = ("\n".join(rows) + "\n").encode()
+        s3 = FlakyS3(obj, p=0.0)
+        refs, _ = diag.sample_adult_recordings(s3, SITE, 12, seed=0)
+        infos = [diag.inspect_signals(s3, r, bucket="b", policy=FAST, sleep=lambda s: None) for r in refs]
+        out[name] = diag.aggregate_signals(infos)["primary_window_exactly_constant_epochs_by_electrode"]["Fp1"]
+    assert out["rail"]["of_constant_epochs_share_at_header_digital_rail"] == 1.0
+    assert out["other"]["of_constant_epochs_share_other_nonzero_value"] == 1.0
+    assert out["other"]["of_constant_epochs_share_at_header_digital_rail"] == 0.0
