@@ -1,19 +1,26 @@
-"""Expected HEEDB layout: table and column names as the earlier research code read them from the REAL bucket.
+"""HEEDB layout: table and column names, per-site variants, and provenance.
 
-Authoritative evidence is ``docs/heedb_schema_real.md`` (column names used by code that ran against the real
-BDSP tables; nothing here was checked against live data by this repo). Provenance of each column:
+Evidence, in order of strength:
 
-  CONFIRMED - read by analysis code that ran against the real table (or stated as observed in its docs).
-  NAMED     - appears only in an extractor request list, constant or doc table; OMOP extractors silently skip
-              columns that do not exist, so NAMED does not prove existence.
-  ASSUMED   - placeholder. Nothing in the source touches it (imaging finalization time, note timestamps,
-              PatientClass, ReferralIndication, OMOP ``person`` extras, ``note_nlp``...). Where the table is
-              OMOP the placeholder uses the standard OMOP CDM v5.4 column name. A human remaps these after
-              ``python -m sortinghat.audit.field_audit --dry-run-schema`` shows what actually exists.
+  1. The first real NAMES-ONLY dry run (2026-10-07, ``docs/research/heedb_schema_dryrun_2026-10-07.md``):
+     CSV header lines and parquet footers of the real BDSP tables, no values, no rows.
+  2. Column names read by earlier research code that ran against the real tables (``docs/heedb_schema_real.md``).
+
+Provenance of each column:
+
+  CONFIRMED - the name was SEEN in a real header (dry run), or is read by code that ran against the real table.
+              A mapping is CONFIRMED when both sides are real header names. Semantics (units, order versus
+              administration, ...) are still unread unless a description says otherwise.
+  NAMED     - appears only in an extractor list, constant or doc table, and was NOT found in the real header.
+  ASSUMED   - placeholder. Not present in any real header: ``PatientClass`` and ``ReferralIndication`` (analytic
+              columns; PatientClass is DERIVED from ``omop_visit_occurrence``), and the ``imaging`` table
+              (the real ``Imaging/`` prefix layout differs from the placeholder; see ``IMAGING_REAL_LAYOUT``).
 
 Table keys equal ``sortinghat.data_io.TABLES`` keys (CSV tables by their short name, OMOP tables as
-``omop_<table>`` under ``OMOP/Merged/<table>/*.parquet``). Column names are exact, including spaces and
-parentheses (``StartTime(EEG)``, ``gen slowing``).
+``omop_<table>`` under ``OMOP/Merged/<table>/*.parquet``). ``SCHEMA`` holds CANONICAL column names (the analytic
+frame). The two per-site CSV tables are NOT uniform across sites: ``SITE_VARIANTS`` records each site's real
+header and the mapping actual name -> canonical name; ``sortinghat.data_io.normalise_site_table`` applies it.
+Column names are exact, including spaces and parentheses (``StartTime(EEG)``, ``gen slowing``).
 
 Dtype vocabulary: ``str``, ``int``, ``float``, ``datetime`` (stored as text ``YYYY-MM-DD HH:MM:SS[.ffffff]``
 in the real files; parse with ``parse_datetimes``).
