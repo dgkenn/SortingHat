@@ -1,40 +1,57 @@
 # Objective-anchor rules for silver positives (research plan v1, "Silver labels: the circularity rules";
 # DECISION_LOG D-009). Every silver positive for E1, E2, E4a, E5, E6, E7 needs >=1 satisfied anchor.
 #
-# STATUS: every clinical threshold and window below is PROPOSED — needs co-investigator sign-off.
-#   Nothing here has been checked against data. LOINC codes are listed only where the author is
-#   confident of the code; `loinc: []` means "map locally". Verify all against the local concept map.
+# STATUS: thresholds and windows below were SIGNED OFF by the project lead 2026-10-07 as a delegated
+#   decision; re-review with the EEG/neurocritical-care co-investigator before Study 1 protocol lock
+#   (DECISION_LOG D-084..D-092). Nothing here has been checked against data. LOINC codes are listed only
+#   where the author is confident of the code; `loinc: []` means "map locally". Verify all against the
+#   local concept map.
 #
 # Semantics
 #   item          key in the anchor event table (see sortinghat/labels/anchors.py); real extraction maps
 #                 OMOP measurement/drug/condition/procedure rows to these keys (LOINC -> item below).
 #   window_hours  [start, end] relative to t0 (EEG start); negative = before t0. Event time must lie
-#                 in the closed window. Windows are PROPOSED.
+#                 in the closed window.
 #   test          lab_threshold: value <op> threshold (op in lt, le, gt, ge) in `unit`
 #                 event: item present (optionally value >= 1 as a boolean flag)
 #   all_of/any_of composite rules; `exclude_if_label` removes the positive if that label's anchor fires
 #                 (E6 "without CNS infection").
+#   acuity_required  (label level, E1) when true and the event table has an optional boolean `acute`
+#                 column, only rows with acute == True count. Imaging flags must be ACUTE/SUBACUTE findings
+#                 (report qualifiers such as acute, new, hyperacute, subacute; exclude chronic, old, remote,
+#                 sequela). If the column is absent the extractor is responsible for that filtering.
+#   rbc_correct   (lab_threshold on csf_wbc) corrected = value - RBC/divisor, using the `item` RBC row with
+#                 the same timestamp (same tap); uncorrected when no same-timestamp RBC row exists.
 #   Anchors may use information after t0 (labels name the cause of the state at t0); the windows bound it.
 version: 1
-status: "PROPOSED — needs co-investigator sign-off"
+status: "SIGNED OFF by project lead 2026-10-07 (delegated decision); re-review with EEG/neurocritical-care co-investigator before Study 1 protocol lock"
 t0_definition: "EEG start time"
 
 items:           # item -> LOINC (confident only) and canonical unit
   ammonia:       {loinc: ["16362-6"], unit: "umol/L"}
   bun:           {loinc: ["3094-0"],  unit: "mg/dL"}
-  creatinine:    {loinc: ["2160-0"],  unit: "mg/dL"}
+  creatinine:    {loinc: ["2160-0"],  unit: "mg/dL"}   # raw value; E5 no longer uses it (stable ESRD); upstream derives creatinine_doubling
   glucose:       {loinc: ["2345-7", "2339-0", "41653-7"], unit: "mg/dL"}   # serum/plasma, blood, capillary POC
   sodium:        {loinc: ["2951-2", "2947-0"], unit: "mmol/L"}
   paco2:         {loinc: ["2019-8"], unit: "mmHg"}
   ph_arterial:   {loinc: ["2744-1"], unit: "pH"}
   calcium:       {loinc: ["17861-6"], unit: "mg/dL"}
   lactate:       {loinc: ["2524-7", "32693-4"], unit: "mmol/L"}
-  wbc:           {loinc: ["6690-2"], unit: "10*3/uL"}
-  temp_c:        {loinc: ["8310-5"], unit: "Cel"}
-  heart_rate:    {loinc: ["8867-4"], unit: "/min"}
-  resp_rate:     {loinc: ["9279-1"], unit: "/min"}
-  blood_culture_pos: {loinc: ["600-7"], unit: "flag"}          # organism identified in blood culture
+  bilirubin:     {loinc: ["1975-2"], unit: "mg/dL"}    # total bilirubin; raw value, upstream derives bilirubin_doubling_ge2
+  platelets:     {loinc: ["777-3"], unit: "10*3/uL"}   # raw value, upstream derives platelets_drop (not used directly by a rule)
+  wbc:           {loinc: ["6690-2"], unit: "10*3/uL"}  # not used by any rule since SIRS was removed (D-087); kept for extractors
+  temp_c:        {loinc: ["8310-5"], unit: "Cel"}      # not used by any rule since SIRS was removed
+  heart_rate:    {loinc: ["8867-4"], unit: "/min"}     # not used by any rule since SIRS was removed
+  resp_rate:     {loinc: ["9279-1"], unit: "/min"}     # not used by any rule since SIRS was removed
+  blood_culture_pos: {loinc: ["600-7"], unit: "flag"}          # organism identified in blood culture (E7 support)
+  blood_culture_drawn: {loinc: [], unit: "flag"}               # blood culture order/collection event (E6)
+  qad_ge4:       {loinc: [], unit: "flag"}                     # >=4 consecutive qualifying antimicrobial days starting within +-2 days of the culture; computed upstream (CDC ASE)
+  vasopressor_initiation: {loinc: [], unit: "flag"}            # new vasopressor start (drug exposure event)
+  creatinine_doubling: {loinc: [], unit: "flag"}               # creatinine >= 2x encounter baseline, excluding ESRD; computed upstream
+  bilirubin_doubling_ge2: {loinc: [], unit: "flag"}            # total bilirubin >= 2.0 mg/dL AND >= 2x baseline; computed upstream
+  platelets_drop: {loinc: [], unit: "flag"}                    # platelets < 100 x10^3/uL AND >= 50% decline from a baseline >= 100; computed upstream
   csf_wbc:       {loinc: ["26464-8"], unit: "cells/uL"}
+  csf_rbc:       {loinc: [], unit: "cells/uL"}                  # CSF RBC count for the traumatic-tap correction; local mapping (LOINC 26455-6 is a candidate, not verified here)
   csf_protein:   {loinc: ["2880-3"], unit: "mg/dL"}
   csf_glucose:   {loinc: ["2342-4"], unit: "mg/dL"}
   csf_culture_pos: {loinc: [], unit: "flag"}
@@ -46,10 +63,11 @@ items:           # item -> LOINC (confident only) and canonical unit
   tox_screen_positive_nontherapeutic: {loinc: [], unit: "flag"} # urine/serum screen for agent not given in hospital
   antidote_response: {loinc: [], unit: "flag"}                  # naloxone/flumazenil/physostigmine/etc. given AND documented response
   arrest_event:  {loinc: [], unit: "flag"}                      # CPR procedure / ROSC / cardiac arrest documented
-  profound_shock: {loinc: [], unit: "flag"}                     # sustained MAP<50 or >=2 vasopressors
+  profound_shock: {loinc: [], unit: "flag"}                     # sustained MAP < 50 mmHg for >= 30 min; computed upstream
   asphyxia_event: {loinc: [], unit: "flag"}                     # hanging/drowning/choking/CO event
-  suspected_infection: {loinc: [], unit: "flag"}                # culture drawn + antibiotics started
   # Imaging findings parsed from radiology reports (NOT EEG-derived). Flags.
+  # ACUTE/SUBACUTE findings only (qualifiers acute, new, hyperacute, subacute count; chronic, old, remote,
+  # sequela do not). Chronic findings do not explain acute coma. See E1 acuity_required.
   imaging_ich:         {loinc: [], unit: "flag"}
   imaging_sah:         {loinc: [], unit: "flag"}
   imaging_sdh_edh:     {loinc: [], unit: "flag"}
@@ -59,14 +77,16 @@ items:           # item -> LOINC (confident only) and canonical unit
 
 labels:
   E1:
-    description: "Acute structural: imaging finding"
+    description: "Acute structural: imaging finding (ACUTE/SUBACUTE findings only)"
+    note: "Imaging flags must be ACUTE/SUBACUTE findings: report qualifiers acute, new, hyperacute, subacute count; chronic, old, remote, sequela do not. Enforced via the optional `acute` column when present."
+    acuity_required: true
     any_of:
-      - {id: E1_ich,        item: imaging_ich,          test: event, window_hours: [-72, 24]}
+      - {id: E1_ich,        item: imaging_ich,          test: event, window_hours: [-72, 24]}   # acute/subacute only
       - {id: E1_sah,        item: imaging_sah,          test: event, window_hours: [-72, 24]}
       - {id: E1_sdh_edh,    item: imaging_sdh_edh,      test: event, window_hours: [-72, 24]}
       - {id: E1_infarct,    item: imaging_infarct,      test: event, window_hours: [-72, 24]}
       - {id: E1_tbi,        item: imaging_tbi_contusion, test: event, window_hours: [-72, 24]}
-      - {id: E1_mass,       item: imaging_mass_effect,  test: event, window_hours: [-72, 24]}
+      - {id: E1_mass,       item: imaging_mass_effect,  test: event, window_hours: [-72, 24]}   # acute/subacute findings only (all E1 items)
     sublabel_map: {focal: [imaging_ich, imaging_infarct, imaging_sdh_edh, imaging_tbi_contusion],
                    diffuse: [imaging_sah, imaging_mass_effect]}
   E2:
@@ -74,6 +94,7 @@ labels:
     any_of:
       - {id: E2_arrest,   item: arrest_event,    test: event, window_hours: [-168, 0]}
       - {id: E2_asphyxia, item: asphyxia_event,  test: event, window_hours: [-168, 0]}
+      # profound_shock = sustained MAP < 50 mmHg for >= 30 min (flag computed upstream). Vasopressor count alone is NOT used.
       - {id: E2_shock,    item: profound_shock,  test: event, window_hours: [-48, 0]}
   E4a:
     description: "Exogenous intoxication: toxicology or antidote response"
@@ -89,33 +110,29 @@ labels:
     any_of:
       - {id: E5_ammonia,    item: ammonia,     test: lab_threshold, op: ge, threshold: 100, unit: "umol/L", window_hours: [-24, 6]}
       - {id: E5_bun,        item: bun,         test: lab_threshold, op: ge, threshold: 100, unit: "mg/dL",  window_hours: [-24, 6]}
-      - {id: E5_creatinine, item: creatinine,  test: lab_threshold, op: ge, threshold: 6.0, unit: "mg/dL",  window_hours: [-24, 6]}
-      - {id: E5_glucose_lo, item: glucose,     test: lab_threshold, op: lt, threshold: 50,  unit: "mg/dL",  window_hours: [-12, 6]}
+      - {id: E5_glucose_lo, item: glucose,     test: lab_threshold, op: lt, threshold: 50,  unit: "mg/dL",  window_hours: [-12, 1]}   # post-t0 hypoglycemia may be iatrogenic: window ends +1 h
       - {id: E5_glucose_hi, item: glucose,     test: lab_threshold, op: gt, threshold: 600, unit: "mg/dL",  window_hours: [-24, 6]}
       - {id: E5_na_lo,      item: sodium,      test: lab_threshold, op: lt, threshold: 120, unit: "mmol/L", window_hours: [-24, 6]}
       - {id: E5_na_hi,      item: sodium,      test: lab_threshold, op: gt, threshold: 160, unit: "mmol/L", window_hours: [-24, 6]}
-      - {id: E5_paco2,      item: paco2,       test: lab_threshold, op: gt, threshold: 70,  unit: "mmHg",   window_hours: [-12, 6]}
+      - id: E5_paco2        # hypercapnia needs acidemia (excludes chronic CO2 retention); ideally pH within 1 h of the PaCO2, implemented as both in window
+        all_of:
+          - {id: E5_paco2_hi, item: paco2,       test: lab_threshold, op: gt, threshold: 70,   unit: "mmHg", window_hours: [-12, 6]}
+          - {id: E5_paco2_ph, item: ph_arterial, test: lab_threshold, op: lt, threshold: 7.30, unit: "pH",   window_hours: [-12, 6]}
       - {id: E5_ph_lo,      item: ph_arterial, test: lab_threshold, op: lt, threshold: 7.10, unit: "pH",    window_hours: [-12, 6]}
       - {id: E5_calcium_hi, item: calcium,     test: lab_threshold, op: gt, threshold: 14,  unit: "mg/dL",  window_hours: [-24, 6]}
-    note: "Hepatic/uremic thresholds additionally need clinician review of acute-on-chronic baselines (PROPOSED)."
+    note: "Hepatic (ammonia) and uremic (BUN) thresholds still need clinician review of acute-on-chronic baselines at the co-investigator re-review. Creatinine was removed (flags stable ESRD)."
   E6:
-    description: "Systemic infection/inflammation without CNS infection (sepsis-associated)"
+    description: "Systemic infection/inflammation without CNS infection (sepsis-associated; CDC Adult Sepsis Event style)"
     all_of:
-      - id: E6_suspected_infection
-        item: suspected_infection
-        test: event
-        window_hours: [-72, 24]
-      - any_of:   # organ dysfunction / systemic response (PROPOSED: lactate or >=2 SIRS-like findings)
-          - {id: E6_lactate, item: lactate, test: lab_threshold, op: ge, threshold: 2.0, unit: "mmol/L", window_hours: [-24, 6]}
-          - {id: E6_bacteremia, item: blood_culture_pos, test: event, window_hours: [-72, 24]}
-          - id: E6_sirs2
-            sirs_at_least: 2
-            window_hours: [-24, 6]
-            criteria:
-              - {item: temp_c,     any: [{op: gt, threshold: 38.0}, {op: lt, threshold: 36.0}]}
-              - {item: heart_rate, any: [{op: gt, threshold: 90}]}
-              - {item: resp_rate,  any: [{op: gt, threshold: 20}]}
-              - {item: wbc,        any: [{op: gt, threshold: 12.0}, {op: lt, threshold: 4.0}]}
+      - {id: E6_blood_culture, item: blood_culture_drawn, test: event, window_hours: [-72, 24]}
+      - {id: E6_qad, item: qad_ge4, test: event, window_hours: [-72, 24]}   # >=4 consecutive qualifying antimicrobial days starting within +-2 d of the culture (upstream)
+      - id: E6_organ_dysfunction
+        any_of:   # window [-48, 24]. New mechanical ventilation is deliberately NOT used (comatose patients are intubated for airway protection).
+          - {id: E6_vasopressor, item: vasopressor_initiation, test: event, window_hours: [-48, 24]}
+          - {id: E6_lactate, item: lactate, test: lab_threshold, op: ge, threshold: 2.0, unit: "mmol/L", window_hours: [-48, 24]}
+          - {id: E6_creatinine_doubling, item: creatinine_doubling, test: event, window_hours: [-48, 24]}   # vs encounter baseline, excluding ESRD
+          - {id: E6_bilirubin, item: bilirubin_doubling_ge2, test: event, window_hours: [-48, 24]}          # bilirubin >= 2.0 mg/dL and doubled
+          - {id: E6_platelets_drop, item: platelets_drop, test: event, window_hours: [-48, 24]}             # <100 x10^3/uL and >= 50% decline from baseline >= 100
     exclude_if_label: E7
   E7:
     description: "CNS infection/inflammation: CSF or culture result"
@@ -125,10 +142,11 @@ labels:
       - {id: E7_autoimmune_ab, item: csf_autoimmune_ab_pos, test: event, window_hours: [-168, 168]}
       - id: E7_csf_pleocytosis
         all_of:
-          - {id: E7_csf_wbc, item: csf_wbc, test: lab_threshold, op: ge, threshold: 20, unit: "cells/uL", window_hours: [-72, 72]}
+          - {id: E7_csf_wbc, item: csf_wbc, test: lab_threshold, op: ge, threshold: 20, unit: "cells/uL", window_hours: [-72, 72],
+             rbc_correct: {item: csf_rbc, divisor: 500}}   # corrected WBC = WBC - RBC/500 when RBC from the same tap (same timestamp); else uncorrected
           - id: E7_csf_support
             any_of:
               - {id: E7_csf_protein, item: csf_protein, test: lab_threshold, op: gt, threshold: 100, unit: "mg/dL", window_hours: [-72, 72]}
               - {id: E7_csf_glucose, item: csf_glucose, test: lab_threshold, op: lt, threshold: 40,  unit: "mg/dL", window_hours: [-72, 72]}
               - {id: E7_blood_culture, item: blood_culture_pos, test: event, window_hours: [-72, 72]}
-    note: "Cell-count rule is PROPOSED; traumatic taps and antibiotics pre-treatment need clinician rules."
+    note: "CSF WBC threshold applies to the RBC-corrected count (traumatic taps inflate WBC). Antibiotic pre-treatment still needs clinician rules at the co-investigator re-review."

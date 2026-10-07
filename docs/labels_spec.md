@@ -2,7 +2,7 @@
 
 Code: `sortinghat/labels/`. Config: `configs/silver_anchors.yaml`. Tests: `tests/test_labels*.py`.
 Source: `docs/research_plan_v1.txt` (Revised ontology, Reference standard, Silver labels: the circularity rules,
-Phase 0b); `DECISION_LOG.md` D-001..D-013. Everything here was built and tested on tiny hand-made fixtures only;
+Phase 0b); `DECISION_LOG.md` D-001..D-013 and D-084..D-092 (anchor changes). Everything here was built and tested on tiny hand-made fixtures only;
 no HEEDB data was seen. Every output that may leave a restricted-data job is aggregate-only with small-cell
 suppression (n < 11 shown as `<11`) via `sortinghat.safe_output`. Record-level ID lists go only to `local_only/`.
 
@@ -76,24 +76,43 @@ ICD-10-CM codes under the banned prefixes, enumerated 2026-10-07 from the ICD-10
 
 The family rule bans by prefix (`G92`, `G934`), so future-year additions are caught; G92.0x and G93.42-G93.45 are
 not "nonspecific" but are banned with the family (they are not independent anchors for these labels either).
-Re-enumerate each October. Legacy ICD-9 prefixes 348.30/348.31/348.39/349.82 are also banned but were recalled
-from memory, not tool-verified: confirm before use (HEEDB `condition_source_value` mixes ICD-9 and ICD-10).
+Re-enumerate each October. Legacy ICD-9 prefixes 348.30/348.31/348.39/349.82 are also banned; the project lead
+verified on 2026-10-07 that these four codes are correct (not tool-enumerated). HEEDB `condition_source_value`
+mixes ICD-9 and ICD-10.
 
 ## 4. Objective anchors (`anchors.py`, `configs/silver_anchors.yaml`)
 
-A silver positive needs at least one satisfied anchor; the YAML holds all rules as data. **Every threshold and
-window is PROPOSED — needs co-investigator sign-off.** Input is a tidy event table
-`case_id | item | value | hours_from_t0` (t0 = EEG start); items map from OMOP via the LOINC table in the YAML
-(LOINC listed only where confident; empty list = map locally; verify against the local concept map).
+A silver positive needs at least one satisfied anchor; the YAML holds all rules as data. **Status: SIGNED OFF by
+the project lead 2026-10-07 (delegated decision); re-review with the EEG/neurocritical-care co-investigator before
+Study 1 protocol lock** (DECISION_LOG D-084..D-092). Input is a tidy event table
+`case_id | item | value | hours_from_t0` (t0 = EEG start) plus an optional boolean `acute` column; items map from
+OMOP via the LOINC table in the YAML (LOINC listed only where confident; empty list = map locally; verify against
+the local concept map). Flag items (`loinc: []`) are computed upstream by the extractor.
 
-| Label | Anchor (proposed) | Window vs t0 (h) |
+| Label | Anchor | Window vs t0 (h) |
 |---|---|---|
-| E1 | imaging finding: ICH, SAH, SDH/EDH, infarct, TBI/contusion, mass effect | -72 to +24 |
-| E2 | arrest event; asphyxia; profound shock | -168 to 0; -168 to 0; -48 to 0 |
+| E1 | ACUTE/SUBACUTE imaging finding: ICH, SAH, SDH/EDH, infarct, TBI/contusion, mass effect (`acuity_required: true`) | -72 to +24 |
+| E2 | arrest event; asphyxia; profound shock (sustained MAP < 50 mmHg for >= 30 min, flag computed upstream) | -168 to 0; -168 to 0; -48 to 0 |
 | E4a | antidote with documented response; non-therapeutic tox screen; ethanol >= 300 mg/dL; acetaminophen >= 150 ug/mL; salicylate >= 30 mg/dL | -6 to +6; -24 to +6 |
-| E5 | ammonia >= 100 umol/L; BUN >= 100 or creatinine >= 6.0 mg/dL; glucose < 50 or > 600 mg/dL; Na < 120 or > 160 mmol/L; PaCO2 > 70 mmHg; arterial pH < 7.10; Ca > 14 mg/dL | -24 to +6 (glucose<50, PaCO2, pH: -12 to +6) |
-| E6 | suspected infection AND (lactate >= 2, or bacteremia, or >= 2 SIRS-type findings); removed if any E7 anchor fires | -72 to +24 / -24 to +6 |
-| E7 | CSF culture or PCR positive; autoimmune antibody; or CSF WBC >= 20/uL plus protein > 100, glucose < 40 or positive blood culture | -72 to +72 (antibody -168 to +168) |
+| E5 | ammonia >= 100 umol/L; BUN >= 100 mg/dL; glucose < 50 (window ends +1 h) or > 600 mg/dL; Na < 120 or > 160 mmol/L; PaCO2 > 70 mmHg AND arterial pH < 7.30 (both in window); arterial pH < 7.10; Ca > 14 mg/dL. Creatinine is not an anchor. | -24 to +6 (glucose<50: -12 to +1; PaCO2+pH, pH<7.10: -12 to +6) |
+| E6 | CDC Adult Sepsis Event style: blood culture drawn AND `qad_ge4` (>= 4 consecutive qualifying antimicrobial days starting within +-2 d of the culture; upstream) AND any organ dysfunction: vasopressor initiation, lactate >= 2.0 mmol/L, `creatinine_doubling` (vs encounter baseline, excluding ESRD), `bilirubin_doubling_ge2` (>= 2.0 mg/dL and doubled), `platelets_drop` (< 100 x10^3/uL and >= 50% decline from baseline >= 100). Removed if any E7 anchor fires. No SIRS, no new mechanical ventilation. | culture and QAD -72 to +24; organ dysfunction -48 to +24 |
+| E7 | CSF culture or PCR positive; autoimmune antibody; or RBC-corrected CSF WBC >= 20/uL plus protein > 100, glucose < 40 or positive blood culture | -72 to +72 (antibody -168 to +168) |
+
+Rule details:
+
+- **E1 acuity.** Imaging flags must be acute or subacute findings (report qualifiers acute, new, hyperacute,
+  subacute count; chronic, old, remote, sequela do not). When a label sets `acuity_required` and the event table
+  has an `acute` column, only rows with `acute == True` count (missing or null acute does not count). If the
+  column is absent the extractor must have applied the filter.
+- **E5 PaCO2.** A composite `all_of`: PaCO2 > 70 mmHg and arterial pH < 7.30, both inside [-12, +6] h (pH within
+  1 h of the PaCO2 is ideal; the implementation only requires both in the window). The acidemia requirement
+  excludes chronic CO2 retention. Hepatic (ammonia) and uremic (BUN) thresholds keep a note that acute-on-chronic
+  baselines need clinician review.
+- **E6.** Mechanical ventilation is deliberately not used (comatose patients are intubated for airway
+  protection). SIRS and the `suspected_infection` item were removed.
+- **E7 RBC correction.** Corrected WBC = csf_wbc - csf_rbc / 500 (floored at 0) when a `csf_rbc` row has the same
+  `hours_from_t0` as the `csf_wbc` row (same tap); otherwise the uncorrected count is used. `csf_rbc` has no
+  LOINC in the YAML (26455-6 is a candidate, not verified).
 
 E4a note: toxicology positivity for a drug given in hospital is E4b, not E4a; the extractor must drop in-hospital
 agents. `silver_anchor_table(events)` returns a boolean case-by-label table; fired anchor ids are kept in
@@ -125,7 +144,8 @@ cases and audit cases raises `SilverScoringError` (silver labels train, never sc
 
 ## Open items
 
-Anchor thresholds and windows need clinician sign-off; ICD-9 prefixes need verification; the OMOP-to-item mapper
+Anchor thresholds and windows were signed off by the project lead (delegated) and need EEG/neurocritical-care
+co-investigator re-review before Study 1 protocol lock; the OMOP-to-item mapper
 (LOINC and drug/procedure concepts to `items`) is not built, since the real table contents are unseen; the
 reviewer-packet summarizer (open-weight, 50-case validation) is out of scope here; `BS` abbreviation leakage
 should be checked in the pilot.

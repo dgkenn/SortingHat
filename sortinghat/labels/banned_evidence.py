@@ -54,9 +54,10 @@ BANNED_ICD10_CM: tuple[tuple[str, str, bool], ...] = (
 BANNED_ICD10_PREFIXES: tuple[str, ...] = ("G92", "G934")
 
 # Legacy ICD-9-CM equivalents (HEEDB condition_source_value mixes ICD-9 and ICD-10).
-# Recalled from the ICD-9-CM tabular list, NOT enumerated from a tool: verify before use.
+# Verified as correct by the project lead 2026-10-07 (348.30, 348.31, 348.39, 349.82); not tool-enumerated.
 BANNED_ICD9_PREFIXES: tuple[str, ...] = ("34830", "34831", "34839", "34982")   # 348.30/.31/.39, 349.82
-ICD9_NOTE = "UNVERIFIED: 348.30 encephalopathy NOS, 348.31 metabolic, 348.39 other, 349.82 toxic"
+ICD9_NOTE = ("VERIFIED by project lead 2026-10-07: 348.30 encephalopathy NOS, 348.31 metabolic, "
+             "348.39 other, 349.82 toxic")
 
 
 def normalize_code(code: str) -> str:

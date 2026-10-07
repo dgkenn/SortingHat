@@ -558,3 +558,61 @@
 - **Decision:** Any LLM used to read notes is an open-weight model running on approved compute.
 - **Rationale:** A hosted model would receive restricted note text, which the BDSP terms prohibit.
 - **Source:** Phase 0e, fourth bullet; Reference standard, packet paragraph.
+
+---
+
+## Silver-anchor rule changes (labels)
+
+### D-084 Remove creatinine from E5 anchors
+- **Date:** 2026-10-07 · **Area:** labels · **Outcome data seen?** No
+- **Decision:** Delete the E5_creatinine anchor (creatinine >= 6.0 mg/dL); BUN >= 100 mg/dL and the other E5 anchors stay.
+- **Rationale:** A creatinine threshold flags patients with stable end-stage renal disease, whose level does not explain acute coma.
+- **Source:** Project lead sign-off of the proposed silver-anchor rules (2026-10-07); Silver labels: the circularity rules; builds on D-009.
+
+### D-085 Require acidemia for the E5 PaCO2 anchor
+- **Date:** 2026-10-07 · **Area:** labels · **Outcome data seen?** No
+- **Decision:** E5_paco2 becomes an all_of: PaCO2 > 70 mmHg AND arterial pH < 7.30, both within [-12, +6] h of t0 (pH within 1 h of the PaCO2 is ideal; implemented as both in window).
+- **Rationale:** PaCO2 alone includes chronic CO2 retainers; acidemia separates acute hypercapnia from compensated chronic retention.
+- **Source:** Project lead sign-off of the proposed silver-anchor rules (2026-10-07); Silver labels: the circularity rules; builds on D-009.
+
+### D-086 End the E5 hypoglycemia window at +1 h
+- **Date:** 2026-10-07 · **Area:** labels · **Outcome data seen?** No
+- **Decision:** E5_glucose_lo (glucose < 50 mg/dL) window changes from [-12, +6] to [-12, +1] h.
+- **Rationale:** Hypoglycemia found well after t0 may be iatrogenic (insulin, treatment of the unwell patient) and cannot be the cause of the state at t0.
+- **Source:** Project lead sign-off of the proposed silver-anchor rules (2026-10-07); Silver labels: the circularity rules; builds on D-009.
+
+### D-087 Replace E6 with a CDC Adult Sepsis Event style definition
+- **Date:** 2026-10-07 · **Area:** labels · **Outcome data seen?** No
+- **Decision:** E6 becomes all_of: blood culture drawn [-72, +24] h; >= 4 consecutive qualifying antimicrobial days starting within +-2 days of the culture (flag qad_ge4, computed upstream) [-72, +24] h; and any organ dysfunction within [-48, +24] h: vasopressor initiation, lactate >= 2.0 mmol/L, creatinine doubling vs encounter baseline excluding ESRD, bilirubin >= 2.0 mg/dL with doubling, or platelets < 100 x10^3/uL with >= 50% decline from a baseline >= 100. SIRS criteria, the suspected_infection item and the bacteremia branch are removed; new mechanical ventilation is explicitly not used; exclude_if_label E7 is kept.
+- **Rationale:** SIRS is near-universal in comatose ICU patients and would destroy E6 specificity; the CDC Adult Sepsis Event definition is validated for EHR surveillance. Comatose patients are intubated for airway protection, so ventilation is not organ dysfunction evidence.
+- **Source:** Project lead sign-off of the proposed silver-anchor rules (2026-10-07); Silver labels: the circularity rules; builds on D-009.
+
+### D-088 Redefine E2 profound shock as sustained MAP < 50 mmHg for >= 30 min
+- **Date:** 2026-10-07 · **Area:** labels · **Outcome data seen?** No
+- **Decision:** The profound_shock flag (computed upstream) means sustained MAP < 50 mmHg for >= 30 minutes, window [-48, 0] h; the earlier alternative of >= 2 vasopressors is dropped.
+- **Rationale:** Two or more vasopressors without sustained hypotension is ordinary septic shock, not hypoxic-ischemic injury.
+- **Source:** Project lead sign-off of the proposed silver-anchor rules (2026-10-07); Silver labels: the circularity rules; builds on D-009.
+
+### D-089 Require acute or subacute imaging for E1
+- **Date:** 2026-10-07 · **Area:** labels · **Outcome data seen?** No
+- **Decision:** Add a top-level note and item comments that E1 imaging flags must be acute or subacute findings (qualifiers acute, new, hyperacute, subacute; exclude chronic, old, remote, sequela). Add acuity_required: true to E1; anchors.py enforces it when the event table carries an optional boolean acute column (only acute == True rows count).
+- **Rationale:** Chronic imaging findings do not explain acute coma.
+- **Source:** Project lead sign-off of the proposed silver-anchor rules (2026-10-07); Silver labels: the circularity rules; builds on D-009.
+
+### D-090 Apply the E7 CSF WBC threshold to the RBC-corrected count
+- **Date:** 2026-10-07 · **Area:** labels · **Outcome data seen?** No
+- **Decision:** Add item csf_rbc (no LOINC mapped; 26455-6 noted as an unverified candidate). Corrected WBC = csf_wbc - csf_rbc/500 when both come from the same tap (same timestamp); otherwise the uncorrected count is used.
+- **Rationale:** Traumatic taps inflate CSF WBC and would create false E7 positives.
+- **Source:** Project lead sign-off of the proposed silver-anchor rules (2026-10-07); Silver labels: the circularity rules; builds on D-009.
+
+### D-091 Mark the ICD-9 banned prefixes as verified
+- **Date:** 2026-10-07 · **Area:** labels · **Outcome data seen?** No
+- **Decision:** The project lead verified that ICD-9 prefixes 348.30, 348.31, 348.39 and 349.82 are correct; the UNVERIFIED note in banned_evidence.py is changed accordingly.
+- **Rationale:** The prefixes had been recalled from memory rather than tool-enumerated; the lead's check closes that open item.
+- **Source:** Project lead sign-off of the proposed silver-anchor rules (2026-10-07); Silver labels: the circularity rules; builds on D-009.
+
+### D-092 Delegate clinical-threshold sign-off to the project lead, with co-I re-review before lock
+- **Date:** 2026-10-07 · **Area:** labels · **Outcome data seen?** No
+- **Decision:** The silver_anchors.yaml status changes from "PROPOSED — needs co-investigator sign-off" to "SIGNED OFF by project lead 2026-10-07 (delegated decision); re-review with EEG/neurocritical-care co-investigator before Study 1 protocol lock". Per-item notes where clinically uncertain (hepatic and uremic acute-on-chronic, antibiotic pre-treatment for CSF) are kept.
+- **Rationale:** The clinical thresholds and windows were decided by the project lead rather than a clinical co-investigator; the co-investigator's re-review is required before the Study 1 protocol is locked.
+- **Source:** Project lead sign-off of the proposed silver-anchor rules (2026-10-07); Silver labels: the circularity rules; builds on D-009.

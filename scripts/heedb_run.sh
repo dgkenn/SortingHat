@@ -22,7 +22,8 @@
 #                       project used a profile literally named "physionet".
 #
 # Usage:
-#   scripts/heedb_run.sh python -m sortinghat.audit.field_audit --data <dir> --out <dir>
+#   scripts/heedb_run.sh python -m sortinghat.audit.field_audit --s3 --dry-run-schema   # run this first (names only)
+#   scripts/heedb_run.sh python -m sortinghat.audit.field_audit --s3 --out <dir>
 #   HEEDB_AWS_PROFILE=physionet scripts/heedb_run.sh python your_script.py
 #
 # Diagnose a 403 per credential source, never globally (source rule 8):

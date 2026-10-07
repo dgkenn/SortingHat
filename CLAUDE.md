@@ -40,8 +40,10 @@ best-effort for Bash; the human-run-only rule is the real control.
 - Tests: `pytest`
 - Synthetic data: `python -m sortinghat.synthetic --out data/synthetic`
 - Field audit: `python -m sortinghat.audit.field_audit --data data/synthetic --out out/audit`
+- Schema dry run (names only; the first command a human runs on real data, via `scripts/heedb_run.sh ... --s3`):
+  `python -m sortinghat.audit.field_audit --data data/synthetic --dry-run-schema`
 
 ## Schema
 
-Column provenance (DOCUMENTED vs ASSUMED) is in `sortinghat/schema.py` and
-`docs/heedb_schema.md`. Remap ASSUMED columns by a human against the real tables.
+Real table/column names and provenance (CONFIRMED / NAMED / ASSUMED) are in `sortinghat/schema.py`,
+`docs/heedb_schema_real.md` and `docs/heedb_schema.md`. Remap ASSUMED columns by a human against the real tables.

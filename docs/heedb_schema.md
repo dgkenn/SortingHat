@@ -1,59 +1,54 @@
-# HEEDB schema used by the synthetic generator
+# HEEDB schema used by SortingHat tooling
 
-Source: public BDSP page for the Harvard Electroencephalography Database
-(bdsp.io/content/harvard-eeg-db). Note: "HEEDB" also names the unrelated
-Harvard-Emory ECG Database; this project concerns the EEG database.
+**Authoritative source: `docs/heedb_schema_real.md`** (real table and column names found in the earlier research
+code that read the BDSP bucket; status CONFIRMED / NAMED / UNKNOWN per column). `sortinghat/schema.py` is the
+machine-readable copy and `sortinghat/data_io.py` (`TABLES`) holds the matching file/prefix locations. The public
+BDSP page (bdsp.io/content/harvard-eeg-db) only lists the EEG metadata CSV; nothing here has been checked against
+live data by this repo.
 
-Documented publicly: an EEG metadata CSV (SiteID, BDSPPatientID, BidsFolder,
-SessionID, CreationTime, StartTime, EndTime, DurationInSecond, HasXLTEKAnnotations,
-HasPersystAnnotations, ServiceName, AgeAtVisit, SexDSC, BDSPLastModifiedDTS), BIDS
-participants.tsv / scans.tsv, and EHR branches data_Structured (medications, labs,
-vitals, problem lists, ICD, CPT, demographics as Parquet), data_Unstructured (notes,
-EEG reports) and data_Imaging (imaging metadata and reports). Site IDs listed: S0001,
-S0002, I0003, I0002 (hospital mapping not given). Column names inside the EHR
-branches, clinical scores (GCS/FOUR/RASS) and acute-care/setting flags are NOT
-publicly documented, so they are ASSUMED below and must be remapped by someone with
-real access (see COLUMN_ALIASES in `sortinghat/schema.py`).
+Provenance vocabulary in `schema.py`:
 
-Operationalisations chosen by the audit (also assumptions): acute care = PatientClass
-in {ICU, Inpatient, ED}; candidate = first acute-care adult EEG per patient with a
-start time; "present" criteria for labs/imaging/notes = >=95%.
+- **CONFIRMED**: read by code that ran against the real table.
+- **NAMED**: appears only in an extractor list, constant or doc table. OMOP extractors skip absent columns
+  silently, so NAMED does not prove the column exists.
+- **ASSUMED**: placeholder; nothing in the source touches it. OMOP tables use standard OMOP CDM v5.4 names.
 
-## Table and column provenance
+## Layout (what the synthetic generator emits and the audit reads)
 
-| Table | Column | Type | Provenance | Description |
-|---|---|---|---|---|
-| eeg_metadata | SiteID | str | DOCUMENTED | Hospital where the EEG was recorded |
-| eeg_metadata | BDSPPatientID | str | DOCUMENTED | Patient identifier |
-| eeg_metadata | BidsFolder | str | DOCUMENTED | Folder holding a patient's studies |
-| eeg_metadata | SessionID | str | DOCUMENTED | Study/session identifier |
-| eeg_metadata | CreationTime | datetime | DOCUMENTED | De-identified (date-shifted) creation time |
-| eeg_metadata | StartTime | datetime | DOCUMENTED | De-identified (date-shifted) EEG start |
-| eeg_metadata | EndTime | datetime | DOCUMENTED | De-identified (date-shifted) EEG end |
-| eeg_metadata | DurationInSecond | float | DOCUMENTED | Recording duration |
-| eeg_metadata | ServiceName | str | DOCUMENTED | Routine / LTM / EMU |
-| eeg_metadata | AgeAtVisit | float | DOCUMENTED | Age at the study |
-| eeg_metadata | SexDSC | str | DOCUMENTED | Patient-reported gender |
-| eeg_metadata | PatientClass | str | ASSUMED | ICU / Inpatient / ED / Outpatient (defines acute care) |
-| eeg_metadata | ReferralIndication | str | ASSUMED | EEG referral indication category |
-| medications | BDSPPatientID | str | ASSUMED | Patient identifier |
-| medications | med_name | str | ASSUMED | Medication name |
-| medications | med_class | str | ASSUMED | sedative / analgesic / antiseizure / other |
-| medications | order_time | datetime | ASSUMED | Order time |
-| medications | admin_time | datetime | ASSUMED | Administration (MAR) time; null if only ordered |
-| labs | BDSPPatientID | str | ASSUMED | Patient identifier |
-| labs | lab_name | str | ASSUMED | Assay |
-| labs | collect_time | datetime | ASSUMED | Specimen collection time |
-| labs | result_time | datetime | ASSUMED | Result / verification time |
-| imaging | BDSPPatientID | str | ASSUMED | Patient identifier |
-| imaging | modality | str | ASSUMED | CT head / MRI brain / CTA |
-| imaging | study_time | datetime | ASSUMED | Acquisition time |
-| imaging | report_final_time | datetime | ASSUMED | Report finalization time |
-| clinical_scores | BDSPPatientID | str | ASSUMED | Patient identifier |
-| clinical_scores | score_type | str | ASSUMED | GCS / FOUR / RASS |
-| clinical_scores | score_value | float | ASSUMED | Score value |
-| clinical_scores | score_time | datetime | ASSUMED | Documentation time |
-| notes | BDSPPatientID | str | ASSUMED | Patient identifier |
-| notes | note_id | str | ASSUMED | Note identifier |
-| notes | note_type | str | ASSUMED | Physician / nursing / EEG report / other |
-| notes | note_time | datetime | ASSUMED | Note timestamp (text body not modelled) |
+| Table key | Location under the access point | Notes |
+|---|---|---|
+| `eeg_metadata` | `EEG/eeg-metadata/{SITE}_eeg_metadata_<release>.csv` | `DurationInSeconds`; `StartTime`/`EndTime` blank; `BDSPPatientID` can be blank (use `BidsFolder` = `sub-<SITE><PID>`); `AgeAtVisit`/`SexDSC` sparse |
+| `reports_findings` | `EEG/HEEDB_Metadata/{SITE}_EEG__reports_findings.csv` | real start/end are `StartTime(EEG)` / `EndTime(EEG)`; label columns (`bs`, `gen slowing`, ...); join on (`BDSPPatientID`, `SessionID`) |
+| `heedb_patients`, `icd10_neurology`, `medication_atc` | `EEG/HEEDB_Metadata/*.csv` | per-patient, wide, no timestamps |
+| `omop_<table>` | `OMOP/Merged/<table>/*.parquet` | `person_id` = `int(BDSPPatientID)`; datetimes are text `YYYY-MM-DD HH:MM:SS[.ffffff]` |
+| `imaging` | `Imaging/imaging_metadata/*.parquet` | ASSUMED location and columns |
+
+Analytic mapping used by the audit (`sortinghat/audit/field_audit.py`):
+
+| Audit field | Real source |
+|---|---|
+| EEG start `t0` | `reports_findings."StartTime(EEG)"` |
+| age | `reports_findings.AgeAtVisit`, else `eeg_metadata.AgeAtVisit` |
+| medication timing | `omop_drug_exposure` (`drug_source_value` regex for sedatives; `drug_exposure_end_datetime` present as the administration-record proxy) |
+| lab collection / result time | `omop_measurement.measurement_datetime`; **no result-time column known**, so the row fails unless one is found |
+| GCS / FOUR / RASS | `omop_measurement` rows whose `measurement_source_value` matches the score regex |
+| notes | `omop_note.note_datetime` (ASSUMED) |
+| imaging finalization | `imaging.report_final_datetime` (ASSUMED) |
+| acute care flag | `eeg_metadata.PatientClass` (ASSUMED); if absent the audit uses all adults and says so |
+
+## Remaining unknowns (settle with `--dry-run-schema`, names only)
+
+1. **Imaging**: table location under `Imaging/`, modality, report finalization time.
+2. **Notes**: whether OMOP `note` / `note_nlp` exist in `OMOP/Merged/`, and the note timestamp and type coding.
+3. **PatientClass** (acute-care flag) and **ReferralIndication**: not seen in any table. Nearest proxies are
+   `ServiceName` and `visit_occurrence.visit_concept_id` (NAMED, may be zero-filled).
+4. **Lab result / verification time**: OMOP `measurement` has only `measurement_datetime` / `measurement_date`.
+5. **Medication order versus administration time**: semantics of `drug_exposure_start_datetime` are not stated.
+6. **OMOP `person` extras** (gender, birth date, race): the table was verified to match EEG patients but its
+   columns were never read.
+7. Other ICD-chapter and ATC-group columns in the wide tables; FOUR-score rows in `measurement`;
+   `eeg_metadata.BDSPPatientID` blankness per release; hospital names behind site codes.
+
+## Column list
+
+Generated from `schema.py` (`python -c "from sortinghat import schema; print(schema.provenance_markdown())"`).
