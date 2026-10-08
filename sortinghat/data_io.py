@@ -476,6 +476,14 @@ def bids_edf_key(site: str, bids_folder: str, session_id: str, eeg_folder: str |
             f"{bids_folder}_ses-{session_id}_task-{task}_eeg.edf")
 
 
+def edf_key_for_row(site, bids_folder, session_id, eeg_folder) -> str:
+    """THE convention for turning one table row's cells into the EDF key: every cell is taken as text (``str``), a missing
+    ``EEGFolder`` (None / NaN / NA) is None, then ``bids_edf_key``. Used by the cohort key list AND by
+    ``scripts/extract_eeg_features.py`` when it builds keys from BidsFolder + SessionID, so both always agree."""
+    ef = None if (eeg_folder is None or pd.isna(eeg_folder)) else str(eeg_folder)
+    return bids_edf_key(str(site), str(bids_folder), str(session_id), ef)
+
+
 def bids_folder_for(site: str, bdsp_patient_id: str | int) -> str:
     """``BidsFolder`` convention: ``sub-<SITE><BDSPPatientID>`` (the metadata BDSPPatientID can be blank)."""
     return f"sub-{site}{bdsp_patient_id}"

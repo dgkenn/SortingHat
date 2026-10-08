@@ -23,7 +23,7 @@ import pandas as pd
 
 from .. import data_io, schema
 from ..audit import field_audit as fa
-from . import rules
+from . import integrity, rules
 
 SESSION_COLUMNS = ["SiteID", "person_id", "SessionID", "BidsFolder", "EEGFolder", "ServiceName", "t0",
                    "t_end", "age_years", "duration_raw_s"]
@@ -148,19 +148,29 @@ def site_sessions(meta: pd.DataFrame, rf: pd.DataFrame | None, site: str) -> pd.
 
     Start/end/age come from ``field_audit.merge_eeg`` (the audit's rule, so the cohort and the audit agree):
     ``StartTime(EEG)`` of the findings table, else the metadata ``StartTime`` (the only source at I0008/I0009,
-    whose findings file does not exist). ``ServiceName`` prefers the metadata column, else ``ServiceName(EEG)``."""
+    whose findings file does not exist). ``ServiceName`` prefers the metadata column, else ``ServiceName(EEG)``.
+
+    ROW ALIGNMENT. ``SessionID`` is NOT unique across patients (it is a per-patient counter: many patients have a
+    session "1"), so nothing here may be joined on ``SessionID`` alone. ``merge_eeg`` returns one row per metadata
+    row in metadata order (a left join on the unique key ``(person_id, SessionID)``); the metadata columns
+    (``BidsFolder``, ``EEGFolder``, ``ServiceName``, duration) are therefore taken POSITIONALLY from the same rows,
+    and the findings ``ServiceName(EEG)`` is joined on ``(person_id, SessionID)``. The row count is asserted."""
     m = fa.merge_eeg(meta, rf, site)
-    extra = pd.DataFrame({
-        "SessionID": _text(meta, "SessionID"),
-        "BidsFolder": _text(meta, "BidsFolder"), "EEGFolder": _text(meta, "EEGFolder"),
-        "ServiceName": _text(meta, "ServiceName"),
-        "duration_raw_s": pd.to_numeric(meta["DurationInSeconds"], errors="coerce") if "DurationInSeconds" in meta
-        else np.nan}).drop_duplicates("SessionID")
-    out = m.merge(extra, on="SessionID", how="left")
-    if rf is not None and schema.SERVICE_EEG in rf:
-        svc = pd.DataFrame({"SessionID": _text(rf, "SessionID"), "_svc_rf": _text(rf, schema.SERVICE_EEG)}
-                           ).drop_duplicates("SessionID")
-        out = out.merge(svc, on="SessionID", how="left")
+    if len(m) != len(meta):
+        raise RuntimeError("session frame lost row alignment with eeg_metadata")
+    out = m.reset_index(drop=True)
+    out["BidsFolder"] = _text(meta, "BidsFolder").to_numpy(object)
+    out["EEGFolder"] = _text(meta, "EEGFolder").to_numpy(object)
+    out["ServiceName"] = _text(meta, "ServiceName").to_numpy(object)
+    out["duration_raw_s"] = (pd.to_numeric(meta["DurationInSeconds"], errors="coerce").to_numpy(float)
+                             if "DurationInSeconds" in meta else np.nan)
+    if rf is not None and schema.SERVICE_EEG in rf and len(rf):
+        svc = pd.DataFrame({"person_id": fa.person_ids(rf, site), "SessionID": _text(rf, "SessionID"),
+                            "_svc_rf": _text(rf, schema.SERVICE_EEG)}).drop_duplicates(["person_id", "SessionID"])
+        n = len(out)
+        out = out.merge(svc, on=["person_id", "SessionID"], how="left")
+        if len(out) != n:
+            raise RuntimeError("session frame lost row alignment with reports_findings")
         out["ServiceName"] = out["ServiceName"].where(out["ServiceName"].notna(), out["_svc_rf"])
         out = out.drop(columns="_svc_rf")
     out["SiteID"] = site
@@ -189,14 +199,19 @@ class FrameSources:
 
     def sessions(self) -> pd.DataFrame:
         meta, rf = self.t["eeg_metadata"], self.t.get("reports_findings")
-        parts = []
+        parts, idx = [], []
         for site, g in meta.groupby("SiteID", sort=True):
-            sess = set(g["SessionID"].astype(str))
-            fg = rf[rf["SessionID"].astype(str).isin(sess)] if rf is not None and len(rf) else None
+            fg = fa.site_findings(rf, g, str(site))
             parts.append(site_sessions(g, fg, str(site)))
+            idx.append(integrity.source_index(g, fg, str(site)))
+        self._index = pd.concat(idx, ignore_index=True) if idx else integrity.empty_index()
         if not parts:
             return empty_sessions()
         return pd.concat(parts, ignore_index=True)
+
+    def source_index(self) -> pd.DataFrame:
+        """Independent keys of the source eeg_metadata rows (see ``cohort.integrity``); call after ``sessions()``."""
+        return self._index
 
     def merge_map(self) -> tuple[dict[int, int], str]:
         """({retired id: surviving id}, status). Optional table key ``patient_merge_history`` (not a ``schema`` table)."""
@@ -212,7 +227,8 @@ class FrameSources:
             return _empty(table)
         return d[d["person_id"].isin(set(int(p) for p in person_ids))]
 
-    def visits(self, person_ids, bounds=None, remap=None, slack_h: float = 0.0) -> pd.DataFrame:
+    def visits(self, person_ids, bounds=None, remap=None, slack_h: float = 0.0, dates_only: bool = False
+               ) -> pd.DataFrame:
         return remap_ids(self._rows("omop_visit_occurrence", person_ids), remap)
 
     def scores(self, person_ids, window=None, remap=None) -> pd.DataFrame:
@@ -233,7 +249,7 @@ class StoreSources:
 
     def sessions(self) -> pd.DataFrame:
         sites = self.sites or data_io.discover_sites(self.s3)
-        parts = []
+        parts, idx = [], []
         for site in sites:
             try:
                 meta = data_io.read_site_table("eeg_metadata", site, s3=self.s3)
@@ -246,9 +262,15 @@ class StoreSources:
             meta = schema.coerce_types("eeg_metadata", meta)
             rf = None if rf is None else schema.coerce_types("reports_findings", rf)
             parts.append(site_sessions(meta, rf, site))
+            idx.append(integrity.source_index(meta, rf, site))
         if not parts:
             raise FileNotFoundError("no eeg_metadata CSV found for any requested site")
+        self._index = pd.concat(idx, ignore_index=True)
         return pd.concat(parts, ignore_index=True)
+
+    def source_index(self) -> pd.DataFrame:
+        """Independent keys of the source eeg_metadata rows (see ``cohort.integrity``); call after ``sessions()``."""
+        return self._index
 
     def merge_map(self) -> tuple[dict[int, int], str]:
         """Read ``PatientMergeHistory/`` if it has files (CSV or parquet); only whole-file reads, ids kept in memory."""
@@ -289,11 +311,12 @@ class StoreSources:
         if buf:
             yield buf[0] if len(buf) == 1 else pd.concat(buf, ignore_index=True)
 
-    def visits(self, person_ids, bounds=None, remap=None, slack_h: float = 0.0) -> pd.DataFrame:
+    def visits(self, person_ids, bounds=None, remap=None, slack_h: float = 0.0, dates_only: bool = False
+               ) -> pd.DataFrame:
         """COMPACT visits (``rules.compact_visits``), compacted, re-keyed and pruned PER CHUNK as they stream in."""
         chunks = []
         for raw in self.iter_rows("omop_visit_occurrence", _VISIT_COLS, person_ids, min_rows=250_000):
-            c = rules.compact_visits(raw)
+            c = rules.compact_visits(raw, dates_only=dates_only)
             del raw
             c = rules.prune_visits(remap_ids(c, remap), bounds, slack_h)
             if len(c):

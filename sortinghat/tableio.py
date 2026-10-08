@@ -60,8 +60,13 @@ def write_tables(tables: dict[str, pd.DataFrame], outdir: str | Path, fmt: str =
     root = Path(outdir)
     root.mkdir(parents=True, exist_ok=True)
     paths: list[Path] = []
-    site_of_session = (tables["eeg_metadata"].drop_duplicates("SessionID")
-                       .set_index("SessionID")["SiteID"] if "eeg_metadata" in tables else None)
+    # reports_findings has no SiteID: its site is that of the eeg_metadata row with the same (BDSPPatientID, SessionID).
+    # SessionID alone is not a key (a per-patient counter), so it is never used by itself.
+    site_of: dict = {}
+    if "eeg_metadata" in tables:
+        from .audit.field_audit import person_ids         # BDSPPatientID, else parsed from BidsFolder (blank in some releases)
+        for st, g in tables["eeg_metadata"].groupby("SiteID"):
+            site_of.update(zip(zip(person_ids(g, str(st)).astype("Int64").astype(str), g["SessionID"].astype(str)), [st] * len(g)))
     for name, raw in tables.items():
         spec = data_io.TABLES[name]
         df = _as_text(name, raw)
@@ -70,7 +75,8 @@ def write_tables(tables: dict[str, pd.DataFrame], outdir: str | Path, fmt: str =
                 g = data_io.denormalise_site_table(name, str(site), g)        # the site's real header, real names
                 paths.append(_write_csv(g, root / f"{data_io.EEG_METADATA_PREFIX}{site}_eeg_metadata_{RELEASE}.csv"))
         elif name == "reports_findings":
-            sites = df["SessionID"].map(site_of_session)
+            pk = pd.to_numeric(df["BDSPPatientID"], errors="coerce").astype("Int64").astype(str)
+            sites = pd.Series([site_of.get((p, str(i))) for p, i in zip(pk, df["SessionID"])], index=df.index, dtype=object)
             for site, g in df.groupby(sites, sort=True):
                 v = schema.variant_for(str(site))
                 if v is not None and v.reports_findings is None:

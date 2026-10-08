@@ -111,6 +111,8 @@ def prepare_visits(visits: pd.DataFrame, open_days: float | None = 30.0, date_on
                    dates_only: bool = False) -> pd.DataFrame:
     """``compact_visits`` (unless already compact) plus the open-end horizon (``with_horizon``)."""
     v = visits if "_start" in visits else compact_visits(visits, date_only_end_of_day, dates_only)
+    if dates_only and "_start" in visits:                    # already compact (e.g. streamed): reduce to dates here too
+        v = v.assign(_start=v["_start"].dt.normalize(), _end=v["_end"].dt.normalize())
     return with_horizon(v, open_days)
 
 
@@ -214,6 +216,22 @@ def match_visits(sessions: pd.DataFrame, visits: pd.DataFrame, acute: tuple[str,
         enc = enc.where(enc <= t0, t0)
         out.loc[enc.index.to_numpy(), "encounter_start"] = enc.astype("datetime64[us]").to_numpy()
     return out
+
+
+def acute_parts(visit_class: pd.Series, inpatient_length: pd.Series, service: pd.Series, acute_classes,
+                service_acute, use_service_proxy: bool = True) -> tuple[pd.Series, pd.Series, pd.Series]:
+    """The acute-care proxy (D-111) on a matched visit: ``(by_class, by_length, by_service)`` boolean Series.
+    A visit classified by concept id / text (a no-op while every concept id is 0) decides by its class alone;
+    otherwise the covering visit is inpatient-length (end date after start date) OR ``ServiceName`` (upper case)
+    contains one of ``service_acute``. Used by the cohort build and by the Phase 0a audit."""
+    known = visit_class.notna()
+    by_class = known & visit_class.isin(list(acute_classes))
+    by_length = ~known & inpatient_length.fillna(False).astype(bool)
+    svc = service.fillna("").astype(str).str.upper()
+    toks = [t.upper() for t in service_acute]
+    hit = pd.Series([any(t in x for t in toks) for x in svc], index=service.index) if use_service_proxy else \
+        pd.Series(False, index=service.index)
+    return by_class, by_length, ~known & hit
 
 
 # ---------------------------------------------------------------------------------------------- scores

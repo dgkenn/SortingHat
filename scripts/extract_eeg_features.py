@@ -96,7 +96,7 @@ def load_recordings_with_parts(path: Path) -> list[tuple[str, str, tuple | None]
         eeg = df["EEGFolder"] if "EEGFolder" in df.columns else pd.Series([None] * len(df))
         parts = [(str(s), str(b), str(i), None if pd.isna(e) else str(e))
                  for s, b, i, e in zip(df[site_col], df["BidsFolder"], df["SessionID"], eeg)]
-        keys = pd.Series([bids_edf_key(*p) for p in parts])
+        keys = pd.Series([bids_edf_key(*p) for p in parts])      # == data_io.edf_key_for_row on the same cells (cohort key list)
     else:
         raise SystemExit("input needs an edf_key/key column, or BidsFolder + SessionID + a site column")
     ids = df["recording_id"].astype(str) if "recording_id" in df.columns else keys.map(opaque_id)

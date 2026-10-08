@@ -169,6 +169,15 @@ def merge_eeg(meta: pd.DataFrame, findings: pd.DataFrame | None, site: str) -> p
     return m
 
 
+def site_findings(rf: pd.DataFrame | None, meta: pd.DataFrame, site: str) -> pd.DataFrame | None:
+    """The rows of a whole-cohort ``reports_findings`` that belong to one site's ``meta``: matched on the pair
+    (person_id, SessionID). ``SessionID`` alone is NOT a key (it is a per-patient counter, 1..N, repeated across patients)."""
+    if rf is None or not len(rf):
+        return rf
+    keys = pd.MultiIndex.from_arrays([person_ids(meta, site), meta["SessionID"].astype("string")])
+    return rf[pd.MultiIndex.from_arrays([person_ids(rf, site), rf["SessionID"].astype("string")]).isin(keys)]
+
+
 def filter_drugs(d: pd.DataFrame) -> pd.DataFrame:
     if "drug_source_value" not in d:
         return d.iloc[0:0]
@@ -245,9 +254,7 @@ def from_raw_tables(raw: dict[str, pd.DataFrame]) -> dict[str, pd.DataFrame]:
     meta, rf = raw["eeg_metadata"], raw.get("reports_findings")
     parts = []
     for site, g in meta.groupby("SiteID", sort=True):
-        sess = set(g["SessionID"].astype(str))
-        fg = rf[rf["SessionID"].astype(str).isin(sess)] if rf is not None else None
-        parts.append(merge_eeg(g, fg, str(site)))
+        parts.append(merge_eeg(g, site_findings(rf, g, str(site)), str(site)))
     eeg = pd.concat(parts, ignore_index=True)
     if not eeg["PatientClass"].notna().any() and "omop_visit_occurrence" in raw:     # real files have no PatientClass
         eeg["PatientClass"] = derive_patient_class(eeg, raw["omop_visit_occurrence"])
@@ -447,7 +454,7 @@ def build_candidates(eeg: pd.DataFrame) -> pd.DataFrame:
     e, _ = acute_adult(eeg)
     e = e[e["StartTime"].notna() & e["person_id"].notna()]
     e = e.sort_values(["person_id", "StartTime"], kind="stable")
-    first = e.groupby("person_id", as_index=False).first()
+    first = e.drop_duplicates("person_id", keep="first")            # the whole earliest row (groupby.first() is per column)
     return first[["person_id", "SiteID", "StartTime"]].rename(columns={"StartTime": "t0"})
 
 

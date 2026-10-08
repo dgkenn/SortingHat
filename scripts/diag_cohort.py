@@ -28,6 +28,9 @@ def main(argv=None) -> int:
     ap.add_argument("--profile", help="AWS profile for --s3")
     ap.add_argument("--sites", nargs="+", help="site codes (default: every site with an eeg-metadata CSV)")
     ap.add_argument("--out", help="also write the JSON here (aggregate only)")
+    ap.add_argument("--severity", action="store_true",
+                    help="also run the per-site severity / score-vocabulary diagnostic for the post-first-EEG candidate "
+                         "set (builds the cohort first; reads measurement, observation and condition_occurrence once more)")
     ap.add_argument("--max-memory-gb", type=float, default=None,
                     help="guard: set RLIMIT_AS to this many GB (address space, an upper bound on RSS; pick generously) "
                          "and print a clear aggregate error instead of a traceback if exceeded")
@@ -40,6 +43,10 @@ def _run(a) -> int:
         agent_safety.assert_not_restricted_in_agent(a.data)
     store = data_io.open_store(a.data, profile=a.profile)            # make_client refuses inside an agent session
     report, known = run_diag(store, a.sites)
+    if a.severity:
+        from sortinghat.cohort.severity_diag import run_severity_diag
+        report["severity"], k2 = run_severity_diag(store, a.sites)
+        known |= k2
     if a.out:
         safe_write_json(a.out, report, known)
     print(json.dumps(report, indent=1))

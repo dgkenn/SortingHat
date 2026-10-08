@@ -30,17 +30,22 @@ def build_index(tables: dict[str, pd.DataFrame]) -> pd.DataFrame:
     rf_all = tables.get("reports_findings")
     parts = []
     for site, meta in meta_all.groupby("SiteID", sort=True):
-        sess = set(meta["SessionID"].astype(str))
-        rf = None if rf_all is None else rf_all[rf_all["SessionID"].astype(str).isin(sess)]
+        rf = fa.site_findings(rf_all, meta, str(site))
         m = fa.merge_eeg(meta, rf, str(site))
-        extra = meta.assign(SessionID=meta["SessionID"].astype("string"))[
-            ["SessionID"] + [c for c in ("ReferralIndication", "SexDSC") if c in meta]]
-        extra = extra.rename(columns={"SexDSC": "sex_meta"}).drop_duplicates("SessionID")
-        m = m.merge(extra, on="SessionID", how="left")
+        # merge_eeg is one row per metadata row, in order (left join on the unique (person_id, SessionID)): take the
+        # metadata columns POSITIONALLY. SessionID alone is not a key (1..N per patient, repeated across patients).
+        if len(m) != len(meta):
+            raise RuntimeError("EEG frame lost row alignment with eeg_metadata")
+        for c, name in (("ReferralIndication", "ReferralIndication"), ("SexDSC", "sex_meta")):
+            if c in meta:
+                m[name] = meta[c].to_numpy()
         if rf is not None and "SexDSC" in rf:
-            sx = rf.assign(SessionID=rf["SessionID"].astype("string"))[["SessionID", "SexDSC"]].drop_duplicates(
-                "SessionID").rename(columns={"SexDSC": "sex_rf"})
-            m = m.merge(sx, on="SessionID", how="left")
+            sx = pd.DataFrame({"person_id": fa.person_ids(rf, str(site)), "SessionID": rf["SessionID"].astype("string"),
+                               "sex_rf": rf["SexDSC"].to_numpy()}).drop_duplicates(["person_id", "SessionID"])
+            n = len(m)
+            m = m.merge(sx, on=["person_id", "SessionID"], how="left")
+            if len(m) != n:
+                raise RuntimeError("EEG frame lost row alignment with reports_findings")
         parts.append(m)
     eeg = pd.concat(parts, ignore_index=True)
     e, _ = fa.acute_adult(eeg)

@@ -49,7 +49,7 @@ class World:
                not age_blank else pd.NaT}
         self.meta.append(row)
         if not md_start:
-            self.rf.append({"BDSPPatientID": str(pid), "SessionID": sid,
+            self.rf.append({"SiteID": site, "BDSPPatientID": str(pid), "SessionID": sid,
                             schema.START_EEG: pd.NaT if start_blank else t0,
                             schema.END_EEG: pd.NaT if end_blank else end,
                             "AgeAtVisit": np.nan if age_blank else age, schema.SERVICE_EEG: service})

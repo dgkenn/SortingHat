@@ -30,6 +30,7 @@ from .. import data_io
 from ..safe_output import safe_quantiles, suppress_count
 from . import rules
 from .config import CohortConfig
+from . import integrity
 from .flow import FlowRecorder, debug_report, flow_report
 
 KEY_LIST_COLUMNS = ["SiteID", "person_id", "SessionID", "BidsFolder", "EEGFolder", "edf_key",
@@ -50,6 +51,7 @@ class CohortResult:
     config: dict = field(default_factory=dict)
     merge_status: str = "absent"        # patient merge history: applied | absent | unrecognised
     debug: dict = field(default_factory=dict)   # unmerged diagnostic report (NOT for sharing)
+    stages: dict = field(default_factory=dict)  # RECORD-LEVEL intermediate frames, in memory only (diagnostics)
 
 
 def _hours(a: pd.Series, b: pd.Series) -> pd.Series:
@@ -113,6 +115,9 @@ def build_cohort(src, cfg: CohortConfig | None = None) -> CohortResult:
     S0 = src.sessions().reset_index(drop=True)
     mm, merge_status = src.merge_map() if hasattr(src, "merge_map") else ({}, "absent")
     S0["person_id_source"] = S0["person_id"]
+    src_index = src.source_index() if hasattr(src, "source_index") else None
+    if src_index is not None:
+        integrity.verify_rows(S0, src_index, "sessions loaded from eeg_metadata")
     n_remapped = 0
     if mm and len(S0):
         mapped = S0["person_id"].map(mm)
@@ -151,7 +156,8 @@ def build_cohort(src, cfg: CohortConfig | None = None) -> CohortResult:
     S = run.S.copy()
     S["person_id"] = S["person_id"].astype("int64")
     bounds = S.groupby("person_id")["t0"].agg(lo="min", hi="max").astype("datetime64[s]")
-    visits = fetch(src.visits, S["person_id"].unique(), bounds=bounds, slack_h=cfg.visit_slack_h)
+    visits = fetch(src.visits, S["person_id"].unique(), bounds=bounds, slack_h=cfg.visit_slack_h,
+                   dates_only=cfg.visit_dates_only)
     run.S = S.join(rules.match_visits(S, visits, cfg.acute_classes, cfg.visit_chain_gap_h, cfg.visit_slack_h,
                                       cfg.open_visit_days, cfg.date_only_end_of_day, dates_only=cfg.visit_dates_only))
     del visits
@@ -161,12 +167,8 @@ def build_cohort(src, cfg: CohortConfig | None = None) -> CohortResult:
     # acute-care proxy (D-111): a visit classified by concept id / text (no-op while all ids are 0) decides by its class;
     # otherwise the covering visit is inpatient-length OR ServiceName names an acute setting
     S = run.S
-    known = S["visit_class"].notna()
-    by_class = known & S["visit_class"].isin(cfg.acute_classes)
-    by_length = ~known & S["visit_inpatient_length"].astype(bool)
-    svc = S["ServiceName"].fillna("")
-    by_service = ~known & cfg.use_service_proxy & pd.Series(
-        [any(tok in x for tok in cfg.service_acute) for x in svc], index=S.index)
+    by_class, by_length, by_service = rules.acute_parts(S["visit_class"], S["visit_inpatient_length"], S["ServiceName"],
+                                                        cfg.acute_classes, cfg.service_acute, cfg.use_service_proxy)
     run.drop("Not acute care (visit shorter than a day and no acute ServiceName)", by_class | by_length | by_service, SESS)
     run.S = run.S.assign(acute_basis=np.where(by_class[run.S.index], "visit_class",
                                               np.where(by_length[run.S.index], "visit_length", "service")))
@@ -176,6 +178,8 @@ def build_cohort(src, cfg: CohortConfig | None = None) -> CohortResult:
     # ------------------------------------------------------------------ first qualifying EEG per patient
     run.S = run.S.sort_values(["person_id", "t0", "SessionID"], kind="stable")
     run.drop(LATER_SESSION, ~run.S["person_id"].duplicated(keep="first"), PAT)
+    stages = {"first_eeg": run.S[["person_id", "SiteID", "t0", "encounter_start", "visit_start", "ServiceName",
+                                  "acute_basis", "visit_inpatient_length"]].reset_index(drop=True)}
 
     # ------------------------------------------------------------------ recording must cover minutes 1-11
     dur, basis = _duration(run.S, cfg)
@@ -194,6 +198,7 @@ def build_cohort(src, cfg: CohortConfig | None = None) -> CohortResult:
     on = rules.onset_times(run.S, scores, cfg.onset_rule, cfg.abnormal_gcs_max, cfg.abnormal_four_max)
     run.S = run.S.assign(onset=on["onset"], onset_basis=on["onset_basis"])
     run.S["hours_since_onset"] = _hours(run.S["t0"], run.S["onset"])
+    stages["onset"] = run.S[["person_id", "SiteID", "hours_since_onset", "onset_basis"]].reset_index(drop=True)
     run.drop("No ACI onset proxy", run.S["onset"].notna(), PAT)
     run.drop(f"EEG more than {cfg.onset_max_h:g} h after onset", run.S["hours_since_onset"] <= cfg.onset_max_h, PAT)
     if (run.S["hours_since_onset"] < 0).any():                  # impossible by construction (onset <= t0)
@@ -226,12 +231,13 @@ def build_cohort(src, cfg: CohortConfig | None = None) -> CohortResult:
     S["in_broad"] = (S["severity_strict"] | S["phenotype"]) & prim
     S["n_unstamped_sessions"] = S["person_id"].map(n_unstamped).fillna(0).astype(int)
     fill = pd.Series([data_io.bids_folder_for(s, p) for s, p in zip(S["SiteID"], S["person_id_source"])], index=S.index)
+    S["bids_filled"] = S["BidsFolder"].isna()
     S["BidsFolder"] = S["BidsFolder"].astype(object).where(S["BidsFolder"].notna(), fill)
     run.reason.loc[S["_sess_idx"].to_numpy()] = INCLUDED
     run.stage.loc[S["_sess_idx"].to_numpy()] = 10**6
 
     cols = ["SiteID", "person_id", "person_id_source", "SessionID", "BidsFolder", "EEGFolder", "t0", "age_years", "ServiceName",
-            "visit_class", "visit_match", "visit_inpatient_length", "acute_basis", "duration_s", "duration_basis", "onset", "onset_basis",
+            "bids_filled", "visit_class", "visit_match", "visit_inpatient_length", "acute_basis", "duration_s", "duration_basis", "onset", "onset_basis",
             "hours_since_onset", *[f"onset_le_{h:g}h" for h in cfg.onset_windows_h], "gcs_min_window",
             "four_min_window", "gcs_nearest_window", "four_nearest_window", "n_score_obs_window", "severity_strict",
             "severity_strict_pm6", "phenotype", "in_strict", "in_strict_pm6", "in_broad",
@@ -242,10 +248,13 @@ def build_cohort(src, cfg: CohortConfig | None = None) -> CohortResult:
 
     _partitions(flow, table, cfg)
     keys = make_key_list(table, cfg)
+    if src_index is not None:
+        integrity.verify_rows(table, src_index, "final cohort table", skip_bids=table["bids_filled"])
+    integrity.verify_output(table, keys)
     fates = _fates(S0, run.reason, run.stage)
     raw = flow.raw()
     return CohortResult(table, keys, fates, raw, flow_report(raw, cfg.to_dict()), cfg.to_dict(), merge_status,
-                        debug_report(raw, cfg.to_dict()))
+                        debug_report(raw, cfg.to_dict()), stages)
 
 
 def _fates(S0: pd.DataFrame, reason: pd.Series, stage: pd.Series) -> pd.Series:
@@ -291,9 +300,8 @@ def make_key_list(t: pd.DataFrame, cfg: CohortConfig) -> pd.DataFrame:
     ``edf_key`` is the BIDS EDF key under the access point (``data_io.bids_edf_key``). ``EEGFolder`` exists only in
     the S0001/S0002 headers, so elsewhere the task token defaults to 'EEG' (``task_token_assumed`` = True: UNVERIFIED
     for continuous-EEG sessions at the I-sites). The window is minutes 1-11 (60-660 s from recording start)."""
-    eeg_folder = t["EEGFolder"].astype(object).where(t["EEGFolder"].notna(), None)
-    edf = [data_io.bids_edf_key(s, b, str(sid), ef)
-           for s, b, sid, ef in zip(t["SiteID"], t["BidsFolder"], t["SessionID"], eeg_folder)]
+    edf = [data_io.edf_key_for_row(s, b, sid, ef)                     # the extractor's convention, one function
+           for s, b, sid, ef in zip(t["SiteID"], t["BidsFolder"], t["SessionID"], t["EEGFolder"])]
     k = pd.DataFrame({
         "SiteID": t["SiteID"], "person_id": t["person_id"], "SessionID": t["SessionID"],
         "BidsFolder": t["BidsFolder"], "EEGFolder": t["EEGFolder"], "edf_key": edf,
