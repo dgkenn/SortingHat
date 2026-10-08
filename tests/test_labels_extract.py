@@ -100,7 +100,7 @@ def test_e5_glucose_unit_conversion_mmol_to_mgdl():
 
 
 def test_e5_ammonia_ug_dl_to_umol_l():
-    assert one(lambda f, p: f.lab(p, -3, "AMMONIA, PLASMA", 200, "ug/dL"), "E5")[2] == ["E5_ammonia"]    # 117 umol/L
+    assert one(lambda f, p: f.lab(p, -3, "AMMONIA, PLASMA", 300, "ug/dL"), "E5")[2] == ["E5_ammonia"]    # 176 umol/L (threshold 150)
     assert not one(lambda f, p: f.lab(p, -3, "AMMONIA, PLASMA", 100, "ug/dL"), "E5")[1]                  # 58.7 umol/L
     assert one(lambda f, p: f.lab(p, -3, "AMMONIA, PLASMA", 120, "umol/L"), "E5")[1]
 

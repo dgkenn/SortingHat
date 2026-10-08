@@ -149,3 +149,59 @@ def test_level_scan_is_nested_and_matches_default_level():
     # with heterogeneity the 99% level controls rejection better than 95%
     het = pw.level_scan(replace(cfg, tau_gain=0.015), 1000, reps=800, seed=5)
     assert het[0.99]["rule"] < het[0.95]["rule"]
+
+
+# ---------------------------------------------------------------- 2-site design (D-120)
+CLEAN2 = pw.two_site_config(gain=0.0, tau_gain=0.0, site_prev_sd=0.0)
+
+
+def test_site_sizes_frac_60_40():
+    assert pw.site_sizes_frac(1000, (0.6, 0.4)) == [600, 400]
+    assert sum(pw.site_sizes_frac(1001, (0.6, 0.4))) == 1001
+    assert pw.two_site_config().n_sites == 2
+
+
+def test_two_site_seeded_and_nested():
+    a = pw.two_site_cell(CLEAN2, 500, reps=60, seed=3)
+    assert a == pw.two_site_cell(CLEAN2, 500, reps=60, seed=3)
+    assert a != pw.two_site_cell(CLEAN2, 500, reps=60, seed=4)
+    for lv, v in a.items():
+        assert v["both"] <= v["both_ub"] <= min(v["loso"], v["temporal"]) + 1e-12
+    assert a[0.99]["both"] <= a[0.975]["both"] <= a[0.95]["both"]
+    assert a[0.99]["loso"] <= a[0.975]["loso"] <= a[0.95]["loso"]
+
+
+def test_two_site_null_rate_within_tolerance():
+    # tau = 0, no prevalence shift: the one-sided rejection of a 95% CI is nominally 2.5%, and the
+    # 2-site every-site requirement (both Deltas < 0) only lowers it; the combined rule is lower still.
+    r = pw.two_site_cell(CLEAN2, 900, reps=1500, seed=11)
+    for lv, nominal in ((0.95, 0.025), (0.975, 0.0125), (0.99, 0.005)):
+        assert r[lv]["loso"] <= nominal + 0.02
+        assert r[lv]["temporal"] <= nominal + 0.02
+        assert r[lv]["both"] <= min(r[lv]["loso"], r[lv]["temporal"]) + 1e-12
+    assert r[0.95]["loso"] > 0.005                       # the simulator is not trivially never rejecting
+
+
+def test_two_site_power_monotone_in_n_and_effect():
+    cfg = pw.two_site_config(gain=0.04)
+    p = [pw.two_site_cell(cfg, n, reps=500, seed=9, levels=(0.99,))[0.99]["both"] for n in (400, 800, 1600)]
+    assert p[0] < p[1] + 0.03 and p[1] < p[2] + 0.03 and p[2] > p[0] + 0.15
+    g = [pw.two_site_cell(pw.two_site_config(gain=x), 1000, reps=300, seed=9, levels=(0.99,))[0.99]["both"]
+         for x in (0.0, 0.02, 0.04, 0.06)]
+    assert g == sorted(g) and g[-1] > 0.9 and g[0] < 0.1
+
+
+def test_two_site_drift_lowers_power_and_hits_temporal_scheme_hardest():
+    flat = pw.two_site_cell(pw.two_site_config(gain=0.04), 1000, reps=500, seed=4, levels=(0.99,))[0.99]
+    dr = pw.two_site_cell(pw.two_site_config(gain=0.04, drift=0.02), 1000, reps=500, seed=4, levels=(0.99,))[0.99]
+    assert dr["both"] < flat["both"] and dr["temporal"] < flat["temporal"] - 0.1
+    assert dr["temporal"] < dr["loso"]                   # LOSO only sees the drift in 30% of its patients
+
+
+def test_two_site_grid_and_min_n_helpers():
+    rows = pw.two_site_grid(reps=40, seed=1, taus=(0.015,), drifts=(0.0,), n_grid=(500, 800), gains=(0.0, 0.04),
+                            levels=(0.95, 0.99))
+    assert len(rows) == 1 * 1 * 2 * 2 * 2
+    md = pw.format_two_site(rows)
+    assert "Null (gain 0)" in md and "Power +0.04" in md and "N=800" in md
+    assert set(pw.two_site_min_n(rows)) == {(0.015, 0.0, 0.95), (0.015, 0.0, 0.99)}

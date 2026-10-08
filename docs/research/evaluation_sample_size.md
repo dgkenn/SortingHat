@@ -166,3 +166,94 @@ The full rule's null rejection (7 to 11% at tau 0.015 to 0.03, section 3.4) is t
 - The power cost is small: at +0.04, 0.89 to 0.86 at N = 1,000 and 0.92 to 0.91 at N = 1,500; at +0.06 there is none (0.99).
 - At tau = 0.03 no level reaches 5% (8.6 to 10.8%). The interval cannot fix between-site variance it does not see; the co-reported two-stage interval (section 3.4: 4 to 8%) is the protection, and the Results must say so. The recommended level is therefore a mitigation under the tau = 0.015 assumption, not a guarantee.
 - Implementation: `bootstrap.paired_bootstrap_delta(..., mode="within_site", alpha=0.01)`; B = 10,000 as already planned so the 0.5th and 99.5th percentiles are stable.
+
+
+## 9. 2-site design (D-120)
+
+Only two sites contribute labelled patients (S0001 about 2,000 strict-cohort, S0002 about 1,300), so the primary validation is now two co-primary schemes: (a) **leave-one-site-out** (LOSO) across the 2 sites and (b) a **late-calendar temporal holdout** within each site (last 30% of each site's calendar time). Each scheme applies the D-095 rule: the 1 - alpha within-site bootstrap CI for Delta lies below 0 AND the point estimate is below 0 at *both* held-out sites. "Both schemes pass" requires both rules to pass. `power.two_site_grid` (CLI: `python -m sortinghat.metrics.power --two-site --reps 1500`, about 5 minutes, seeded) extends the section 2 simulator:
+
+- 2 sites, 60/40 split of the evaluation N; tau (site-level SD of the true AUROC gain) in {0.015, 0.03}; everything else as in section 2 (6 labels, base AUROC 0.70 to 0.75, noise correlation 0.6, 90% assessable, prevalence shift SD 0.25).
+- **Drift:** in the late period the EEG model's true AUROC gain is reduced by 0 or 0.01. The temporal holdout evaluates only late patients (so it carries the full drift); LOSO evaluates the whole calendar range, so only its late 30% carries it (mean loss 0.003).
+- **N** is the evaluation size *per scheme*: for LOSO the total across the two held-out sites; for the temporal scheme the total late-period patients held out. A temporal N of 1,000 therefore corresponds to about 3,300 labelled patients; the LOSO scheme can use all of them.
+- The two schemes share each simulated study's site effects (tau, prevalence shift) but draw independent patients. The patient-level overlap between the schemes is ignored, so the "both" column is a **lower bound for power and an optimistic null rate**. The conservative null bound is min(LOSO, temporal), listed below the main table for the null rows that matter.
+- 1,500 reps per cell; Monte Carlo SE at a null near 5% is about 0.006, at 80% power about 0.010. Common random numbers across gains.
+
+### Table P11. Both schemes pass: null rejection (true gain 0) and power at +0.02 / +0.04 / +0.06
+
+| tau | drift | CI | Quantity | N=800 | N=1,000 | N=1,500 | N=2,000 |
+|---|---|---|---|---|---|---|---|
+| 0.015 | 0 | 95.0% | Null (gain 0) | 0.028 | 0.039 | 0.053 | 0.069 |
+| 0.015 | 0 | 95.0% | Power +0.02 | 0.35 | 0.39 | 0.52 | 0.56 |
+| 0.015 | 0 | 95.0% | Power +0.04 | 0.84 | 0.86 | 0.92 | 0.93 |
+| 0.015 | 0 | 95.0% | Power +0.06 | 0.98 | 0.99 | 1.00 | 1.00 |
+| 0.015 | 0 | 97.5% | Null (gain 0) | 0.018 | 0.025 | 0.043 | 0.057 |
+| 0.015 | 0 | 97.5% | Power +0.02 | 0.30 | 0.35 | 0.47 | 0.53 |
+| 0.015 | 0 | 97.5% | Power +0.04 | 0.80 | 0.84 | 0.91 | 0.93 |
+| 0.015 | 0 | 97.5% | Power +0.06 | 0.98 | 0.99 | 1.00 | 1.00 |
+| 0.015 | 0 | 99.0% | Null (gain 0) | 0.009 | 0.013 | 0.027 | 0.047 |
+| 0.015 | 0 | 99.0% | Power +0.02 | 0.24 | 0.29 | 0.41 | 0.49 |
+| 0.015 | 0 | 99.0% | Power +0.04 | 0.74 | 0.81 | 0.89 | 0.92 |
+| 0.015 | 0 | 99.0% | Power +0.06 | 0.98 | 0.98 | 0.99 | 1.00 |
+| 0.015 | 0.01 | 95.0% | Null (gain 0) | 0.007 | 0.011 | 0.023 | 0.021 |
+| 0.015 | 0.01 | 95.0% | Power +0.02 | 0.18 | 0.22 | 0.31 | 0.33 |
+| 0.015 | 0.01 | 95.0% | Power +0.04 | 0.66 | 0.73 | 0.82 | 0.82 |
+| 0.015 | 0.01 | 95.0% | Power +0.06 | 0.95 | 0.96 | 0.98 | 0.98 |
+| 0.015 | 0.01 | 97.5% | Null (gain 0) | 0.005 | 0.009 | 0.015 | 0.015 |
+| 0.015 | 0.01 | 97.5% | Power +0.02 | 0.14 | 0.18 | 0.26 | 0.30 |
+| 0.015 | 0.01 | 97.5% | Power +0.04 | 0.61 | 0.70 | 0.79 | 0.80 |
+| 0.015 | 0.01 | 97.5% | Power +0.06 | 0.93 | 0.96 | 0.98 | 0.98 |
+| 0.015 | 0.01 | 99.0% | Null (gain 0) | 0.002 | 0.007 | 0.008 | 0.008 |
+| 0.015 | 0.01 | 99.0% | Power +0.02 | 0.10 | 0.14 | 0.22 | 0.26 |
+| 0.015 | 0.01 | 99.0% | Power +0.04 | 0.55 | 0.65 | 0.76 | 0.79 |
+| 0.015 | 0.01 | 99.0% | Power +0.06 | 0.91 | 0.94 | 0.98 | 0.98 |
+| 0.03 | 0 | 95.0% | Null (gain 0) | 0.115 | 0.109 | 0.143 | 0.149 |
+| 0.03 | 0 | 95.0% | Power +0.02 | 0.34 | 0.35 | 0.40 | 0.43 |
+| 0.03 | 0 | 95.0% | Power +0.04 | 0.64 | 0.64 | 0.71 | 0.71 |
+| 0.03 | 0 | 95.0% | Power +0.06 | 0.85 | 0.84 | 0.89 | 0.88 |
+| 0.03 | 0 | 97.5% | Null (gain 0) | 0.101 | 0.099 | 0.133 | 0.139 |
+| 0.03 | 0 | 97.5% | Power +0.02 | 0.31 | 0.34 | 0.39 | 0.41 |
+| 0.03 | 0 | 97.5% | Power +0.04 | 0.62 | 0.63 | 0.70 | 0.70 |
+| 0.03 | 0 | 97.5% | Power +0.06 | 0.84 | 0.83 | 0.88 | 0.88 |
+| 0.03 | 0 | 99.0% | Null (gain 0) | 0.083 | 0.081 | 0.122 | 0.123 |
+| 0.03 | 0 | 99.0% | Power +0.02 | 0.29 | 0.31 | 0.37 | 0.40 |
+| 0.03 | 0 | 99.0% | Power +0.04 | 0.59 | 0.61 | 0.69 | 0.69 |
+| 0.03 | 0 | 99.0% | Power +0.06 | 0.83 | 0.82 | 0.88 | 0.88 |
+| 0.03 | 0.01 | 95.0% | Null (gain 0) | 0.064 | 0.069 | 0.081 | 0.097 |
+| 0.03 | 0.01 | 95.0% | Power +0.02 | 0.24 | 0.26 | 0.30 | 0.32 |
+| 0.03 | 0.01 | 95.0% | Power +0.04 | 0.52 | 0.55 | 0.58 | 0.57 |
+| 0.03 | 0.01 | 95.0% | Power +0.06 | 0.78 | 0.80 | 0.79 | 0.81 |
+| 0.03 | 0.01 | 97.5% | Null (gain 0) | 0.053 | 0.057 | 0.075 | 0.089 |
+| 0.03 | 0.01 | 97.5% | Power +0.02 | 0.21 | 0.24 | 0.29 | 0.32 |
+| 0.03 | 0.01 | 97.5% | Power +0.04 | 0.50 | 0.53 | 0.56 | 0.56 |
+| 0.03 | 0.01 | 97.5% | Power +0.06 | 0.76 | 0.79 | 0.79 | 0.80 |
+| 0.03 | 0.01 | 99.0% | Null (gain 0) | 0.043 | 0.047 | 0.069 | 0.083 |
+| 0.03 | 0.01 | 99.0% | Power +0.02 | 0.19 | 0.22 | 0.26 | 0.30 |
+| 0.03 | 0.01 | 99.0% | Power +0.04 | 0.47 | 0.50 | 0.55 | 0.55 |
+| 0.03 | 0.01 | 99.0% | Power +0.06 | 0.75 | 0.78 | 0.78 | 0.79 |
+
+### Table P12. Null rejection at tau = 0.015, drift 0: independent-patient "both" versus the min(LOSO, temporal) bound
+
+| CI | Rule | N=800 | N=1,000 | N=1,500 | N=2,000 |
+|---|---|---|---|---|---|
+| 95.0% | both (independent patients) | 0.028 | 0.039 | 0.053 | 0.069 |
+| 95.0% | min(LOSO, temporal) | 0.089 | 0.093 | 0.112 | 0.127 |
+| 97.5% | both (independent patients) | 0.018 | 0.025 | 0.043 | 0.057 |
+| 97.5% | min(LOSO, temporal) | 0.069 | 0.073 | 0.093 | 0.101 |
+| 99.0% | both (independent patients) | 0.009 | 0.013 | 0.027 | 0.047 |
+| 99.0% | min(LOSO, temporal) | 0.036 | 0.046 | 0.069 | 0.085 |
+
+### Reading the table
+
+- **Null.** Each scheme alone has a worse null than the 3-site design: with only two sites the between-site variance is invisible to the within-site CI, and it is the binding term (LOSO alone at tau 0.015, 99%: 0.04 to 0.09; at tau 0.03: 0.13 to 0.18). Null rejection rises with N, as in section 3.4. Requiring both schemes helps, and drift pushes the null down (a gain of 0 minus drift is a loss), so the **worst case is drift 0**.
+- **CI level.** At tau = 0.015 only the **99%** interval keeps the combined null at or below 5% at every N in the independent-patient column (0.9 to 4.7%); 97.5% fails at N = 2,000 (5.7%) and 95% fails from N = 1,500 (5.3 to 6.9%). Under the conservative min() bound even 99% holds only to N = 1,000 (4.6%). At tau = 0.03 **no level** reaches 5% when drift is 0 (8 to 12% at 99%, 11 to 15% at 95%); the rule is then a statement about these two sites, not about sites in general, and a site-resampling (two-stage) interval is not a remedy with 2 sites (it has only three distinct resamples of sites).
+- **Power at +0.04** (tau 0.015, 99%): 0.74 / 0.81 / 0.89 / 0.92 at N = 800 / 1,000 / 1,500 / 2,000 with drift 0, and 0.55 / 0.65 / 0.76 / 0.79 with drift 0.01. Moving from 95% to 99% costs 5 to 11 points at N = 800 to 1,000 and 1 to 6 points at N >= 1,500. At tau = 0.03 power at +0.04 plateaus at 0.59 to 0.69 (drift 0) and 0.47 to 0.55 (drift 0.01); heterogeneity, not N, is the limit. +0.06 is reliably detected (>= 0.91) only at tau 0.015.
+- **+0.02** is not detectable at any N (<= 0.49 at 99%), as in section 3.3.
+- The temporal scheme is the binding one: with drift 0.01, tau 0.015, 99%, +0.04, N = 1,000, power is 0.85 for LOSO, 0.68 for temporal, 0.65 for both.
+
+### Recommendation
+
+- **CI level: 99%** (alpha = 0.01 two-sided; B = 10,000 so the 0.5th and 99.5th percentiles are stable) for each scheme's within-site interval, with the point-estimate-below-0 condition at both sites kept. It is the only level that holds the combined null at or below 5% across the whole grid for tau = 0.015 (independent-patient estimate), at a small power cost. State that this holds only for tau <= about 0.015; at tau = 0.03 the achieved null is 8 to 12% and cannot be fixed by the level.
+- **Minimum N for 80% power at +0.04** (combined rule, 99%, tau 0.015): **about 1,000 per scheme** if there is no drift (interpolated 980), but **about 2,000 or more** if the late period loses 0.01 AUROC (0.79 at N = 2,000 by the independent-patient estimate; interpolated 2,000 using the min() bound, which brackets true power from above). At tau = 0.03 80% power is not reached at any N <= 2,000. In practice: the temporal late 30% of about 3,300 patients is about 1,000 patients, so the temporal scheme sits at its minimum under no drift and below 80% power under drift 0.01 (about 65%); the LOSO scheme (about 3,300) is not the constraint. Report the temporal-holdout result with its expected-power caveat in the SAP rather than enlarging the sample, which cannot be done.
+- Co-report the LOSO-only and temporal-only results, the per-site Deltas, and the point estimate of site-to-site spread; with two sites, tau cannot be estimated, so the SAP must state the tau assumption (0.015) it is conditional on.
+
+Limits specific to this section: tau, drift and the shared-site-effect/independent-patient treatment are assumptions; drift is applied to the EEG gain only (the baseline is assumed not to decay); the late-period fraction (30%) and the 60/40 split are fixed; no covariate shift between sites beyond the prevalence shift.

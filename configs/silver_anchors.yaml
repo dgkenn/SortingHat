@@ -1,9 +1,10 @@
 # Objective-anchor rules for silver positives (research plan v1, "Silver labels: the circularity rules";
 # DECISION_LOG D-009). Every silver positive for E1, E2, E4a, E5, E6, E7 needs >=1 satisfied anchor.
 #
-# STATUS: thresholds and windows below were SIGNED OFF by the project lead 2026-10-07 as a delegated
-#   decision; re-review with the EEG/neurocritical-care co-investigator before Study 1 protocol lock
-#   (DECISION_LOG D-084..D-092). Nothing here has been checked against data. LOINC codes are listed only
+# STATUS: Evidence-reviewed 2026-10-08 against the published literature (docs/research/anchor_evidence_review.md;
+#   DECISION_LOG D-144). Earlier thresholds were signed off by the project lead 2026-10-07 (D-084..D-092); the review
+#   changed one threshold (ammonia) and tightened the autoimmune-antibody rule. External co-I review before
+#   publication. Nothing here has been checked against data. LOINC codes are listed only
 #   where the author is confident of the code; `loinc: []` means "map locally". Verify all against the
 #   local concept map.
 #
@@ -24,7 +25,7 @@
 #                 the same timestamp (same tap); uncorrected when no same-timestamp RBC row exists.
 #   Anchors may use information after t0 (labels name the cause of the state at t0); the windows bound it.
 version: 1
-status: "SIGNED OFF by project lead 2026-10-07 (delegated decision); re-review with EEG/neurocritical-care co-investigator before Study 1 protocol lock"
+status: "Evidence-reviewed 2026-10-08 (literature-grounded; see docs/research/anchor_evidence_review.md); external co-I review before publication"
 t0_definition: "EEG start time"
 
 items:           # item -> LOINC (confident only) and canonical unit
@@ -56,7 +57,7 @@ items:           # item -> LOINC (confident only) and canonical unit
   csf_glucose:   {loinc: ["2342-4"], unit: "mg/dL"}
   csf_culture_pos: {loinc: [], unit: "flag"}
   csf_pcr_pos:   {loinc: [], unit: "flag"}                      # HSV/VZV/enterovirus/meningitis panel positive
-  csf_autoimmune_ab_pos: {loinc: [], unit: "flag"}              # NMDAR etc. in CSF or serum
+  csf_autoimmune_ab_pos: {loinc: [], unit: "flag"}              # NMDAR: CSF antibody ONLY (CSF 100% vs serum 85.6% sensitive, serum-only positives not counted; Graus 2016, Gresa-Arribas 2013); other neural-surface antibodies CSF or serum. Extractor must apply the specimen rule
   ethanol_serum: {loinc: ["5643-2"], unit: "mg/dL"}
   acetaminophen: {loinc: ["3298-7"], unit: "ug/mL"}
   salicylate:    {loinc: ["4024-6"], unit: "mg/dL"}
@@ -129,7 +130,7 @@ labels:
   E5:
     description: "Metabolic/physiologic: lab threshold with timing"
     any_of:
-      - {id: E5_ammonia,    item: ammonia,     test: lab_threshold, op: ge, threshold: 100, unit: "umol/L", window_hours: [-24, 6]}
+      - {id: E5_ammonia,    item: ammonia,     test: lab_threshold, op: ge, threshold: 150, unit: "umol/L", window_hours: [-24, 6]}   # was 100; ALF cohorts: arterial NH3 ~146-150 umol/L separates intracranial hypertension (PMID 19465152); grade 3-4 HE median only 116 (PMID 28859230)
       - {id: E5_bun,        item: bun,         test: lab_threshold, op: ge, threshold: 100, unit: "mg/dL",  window_hours: [-24, 6]}
       - {id: E5_glucose_lo, item: glucose,     test: lab_threshold, op: lt, threshold: 50,  unit: "mg/dL",  window_hours: [-12, 1]}   # post-t0 hypoglycemia may be iatrogenic: window ends +1 h
       - {id: E5_glucose_hi, item: glucose,     test: lab_threshold, op: gt, threshold: 600, unit: "mg/dL",  window_hours: [-24, 6]}
