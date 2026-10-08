@@ -30,7 +30,7 @@ from .. import data_io
 from ..safe_output import safe_quantiles, suppress_count
 from . import rules
 from .config import CohortConfig
-from .flow import FlowRecorder, flow_report
+from .flow import FlowRecorder, debug_report, flow_report
 
 KEY_LIST_COLUMNS = ["SiteID", "person_id", "SessionID", "BidsFolder", "EEGFolder", "edf_key",
                     "task_token_assumed", "window_start_s", "window_duration_s", "in_strict", "in_strict_pm6", "in_broad"]
@@ -48,6 +48,7 @@ class CohortResult:
     report: dict                        # suppressed, aggregate-only
     config: dict = field(default_factory=dict)
     merge_status: str = "absent"        # patient merge history: applied | absent | unrecognised
+    debug: dict = field(default_factory=dict)   # unmerged diagnostic report (NOT for sharing)
 
 
 def _hours(a: pd.Series, b: pd.Series) -> pd.Series:
@@ -154,7 +155,8 @@ def build_cohort(src, cfg: CohortConfig | None = None) -> CohortResult:
     S = run.S.copy()
     S["person_id"] = S["person_id"].astype("int64")
     visits = fetch(src.visits, S["person_id"].unique())
-    run.S = S.join(rules.match_visits(S, visits, cfg.acute_classes, cfg.visit_chain_gap_h))
+    run.S = S.join(rules.match_visits(S, visits, cfg.acute_classes, cfg.visit_chain_gap_h, cfg.visit_slack_h,
+                                      cfg.open_visit_days, cfg.date_only_end_of_day))
     run.S["ServiceName"] = run.S["ServiceName"].astype("string").str.strip().str.upper()
     run.drop("No visit covering the EEG start", run.S["visit_start"].notna(), SESS)
 
@@ -219,7 +221,7 @@ def build_cohort(src, cfg: CohortConfig | None = None) -> CohortResult:
     run.stage.loc[S["_sess_idx"].to_numpy()] = 10**6
 
     cols = ["SiteID", "person_id", "person_id_source", "SessionID", "BidsFolder", "EEGFolder", "t0", "age_years", "ServiceName",
-            "visit_class", "acute_basis", "duration_s", "duration_basis", "onset", "onset_basis",
+            "visit_class", "visit_match", "acute_basis", "duration_s", "duration_basis", "onset", "onset_basis",
             "hours_since_onset", *[f"onset_le_{h:g}h" for h in cfg.onset_windows_h], "gcs_min_window",
             "four_min_window", "gcs_nearest_window", "four_nearest_window", "n_score_obs_window", "severity_strict",
             "severity_strict_pm6", "phenotype", "in_strict", "in_strict_pm6", "in_broad",
@@ -232,7 +234,8 @@ def build_cohort(src, cfg: CohortConfig | None = None) -> CohortResult:
     keys = make_key_list(table, cfg)
     fates = _fates(S0, run.reason, run.stage)
     raw = flow.raw()
-    return CohortResult(table, keys, fates, raw, flow_report(raw, cfg.to_dict()), cfg.to_dict(), merge_status)
+    return CohortResult(table, keys, fates, raw, flow_report(raw, cfg.to_dict()), cfg.to_dict(), merge_status,
+                        debug_report(raw, cfg.to_dict()))
 
 
 def _fates(S0: pd.DataFrame, reason: pd.Series, stage: pd.Series) -> pd.Series:

@@ -266,16 +266,19 @@ def test_site_variants_are_read(scenario):
 
 
 # ---------------------------------------------------------------------------- agreement with the audit
-def test_matches_audit_candidates_on_synthetic(synth):
+def test_agrees_with_the_audit_candidates_on_synthetic(synth):
+    """The audit matches the visit with the latest start; the cohort matches any covering visit (acuity first), so it
+    can only ADD patients (an inpatient stay covering a later outpatient-labelled EEG) or move t0 earlier."""
     tables = synth[0]
     res = build_cohort(FrameSources(tables))
     cand = fa.build_candidates(fa.from_raw_tables(tables)["eeg_metadata"])
     late = ("Recording", "No ACI", "EEG more than", "Neither", INCLUDED)
     reached = res.fates[res.fates.str.startswith(late)]
-    assert set(reached.index) == set(cand["person_id"])
+    audit = set(cand["person_id"])
+    assert audit <= set(reached.index) and len(set(reached.index) - audit) < 0.03 * len(audit)
     t = res.table.set_index("person_id")["t0"]
     c = cand.set_index("person_id")["t0"].reindex(t.index)
-    assert (t == c).all()
+    assert (t[c.notna()] <= c[c.notna()]).all() and (t[c.notna()] == c[c.notna()]).mean() > 0.97
 
 
 def test_strict_flags_match_an_independent_recomputation(synth):

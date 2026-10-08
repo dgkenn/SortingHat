@@ -36,59 +36,111 @@ PHENOTYPE_CODES = re.compile(r"^(?:R40[0-4]|R410|R4182|78001|78002|78009|78097)"
 
 
 # ---------------------------------------------------------------------------------------------- visits
-def _classified_visits(visits: pd.DataFrame) -> pd.DataFrame:
-    v = visits.dropna(subset=["person_id", "visit_start_datetime"]).copy()
-    if "visit_end_datetime" not in v:
-        v["visit_end_datetime"] = pd.NaT
-    cols = [c for c in ("visit_concept_id", "visit_source_value") if c in v]
-    pairs = v[cols].drop_duplicates() if cols else pd.DataFrame(index=[0])
-    for c in ("visit_concept_id", "visit_source_value"):
-        if c not in pairs:
-            pairs[c] = pd.NA
-    pairs["_cls"] = [fa.visit_class(a, b) for a, b in zip(pairs["visit_concept_id"], pairs["visit_source_value"])]
-    v = v.merge(pairs, on=[c for c in ("visit_concept_id", "visit_source_value") if c in v], how="left") \
-        if cols else v.assign(_cls=None)
+ACUITY_RANK = {"ICU": 0, "ED": 1, "Inpatient": 2, "Outpatient": 3}      # unknown class ranks last
+FAR_FUTURE_DAYS = 365.25 * 100
+
+
+def _dt(df: pd.DataFrame, col: str) -> pd.Series:
+    if col in df:
+        return pd.to_datetime(df[col], errors="coerce").astype("datetime64[us]")
+    return pd.Series(pd.NaT, index=df.index, dtype="datetime64[us]")
+
+
+def prepare_visits(visits: pd.DataFrame, open_days: float | None = 30.0, date_only_end_of_day: bool = True
+                   ) -> pd.DataFrame:
+    """Visits with a usable closed interval and a care-setting class (``_cls``). Explicit rules, in order:
+
+    1. **Start**: ``visit_start_datetime``; if null, ``visit_start_date`` (start of that day). No start -> dropped.
+    2. **End**: ``visit_end_datetime``; if null, ``visit_end_date``. A date-only end (a date column, or a datetime
+       at exactly 00:00:00) is the END of that day when ``date_only_end_of_day`` (a visit ending "2020-03-02" covers
+       the whole of 2 March).
+    3. **End before start** is a charting error: the visit is zero-length at its start.
+    4. **Null end** (``end_known`` False): the visit is treated as open for ``open_days`` days after its start
+       (``None`` = unbounded).
+    5. ``person_id`` is cast to int64 (OMOP ``person_id`` may arrive as text, with or without leading zeros)."""
+    v = visits.copy()
+    v["person_id"] = pd.to_numeric(v["person_id"], errors="coerce")
+    start = _dt(v, "visit_start_datetime")
+    start = start.where(start.notna(), _dt(v, "visit_start_date").dt.normalize())
+    end = _dt(v, "visit_end_datetime")
+    if date_only_end_of_day:
+        midnight = end.notna() & (end == end.dt.normalize())
+        end = end.where(~midnight, end + pd.Timedelta(days=1) - pd.Timedelta(microseconds=1))
+    d_end = _dt(v, "visit_end_date")
+    if date_only_end_of_day:
+        d_end = d_end.dt.normalize() + pd.Timedelta(days=1) - pd.Timedelta(microseconds=1)
+    end = end.where(end.notna(), d_end)
+    v = v.assign(_start=start, _end=end)
+    v = v[v["person_id"].notna() & v["_start"].notna()].copy()
     v["person_id"] = v["person_id"].astype("int64")
-    v["visit_start_datetime"] = v["visit_start_datetime"].astype("datetime64[us]")
-    v["visit_end_datetime"] = v["visit_end_datetime"].astype("datetime64[us]")
+    v["_end"] = v["_end"].where(v["_end"] >= v["_start"], v["_start"]).where(v["_end"].notna(), pd.NaT)
+    v["end_known"] = v["_end"].notna()
+    horizon = pd.Timedelta(days=open_days if open_days is not None else FAR_FUTURE_DAYS)
+    v["_end"] = v["_end"].where(v["end_known"], v["_start"] + horizon)
+    cols = [c for c in ("visit_concept_id", "visit_source_value") if c in v]
+    if cols:
+        pairs = v[cols].drop_duplicates().copy()
+        for c in ("visit_concept_id", "visit_source_value"):
+            if c not in pairs:
+                pairs[c] = pd.NA
+        pairs["_cls"] = [fa.visit_class(a, b) for a, b in zip(pairs["visit_concept_id"], pairs["visit_source_value"])]
+        v = v.merge(pairs[cols + ["_cls"]], on=cols, how="left")
+    else:
+        v["_cls"] = None
     return v
 
 
-def match_visits(sessions: pd.DataFrame, visits: pd.DataFrame, acute: tuple[str, ...], gap_h: float) -> pd.DataFrame:
-    """Visit of each session (index = ``sessions`` index): the same person's visit with the latest start <= t0
-    that has not ended before t0 (``field_audit.derive_patient_class``'s rule; an open visit has no end).
+def match_visits(sessions: pd.DataFrame, visits: pd.DataFrame, acute: tuple[str, ...], gap_h: float,
+                 slack_h: float = 0.0, open_days: float | None = 30.0, date_only_end_of_day: bool = True
+                 ) -> pd.DataFrame:
+    """Care-setting visit of each session (index = ``sessions`` index).
 
-    Columns: ``visit_class`` (ICU / Inpatient / ED / Outpatient, or None when the visit exists but its concept id
-    and source text say nothing), ``visit_start``, ``encounter_start``. ``encounter_start`` is the earliest start
-    among the same person's ACUTE visits that overlap the matched visit or end within ``gap_h`` before it begins
-    (one hop), so an ED visit followed by an admission counts from ED arrival. NaT everywhere when unmatched."""
+    **Any-overlap rule** (replaces "the visit with the latest start", which loses a session whenever a short visit
+    nested inside the real admission started later): among ALL of the person's prepared visits (see
+    ``prepare_visits``) whose interval covers t0 (start <= t0 <= end), the visit is chosen by
+      1. covered exactly before covered only through ``slack_h`` (the interval widened by ``slack_h`` hours both
+         sides; 0 = off),
+      2. then care-setting priority ICU > ED > Inpatient > Outpatient > unclassified,
+      3. then the latest start.
+    Columns: ``visit_class`` (None when the matched visit says nothing about its setting), ``visit_start``,
+    ``encounter_start``, ``visit_match`` ('exact' | 'slack'). ``encounter_start`` is the earliest start among the same
+    person's ACUTE visits with a KNOWN end that overlap the matched visit or end within ``gap_h`` before it begins
+    (one hop), so an ED visit followed by an admission counts from ED arrival; it is never later than t0 (a visit
+    matched only through ``slack_h`` that starts after the EEG gives an encounter start of t0). NaT / None when unmatched."""
     out = pd.DataFrame({"visit_class": pd.Series(None, index=sessions.index, dtype=object),
                         "visit_start": pd.Series(pd.NaT, index=sessions.index, dtype="datetime64[us]"),
-                        "encounter_start": pd.Series(pd.NaT, index=sessions.index, dtype="datetime64[us]")})
-    if not len(sessions) or not len(visits) or not {"person_id", "visit_start_datetime"} <= set(visits):
+                        "encounter_start": pd.Series(pd.NaT, index=sessions.index, dtype="datetime64[us]"),
+                        "visit_match": pd.Series(None, index=sessions.index, dtype=object)})
+    if not len(sessions) or not len(visits) or not {"person_id", "visit_start_datetime"} & set(visits):
         return out
-    v = _classified_visits(visits)
+    v = prepare_visits(visits, open_days, date_only_end_of_day)
     e = pd.DataFrame({"person_id": sessions["person_id"].astype("int64"),
                       "t0": sessions["t0"].astype("datetime64[us]"), "_i": sessions.index}).dropna()
     if not len(e) or not len(v):
         return out
-    m = pd.merge_asof(e.sort_values("t0"), v.sort_values("visit_start_datetime")[
-        ["person_id", "visit_start_datetime", "visit_end_datetime", "_cls"]],
-        left_on="t0", right_on="visit_start_datetime", by="person_id", direction="backward")
-    ok = m["visit_start_datetime"].notna() & (m["visit_end_datetime"].isna() | (m["visit_end_datetime"] >= m["t0"]))
-    m = m[ok]
-    out.loc[m["_i"].to_numpy(), "visit_class"] = m["_cls"].to_numpy()
-    out.loc[m["_i"].to_numpy(), "visit_start"] = m["visit_start_datetime"].to_numpy()
-    # encounter start: one hop back over acute visits that touch the matched one
-    av = v[v["_cls"].isin(acute) & v["visit_end_datetime"].notna()][["person_id", "visit_start_datetime",
-                                                                      "visit_end_datetime"]]
+    slack = pd.Timedelta(hours=slack_h)
+    j = e.merge(v[["person_id", "_start", "_end", "_cls", "end_known"]], on="person_id")
+    exact = (j["_start"] <= j["t0"]) & (j["t0"] <= j["_end"])
+    wide = (j["_start"] - slack <= j["t0"]) & (j["t0"] <= j["_end"] + slack)
+    j = j.assign(_exact=exact)[wide]
+    if not len(j):
+        return out
+    j["_rank"] = j["_cls"].map(ACUITY_RANK).fillna(4)
+    m = j.sort_values(["_i", "_exact", "_rank", "_start"], ascending=[True, False, True, False]
+                      ).drop_duplicates("_i", keep="first")
+    ix = m["_i"].to_numpy()
+    out.loc[ix, "visit_class"] = m["_cls"].to_numpy()
+    out.loc[ix, "visit_start"] = m["_start"].to_numpy()
+    out.loc[ix, "visit_match"] = np.where(m["_exact"], "exact", "slack")
+    # encounter start: one hop back over acute visits (known end) that touch the matched one
+    av = v[v["_cls"].isin(acute) & v["end_known"]][["person_id", "_start", "_end"]]
     gap = pd.Timedelta(hours=gap_h)
-    j = m[["_i", "person_id", "visit_start_datetime"]].merge(av, on="person_id", suffixes=("", "_w"))
-    j = j[(j["visit_start_datetime_w"] <= j["visit_start_datetime"])
-          & (j["visit_end_datetime"] >= j["visit_start_datetime"] - gap)]
-    chain = j.groupby("_i")["visit_start_datetime_w"].min()
-    enc = m.set_index("_i")["visit_start_datetime"]
+    k = m[["_i", "person_id", "_start"]].merge(av, on="person_id", suffixes=("", "_w"))
+    k = k[(k["_start_w"] <= k["_start"]) & (k["_end"] >= k["_start"] - gap)]
+    chain = k.groupby("_i")["_start_w"].min()
+    enc = m.set_index("_i")["_start"]
     enc = pd.concat([enc, chain]).groupby(level=0).min()
+    enc = enc.where(enc <= e.set_index("_i")["t0"].reindex(enc.index), e.set_index("_i")["t0"].reindex(enc.index))
     out.loc[enc.index.to_numpy(), "encounter_start"] = enc.to_numpy()
     return out
 

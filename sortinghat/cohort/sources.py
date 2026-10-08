@@ -28,7 +28,8 @@ from . import rules
 SESSION_COLUMNS = ["SiteID", "person_id", "SessionID", "BidsFolder", "EEGFolder", "ServiceName", "t0",
                    "t_end", "age_years", "duration_raw_s"]
 _VISIT_COLS = ["person_id", "visit_occurrence_id", "visit_start_datetime", "visit_end_datetime",
-               "visit_concept_id", "visit_source_value"]
+               "visit_concept_id", "visit_source_value",
+               "visit_start_date", "visit_end_date"]       # date twins: real header names, used when a datetime is null
 _MEAS_COLS = ["person_id", "measurement_datetime", "measurement_date", "measurement_time",
               "measurement_source_value", "value_as_number"]
 _COND_COLS = ["person_id", "condition_start_datetime", "condition_source_value"]
@@ -43,12 +44,15 @@ _OLD_COL = re.compile(r"old|merged|retired|source|from|secondary|duplicate|prior
 _NEW_COL = re.compile(r"new|surviv|target|\bto\b|primary|master|current|final|canonical|kept", re.I)
 
 
-def merge_pairs(df: pd.DataFrame) -> dict[int, int] | None:
+def merge_pairs(df: pd.DataFrame, cols: tuple[str, str] | None = None) -> dict[int, int] | None:
     """{retired id: surviving id} from a merge-history frame, or None when the old/new columns are not identifiable
     (exactly one id-like column matching the 'old' words and one matching the 'new' words are required)."""
-    cols = [c for c in df.columns if _ID_COL.search(str(c))]
-    old = [c for c in cols if _OLD_COL.search(str(c)) and not _NEW_COL.search(str(c))]
-    new = [c for c in cols if _NEW_COL.search(str(c)) and not _OLD_COL.search(str(c))]
+    if cols is not None:                                    # explicit names from the diagnostic
+        old, new = ([cols[0]], [cols[1]]) if cols[0] in df and cols[1] in df else ([], [])
+    else:
+        idc = [c for c in df.columns if _ID_COL.search(str(c))]
+        old = [c for c in idc if _OLD_COL.search(str(c)) and not _NEW_COL.search(str(c))]
+        new = [c for c in idc if _NEW_COL.search(str(c)) and not _OLD_COL.search(str(c))]
     if len(old) != 1 or len(new) != 1:
         return None
     o = pd.to_numeric(df[old[0]], errors="coerce")
@@ -160,9 +164,10 @@ class StoreSources:
     """A store in the access-point layout: ``data_io.LocalStore`` (synthetic data / a local mirror) or the real
     S3 client. Real runs are HUMAN-RUN ONLY (``data_io.make_client`` refuses inside an agent session)."""
 
-    def __init__(self, store, sites: list[str] | None = None):
+    def __init__(self, store, sites: list[str] | None = None, merge_cols: tuple[str, str] | None = None):
         self.s3 = store
         self.sites = sites
+        self.merge_cols = merge_cols          # (retired-id column, surviving-id column) once known from the diagnostic
 
     def sessions(self) -> pd.DataFrame:
         sites = self.sites or data_io.discover_sites(self.s3)
@@ -195,7 +200,7 @@ class StoreSources:
             body = self.s3.get_object(Bucket=data_io.access_point(), Key=k)["Body"].read()
             df = pd.read_parquet(io.BytesIO(body)) if low.endswith(".parquet") else pd.read_csv(
                 io.BytesIO(body), dtype=str, sep="\t" if low.endswith((".tsv", ".txt")) else ",")
-            m = merge_pairs(df)
+            m = merge_pairs(df, self.merge_cols)
             if m is not None:
                 pairs.update(m)
                 found = True

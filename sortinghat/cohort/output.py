@@ -43,7 +43,7 @@ def _local_csv(df: pd.DataFrame, path: Path) -> Path:
     return path
 
 
-def write_outputs(result: CohortResult, out_root: str | Path = "out") -> dict[str, Path]:
+def write_outputs(result: CohortResult, out_root: str | Path = "out", debug_flow: bool = False) -> dict[str, Path]:
     root = Path(out_root)
     local = root / LOCAL_DIR
     local.mkdir(parents=True, exist_ok=True)
@@ -54,6 +54,9 @@ def write_outputs(result: CohortResult, out_root: str | Path = "out") -> dict[st
     paths["flow_md"] = safe_write_text(root / "cohort" / "flow.md",
                                        flow_markdown(result.report, PENDING_STEPS), ids)
     paths["flow_json"] = safe_write_json(root / "cohort" / "flow.json", result.report, ids)
+    if debug_flow:                                   # unmerged diagnostic flow: for the analyst, not for sharing
+        paths["flow_debug_md"] = safe_write_text(root / "cohort" / "flow_debug.md", flow_markdown(result.debug), ids)
+        paths["flow_debug_json"] = safe_write_json(root / "cohort" / "flow_debug.json", result.debug, ids)
     return paths
 
 

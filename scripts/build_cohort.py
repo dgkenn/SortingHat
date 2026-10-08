@@ -39,6 +39,15 @@ def main(argv=None) -> int:
                     help="primary strict rule in [-6 h, +1 h] of t0 (D-105); strict_pm6 is always reported too")
     ap.add_argument("--service-fallback", action="store_true",
                     help="treat an unclassifiable visit as acute care when ServiceName is LTM (decision C-03)")
+    ap.add_argument("--debug-flow", action="store_true",
+                    help="also write out/cohort/flow_debug.md/json and print the ALL-sites table with EVERY step on its "
+                         "own row (only counts < 11 suppressed; not for sharing)")
+    ap.add_argument("--visit-slack-h", type=float, default=0.0,
+                    help="widen every visit interval by this many hours both sides when matching an EEG (decision C-19)")
+    ap.add_argument("--open-visit-days", type=float, default=30.0,
+                    help="a visit with no end is treated as open this many days after its start (C-19)")
+    ap.add_argument("--merge-cols", nargs=2, metavar=("OLD", "NEW"),
+                    help="column names of the retired and surviving id in PatientMergeHistory/ (see diag_cohort.py)")
     ap.add_argument("--duration-scale", nargs="*", default=[], metavar="SITE=FACTOR",
                     help="unit fix for DurationInSeconds / RecordingDuration after reading the flow's unit check, "
                          "e.g. I0008=60")
@@ -49,9 +58,10 @@ def main(argv=None) -> int:
     store = data_io.open_store(a.data, profile=a.profile)            # make_client refuses inside an agent session
     scale = tuple((kv.split("=")[0], float(kv.split("=")[1])) for kv in a.duration_scale)
     cfg = CohortConfig(onset_rule=a.onset_rule, score_rule=a.score_rule, use_service_fallback=a.service_fallback,
-                       duration_scale_by_site=scale)
-    result = build_cohort(StoreSources(store, a.sites), cfg)
-    paths = write_outputs(result, a.out)
+                       duration_scale_by_site=scale, visit_slack_h=a.visit_slack_h,
+                       open_visit_days=a.open_visit_days)
+    result = build_cohort(StoreSources(store, a.sites, merge_cols=tuple(a.merge_cols) if a.merge_cols else None), cfg)
+    paths = write_outputs(result, a.out, a.debug_flow)
 
     ids = known_ids(result)
     t = result.table
@@ -63,6 +73,10 @@ def main(argv=None) -> int:
                f"{suppress_count(int(t['in_strict_pm6'].sum()))}", known_ids=ids)
     safe_print(f"  broad cohort (includes strict), primary window: {suppress_count(int(t['in_broad'].sum()))}",
                known_ids=ids)
+    if a.debug_flow:
+        safe_print("DEBUG FLOW (all sites; every step; only counts < 11 suppressed; do not share):", known_ids=ids)
+        for r in result.debug["sites"]["ALL"].get("rows", []):
+            safe_print(f"  {r['step']} | excluded {r['n_excluded']} | remaining {r['n_remaining']}", known_ids=ids)
     safe_print(f"  notice: {MERGE_NOTICE[result.merge_status]}", known_ids=ids)
     safe_print(f"Flow report: {paths['flow_md']}", known_ids=ids)
     safe_print(f"Record-level files (mode 0600, not printed): {paths['cohort'].parent}/", known_ids=ids)

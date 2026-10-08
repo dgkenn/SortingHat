@@ -195,12 +195,48 @@ def flow_report(raw: dict, config: dict | None = None, k: int = SUPPRESS_BELOW) 
     return report
 
 
+def debug_report(raw: dict, config: dict | None = None, k: int = SUPPRESS_BELOW) -> dict:
+    """UNMERGED report for diagnosing a run: every step on its own row with its exclusion count, suppressing only
+    individual counts < k (``<11``). No step merging and no site pooling, so a small exclusion count is bounded by
+    "<11" but can be recovered by subtracting two exact remaining counts that are both >= 11. NOT for sharing; the
+    shareable report is ``flow_report``."""
+    steps = [Step(s["label"], s["unit"], s["remaining"], s["start"]) for s in raw["steps"]]
+    report: dict = {"debug": "DIAGNOSTIC, NOT FOR SHARING: every step is listed; only individual counts < "
+                             f"{k} are suppressed, so small exclusions are inferable from neighbouring exact counts",
+                    "suppression": f"counts < {k} are shown as \"{SUPPRESSED}\"", "sites": {}, "partitions": {},
+                    "checks": raw.get("checks", {})}
+    for lab, members in [(ALL, raw["sites"]), *[(x, [x]) for x in raw["sites"]]]:
+        view = _site_view(steps, members)
+        if not view or view[0][2] < k:
+            report["sites"][lab] = {WITHHELD: f"starting count < {k}"}
+            continue
+        rows, prev = [], None
+        for label, unit, n, is_start in view:
+            rows.append({"step": label, "unit": unit,
+                         "n_excluded": None if prev is None or is_start else suppress_count(prev - n, k),
+                         "n_remaining": suppress_count(n, k)})
+            prev = n
+        report["sites"][lab] = {"rows": rows}
+    for p in raw["partitions"]:
+        parts = list(p["parts"])
+        tbl = {}
+        for lab, members in [(ALL, raw["sites"]), *[(x, [x]) for x in raw["sites"]]]:
+            c = {x: sum(p["parts"][x].get(m, 0) for m in members) for x in parts}
+            tbl[lab] = {WITHHELD: f"total < {k}"} if sum(c.values()) < k else suppress_parts(c, k)
+        report["partitions"][p["title"]] = tbl
+    if config is not None:
+        report["config"] = config
+    assert_aggregate_only(report)
+    return report
+
+
 def _cell(v) -> str:
     return "" if v is None else str(v)
 
 
 def flow_markdown(report: dict, pending: list[str] | None = None) -> str:
     L = ["# Study 1 cohort flow (CONSORT-style, aggregate only)", "",
+         *([f"**{report['debug']}**", ""] if report.get("debug") else []),
          f"Suppression: {report['suppression']}.", "",
          "Units: a row counts the unit of its last step. From \"Not the patient's first qualifying EEG\" on, one "
          "EEG per patient remains, so sessions = patients; that row's Excluded counts later sessions.", ""]

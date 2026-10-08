@@ -23,6 +23,9 @@ class CohortConfig:
     use_service_fallback: bool = False                  # C-03: visit class unknown + ServiceName in service_acute -> acute
     service_acute: tuple[str, ...] = ("LTM",)
     exclude_services: tuple[str, ...] = ("OR", "EMU")   # C-04: intra-operative and epilepsy-unit EEGs are not ACI work-ups
+    visit_slack_h: float = 0.0                          # C-19: widen every visit interval by this many hours (0 = exact)
+    open_visit_days: float | None = 30.0                # C-19: a visit with no end is open this long after its start
+    date_only_end_of_day: bool = True                   # C-19: a date-only visit end covers the whole day
     visit_chain_gap_h: float = 6.0                        # C-05: ED -> inpatient/ICU visits <= this gap apart form one encounter
     # --- recording
     min_duration_s: float = PRIMARY_START_S + PRIMARY_DURATION_S      # minutes 1-11 must exist (660 s)

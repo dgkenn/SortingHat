@@ -98,3 +98,12 @@ def test_cli_prints_the_one_line_notice(synth_dir, tmp_path):
                         "--out", str(tmp_path)], capture_output=True, text=True, check=True, env=env, cwd=REPO)
     assert sum("patient merge history" in ln for ln in p.stdout.splitlines()) == 1
     assert MERGE_NOTICE["absent"] in p.stdout
+
+
+def test_explicit_merge_columns_override_the_name_guess(synth_dir, tmp_path):
+    shutil.copytree(synth_dir, tmp_path / "d")
+    (tmp_path / "d" / "PatientMergeHistory").mkdir()
+    pd.DataFrame({"colA": [2], "colB": [1]}).to_csv(tmp_path / "d" / "PatientMergeHistory" / "m.csv", index=False)
+    assert StoreSources(LocalStore(tmp_path / "d")).merge_map() == ({}, "unrecognised")
+    mm, status = StoreSources(LocalStore(tmp_path / "d"), merge_cols=("colA", "colB")).merge_map()
+    assert status == "applied" and mm == {2: 1}
