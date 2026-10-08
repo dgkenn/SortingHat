@@ -298,7 +298,7 @@ def test_agrees_with_the_audit_candidates_on_synthetic(synth):
     """The audit matches the visit with the latest start; the cohort matches any covering visit (acuity first), so it
     can only ADD patients (an inpatient stay covering a later outpatient-labelled EEG) or move t0 earlier."""
     tables = synth[0]
-    res = build_cohort(FrameSources(tables), CohortConfig(**LEGACY))
+    res = build_cohort(FrameSources(tables), CohortConfig(**{**LEGACY, "study_sites": fa.STUDY_SITES}))
     cand = fa.build_candidates(fa.from_raw_tables(tables)["eeg_metadata"])
     late = ("Recording", "No ACI", "EEG more than", "Neither", INCLUDED)
     reached = res.fates[res.fates.str.startswith(late)]

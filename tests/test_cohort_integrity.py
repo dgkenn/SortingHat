@@ -99,7 +99,7 @@ def write_store(world, d):
 
 def _buggy_site_sessions(meta, rf, site):
     """The pre-fix implementation: metadata columns joined on SessionID ALONE."""
-    m = fa.merge_eeg(meta, rf, site)
+    m = fa.merge_eeg(meta, rf, site).drop(columns=["ServiceName"], errors="ignore")
     extra = pd.DataFrame({"SessionID": meta["SessionID"].astype("string"), "BidsFolder": meta["BidsFolder"].astype("string"),
                           "EEGFolder": meta["EEGFolder"].astype("string"), "ServiceName": meta["ServiceName"].astype("string"),
                           "duration_raw_s": pd.to_numeric(meta["DurationInSeconds"], errors="coerce")}
