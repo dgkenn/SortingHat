@@ -71,6 +71,9 @@ Evaluation set: about 1,000 consecutive gold cases (D-093; a 1,500-case reserve 
 | B Bedside | A + vitals, pupils, witnessed convulsion, arrest/trauma history, point-of-care glucose | Secondary |
 | C Full t0 | B + every lab, toxicology, imaging and culture result **available before t0** | **H2** |
 | ~~D Referral question~~ | Dropped (D-107): no referral-indication source in HEEDB | none |
+| P Presentation (D-145) | Age, sex, GCS/FOUR/RASS nearest to t0 in [-6 h, +1 h], first vitals and point-of-care glucose of the current encounter; no diagnosis codes, no history | Intended-use analyses (4.4), supplementary |
+
+From D-145 every baseline (A, B, C, P) uses only events of the **current encounter** (encounter start to t0) by default; allowing prior-encounter events is the labelled sensitivity variant "with history" (section 12, row 17).
 
 "Available before t0" uses result-availability (verification) time, not collection time, wherever the Phase 0a audit shows it exists; otherwise Study 1B is labeled "approximate" (plan, Phase 0a).
 
@@ -84,6 +87,29 @@ The representation ladder is as in the plan: prior, qEEG, connectivity, MORGOTH 
 ### 4.3 Model for comparison
 
 For each baseline X in {A, B, C, D}, the comparator is a baseline-only model with the same head family, training data, hyperparameter budget and recalibration as the "baseline + EEG" model. Delta compares the two on **identical test patients**. No model sees a held-out site in training, hyperparameter selection, imputation fitting, feature scaling or recalibration.
+
+### 4.4 Intended-use analyses (D-145; supplementary, not hypothesis tests)
+
+The intended use is undifferentiated altered mental status or unexplained unconsciousness in the ED, with little or no history
+known: "given an unknown EEG, what is the cause?". EEGs in HEEDB are often recorded hours or days into an admission, so Baselines A to
+C can encode workup information the intended user lacks. The following are reported with the same Delta, interval and every-site
+machinery as sections 6 and 7, **before** the H1 and H2 results in the intended-use report, and change the status of no hypothesis or
+gate:
+
+| # | Comparison (headline rung) | Reference | Reads as |
+|---|---|---|---|
+| a | EEG only vs the prevalence prior | smoothed training prevalence | does the EEG carry etiologic signal at all |
+| b | EEG + age/sex vs age/sex | age and sex | what the EEG adds to the minimum known at the door |
+| c | EEG + P vs P | Baseline P | what the EEG adds to the presentation |
+
+Each is reported for the whole analysed set and for the **undifferentiated subgroup**, all of: EEG on encounter day 0 to 1 (t0 within
+36 h of the encounter start); no ICD diagnosis code of the primary label families (acute structural dx, arrest, asphyxia) recorded at
+or before t0 in any encounter; no sedative or opioid exposure in the 6 h before t0 (Baseline A sedation features). A component that
+cannot be established counts as not met. The subgroup size is reported with small-cell suppression; Delta in the subgroup is not
+estimable below 50 scored patients or 11 per site. The same comparisons are reported with the "with history" baselines as a
+sensitivity variant. EEG-derived information (the EEG report included) is never a model input or label evidence in these analyses.
+Operational choices (the 36 h and 6 h windows, the +1 h score window of P, the encounter-start rule and its fallback) are item 16 of
+section 16 and are exploratory until frozen.
 
 ## 5. Primary endpoint
 
@@ -233,6 +259,8 @@ Each is reported next to the primary result with the same Delta and CI machinery
 | 14 | IPW-for-inclusion and complete-label analyses (section 9) | Missing-data robustness |
 | 15 | Early-EEG subgroup (H5) with and without covariate adjustment | Intended-use proxy |
 | 16 | `strict_pm6` strict cohort (any qualifying score within +-6 h of t0) | Window of the strict definition (D-105) |
+| 17 | Baselines "with history" (prior-encounter events allowed) in place of the current-encounter default, for A, B, C and P (D-145) | Value of history the intended user lacks |
+| 18 | Undifferentiated subgroup (section 4.4) for H1/H2-style Delta and the intended-use comparisons | Intended-use spectrum |
 
 ## 13. Reporting
 
@@ -352,6 +380,7 @@ Any change after freeze is an amendment with a date, reason and a statement of w
     - 14c. EEG minimum channel set = 10 hairline electrodes (D-096).
     - 14d. Burst-suppression 5 uV and EEG QC thresholds are provisional until fixed from the Phase 0b pilot, before any outcome is seen (D-097).
 15. G0 kappa = unweighted binary kappa on the pilot (section 11).
+16. Intended-use analyses (section 4.4, D-145): Baseline P contents and its [-6 h, +1 h] score window (the cohort's strict-severity window, D-105); current-encounter default and the encounter-start rule (cohort covering visit chained back along acute visits, else t0 minus 3 days); subgroup = t0 within 36 h of the encounter start, no primary-label-family ICD code recorded by t0, no sedative or opioid exposure in the 6 h before t0; minimum 50 scored subgroup patients.
 
 ## 17. References
 

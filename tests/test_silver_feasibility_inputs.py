@@ -33,7 +33,8 @@ T_BASE = pd.Timestamp("2024-03-01 08:00:00")
 
 
 def make_inputs(root: Path, signal: float = 1.0, n_per_site: int = 450, seed: int = 0, n_noise: int = 6,
-                sites=("S0001", "S0002"), unassessable: float = 0.04, site_shift: float = 0.0):
+                sites=("S0001", "S0002"), unassessable: float = 0.04, site_shift: float = 0.0, with_p: bool = True,
+                scope_label: str | None = "current encounter only"):
     """Write cohort/features/silver/baselines under ``root/local_only`` and return (paths dict, ModelData truth)."""
     ms = make_synthetic_study(n_per_site=n_per_site, sites=sites, signal=signal, seed=seed, n_noise=n_noise,
                               embeddings=False, morgoth=False, unassessable=unassessable,
@@ -55,6 +56,8 @@ def make_inputs(root: Path, signal: float = 1.0, n_per_site: int = 450, seed: in
         "age_years": 60 + 5 * ms.baseline["age"].to_numpy(), "duration_s": ms.covariates["duration_s"],
         "gcs_nearest_window": gcs, "four_nearest_window": np.nan,
         "in_strict": True, "in_strict_pm6": True, "in_broad": True})
+    hours_in = rng.uniform(1.0, 80.0, n)                                        # hours from the encounter start to t0 (D-145)
+    cohort["encounter_start"] = [t - pd.Timedelta(hours=float(h)) for t, h in zip(cohort["t0"], hours_in)]
     cohort.loc[: n // 20, ["in_strict", "in_strict_pm6"]] = False             # rows outside the strict cohort
     cohort.to_csv(lo / "cohort_study1.csv", index=False)
 
@@ -65,10 +68,24 @@ def make_inputs(root: Path, signal: float = 1.0, n_per_site: int = 450, seed: in
                        "sed__sedative__on_t0": sed, "sed__opioid__on_t0": 0.0,
                        "vital__map__value": ms.baseline["map"].to_numpy(),
                        "lab__lactate__value": ms.baseline["lactate"].to_numpy()})
-    bl.to_parquet(lo / "baselines_AC.parquet", index=False)
     cols_a = ["demo__age_years", "score__gcs__value", "sed__sedative__on_t0", "sed__opioid__on_t0"]
-    (lo / "baselines_AC.columns.json").write_text(json.dumps({"baselines": {"A": cols_a, "B": cols_a,
-                                                                              "C": [c for c in bl.columns if c != "person_id"]}}))
+    side = {"A": cols_a, "B": cols_a, "C": [c for c in bl.columns if c != "person_id"]}
+    extra: dict = {}
+    if with_p:                                                      # Baseline P columns + the subgroup meta columns (D-145)
+        bl["demo__sex_male"] = (rng.random(n) < 0.5).astype(float)
+        bl["pres_score__gcs__value"] = np.clip(gcs + rng.normal(0, 1, n), 3, 15)
+        bl["pres_first__map__value"] = ms.baseline["map"].to_numpy() + rng.normal(0, 0.3, n)
+        bl["sed__midazolam__qty_6h"] = 0.0
+        bl["meta__hours_since_encounter_start"] = hours_in
+        bl["meta__label_dx_before_t0"] = (rng.random(n) < 0.3).astype(float)
+        side = {**side, "A": cols_a + ["demo__sex_male", "sed__midazolam__qty_6h"]}
+        side["B"], side["C"] = side["A"], side["A"] + [c for c in side["C"] if c not in side["A"]]
+        side["P"] = ["demo__age_years", "demo__sex_male", "pres_score__gcs__value", "pres_first__map__value"]
+        extra = {"meta": ["meta__hours_since_encounter_start", "meta__label_dx_before_t0"]}
+    if scope_label:
+        extra["encounter_scope_label"] = scope_label
+    bl.to_parquet(lo / "baselines_AC.parquet", index=False)
+    (lo / "baselines_AC.columns.json").write_text(json.dumps({"baselines": side, **extra}))
 
     # EEG feature parts keyed by the extractor's recording id; primary + nested windows, QC failures, duplicates, strangers
     keys = [rsf.data_io.edf_key_for_row(s, b, sid, e if isinstance(e, str) else None)
@@ -168,7 +185,10 @@ def test_silver_loader_parses_nullable_booleans_and_excludes_nothing_silently(in
 def test_baseline_loader_uses_sidecar(inputs_signal):
     paths, *_ = inputs_signal
     bl, cols = rsf.load_baselines(paths["baselines"])
-    assert set(cols) == {"A", "C"} and set(cols["A"]) < set(cols["C"]) and bl["person_id"].is_unique
+    assert {"A", "C", "P", "AGE_SEX", "meta"} == set(cols) and set(cols["A"]) < set(cols["C"]) and bl["person_id"].is_unique
+    assert set(cols["AGE_SEX"]) == {"demo__age_years", "demo__sex_male"} and set(cols["P"]) >= set(cols["AGE_SEX"])
+    assert not set(cols["meta"]) & (set(cols["A"]) | set(cols["C"]) | set(cols["P"]))        # meta columns are never model inputs
+    assert rsf.baseline_scope(paths["baselines"]) == "current encounter only"
 
 
 def test_sedation_flag_sources():

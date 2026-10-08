@@ -9,11 +9,18 @@ Gate 0, at the project lead's direction. Nothing here is a test of H1-H6.
     # real (streaming, aggregate-only; D-118). --s3 is needed only for the circularity audit (EEG-report comparator)
     scripts/heedb_run.sh python3 scripts/run_silver_feasibility.py --s3
 
+Intended use first (D-145): the FIRST reported block, "Intended use: undifferentiated AMS", asks the question of an unknown EEG in
+the ED with little or nothing known: (a) EEG-only vs the prevalence prior, (b) EEG + age/sex vs age/sex, (c) Baseline P
+(Presentation) + EEG vs P, each for the whole analysed set and for the undifferentiated subgroup (EEG on encounter day 0-1, no
+primary-label-family ICD code recorded before t0, no sedative/opioid exposure in the 6 h before t0). The baselines use the
+current encounter only unless build_baselines.py was run with --with-history (then the report says "with history"). EEG-derived
+information is never an input or label evidence. The existing Baseline A / C comparisons follow.
+
 Inputs (record-level, all under local_only/, never printed)
     --cohort     out/local_only/cohort_study1.csv       (SiteID, person_id, SessionID, BidsFolder, EEGFolder, t0, in_strict*, gcs_*, four_*, duration_s)
     --features   out/local_only/features/part-*.parquet (extractor output; primary window passing QC; keyed by recording_id)
     --silver     out/local_only/silver/silver_labels.csv (sortinghat.labels.extract main; E1 E2 E4a E5 E6 E7 + e4b_* hints)
-    --baselines  out/local_only/baselines_AC.parquet    (scripts/build_baselines.py; Baselines A and C as_of-gated at t0)
+    --baselines  out/local_only/baselines_AC.parquet    (scripts/build_baselines.py; Baselines A, C and P as_of-gated at t0; meta columns)
 Outputs (aggregate-only, safe_output; n < 11 shown as "<11"):  <out>/report.md  and  <out>/report.json
 
 Design
@@ -32,7 +39,7 @@ from __future__ import annotations
 import argparse
 import hashlib
 import sys
-from dataclasses import dataclass, replace
+from dataclasses import dataclass, field, replace
 from pathlib import Path
 from unittest import mock
 
@@ -76,6 +83,14 @@ MIN_EVENTS_FOR_SLOPE = 100                       # D-094: slope only for labels 
 # GCS-equivalent <= 5 (severe), 6-8 (moderate), >= 9. FOUR is mapped linearly to a GCS equivalent (3 + 0.75 * FOUR) only
 # where no GCS exists. Stored as severity = 15 - GCS-equivalent, strata cut at 6.5 and 9.5 (low < 6.5 <= mid < 9.5 <= high).
 SEVERITY_CUTS = (6.5, 9.5)
+# ---- Intended use (D-145)
+IU_TITLE = "Intended use: undifferentiated AMS"
+IU_COMPARISONS = (("prior", "a. EEG-only vs prevalence prior"), ("agesex", "b. EEG + age/sex vs age/sex"),
+                  ("P", "c. P (Presentation) + EEG vs P"))
+UNDIFF_MAX_H = 36.0                              # EEG on encounter day 0-1: t0 within 36 h of the encounter start
+UNDIFF_SEDATION_H = 6.0                          # no sedative / opioid exposure in the 6 h before t0 (Baseline A sedation features)
+IU_MIN_SUBGROUP = 50                             # evaluation rows needed to estimate Delta in the subgroup (and >= 11 per site)
+UNKNOWN_SCOPE = "not recorded (baselines built before D-145; prior-encounter data may be included)"
 LIMITATIONS = (
     "Silver labels train, tune AND score the models: agreement with the label source is not accuracy against a clinical truth.",
     "Silver-label noise is not independent of the baselines (shared structured data); a baseline that sees the anchor "
@@ -116,15 +131,36 @@ def recording_ids(cohort: pd.DataFrame, recording_map: pd.DataFrame | None = Non
 
 
 def load_baselines(path) -> tuple[pd.DataFrame, dict]:
-    """(matrix with person_id + columns, {'A': cols, 'B': cols, 'C': cols}) written by ``scripts/build_baselines.py``."""
+    """(matrix with person_id + columns, column sets) written by ``scripts/build_baselines.py``. The sets always hold 'A' and 'C';
+    'P' (Baseline P, Presentation), 'AGE_SEX' (A's demographic columns) and 'meta' (subgroup-definition columns, never model
+    inputs) are present when the sidecar lists them (a parquet written before D-145 has none of these)."""
     import json
     path = Path(path)
     require_local_only(path, "--baselines")
     df = pd.read_parquet(path)
-    side = json.loads(path.with_name(path.stem + ".columns.json").read_text())["baselines"]
+    side_all = json.loads(path.with_name(path.stem + ".columns.json").read_text())
+    side = side_all["baselines"]
     cols = {b: [c for c in side[b] if c in df.columns] for b in ("A", "C")}
+    if "P" in side:
+        cols["P"] = [c for c in side["P"] if c in df.columns]
+    demo = [c for c in cols["A"] if c.startswith("demo__")]
+    if demo:
+        cols["AGE_SEX"] = demo
+    meta = [c for c in side_all.get("meta", []) if c in df.columns]
+    if meta:
+        cols["meta"] = meta
     df["person_id"] = df["person_id"].astype("int64")
     return df.drop_duplicates("person_id").reset_index(drop=True), cols
+
+
+def baseline_scope(path) -> str:
+    """'current encounter only' | 'with history' | UNKNOWN_SCOPE, from the sidecar of the baselines parquet."""
+    import json
+    p = Path(path)
+    try:
+        return str(json.loads(p.with_name(p.stem + ".columns.json").read_text()).get("encounter_scope_label", UNKNOWN_SCOPE))
+    except (OSError, ValueError):
+        return UNKNOWN_SCOPE
 
 
 def _tf(s: pd.Series) -> tuple[np.ndarray, np.ndarray]:
@@ -220,6 +256,10 @@ class Assembly:
     flow: dict
     label_report: dict
     site_labels: dict
+    iu_sets: dict = field(default_factory=dict)          # D-145: 'prior' ([]), 'agesex', 'P' column sets of the intended-use block
+    subgroup: np.ndarray | None = None                   # bool (n,): undifferentiated subgroup (RECORD-LEVEL, memory only)
+    subgroup_info: dict = field(default_factory=dict)    # aggregate, suppressed
+    baseline_scope: str = UNKNOWN_SCOPE
 
 
 def gcs_equivalent(gcs: pd.Series, four: pd.Series) -> pd.Series:
@@ -239,6 +279,53 @@ def sedation_flag(bl: pd.DataFrame, hints: pd.DataFrame, source: str) -> np.ndar
     from_e4b = hints["e4b_sedative_exposure"].reindex(bl.index).fillna(False).to_numpy(bool) \
         if "e4b_sedative_exposure" in hints else np.zeros(n, bool)
     return {"baseline": from_bl, "e4b": from_e4b, "either": from_bl | from_e4b}[source]
+
+
+def sedation_6h_flag(bl: pd.DataFrame) -> np.ndarray | None:
+    """Sedative / opioid exposure in the 6 h before t0 from the Baseline A sedation features: a sedative or opioid running at t0
+    (``sed__{sedative,opioid}__on_t0``) or a recorded quantity attributable to the 6 h window (``sed__<agent>__qty_6h`` > 0).
+    None when the frame has no such column (the exposure cannot be established). A bolus with no recorded quantity that ended
+    before t0 is invisible to these features; that limitation is stated in docs/silver_feasibility.md."""
+    cols = [c for c in ("sed__sedative__on_t0", "sed__opioid__on_t0") if c in bl] + \
+           [c for c in bl.columns if str(c).startswith("sed__") and str(c).endswith("__qty_6h")]
+    if not cols:
+        return None
+    exposed = np.zeros(len(bl), bool)
+    for c in cols:
+        exposed |= (bl[c].fillna(0).to_numpy(float) > 0)
+    return exposed
+
+
+def hours_since_encounter(sel: pd.DataFrame, bl: pd.DataFrame) -> tuple[np.ndarray, str]:
+    """Hours from the encounter start to t0 and where it came from: the cohort table's ``encounter_start`` column, else the
+    baselines parquet's ``meta__hours_since_encounter_start`` (resolved by build_baselines for an older cohort table)."""
+    if "encounter_start" in sel and sel["encounter_start"].notna().any():
+        h = (pd.to_datetime(sel["t0"]) - pd.to_datetime(sel["encounter_start"])).dt.total_seconds().to_numpy(float) / 3600.0
+        return h, "cohort encounter_start"
+    if "meta__hours_since_encounter_start" in bl:
+        return bl["meta__hours_since_encounter_start"].to_numpy(float), "baselines meta (build_baselines)"
+    return np.full(len(sel), np.nan), "unavailable"
+
+
+def undifferentiated_flag(sel: pd.DataFrame, bl: pd.DataFrame, max_hours: float = UNDIFF_MAX_H) -> tuple[np.ndarray, dict]:
+    """Undifferentiated-presentation subgroup, all three required:
+      1. EEG on encounter day 0-1: 0 <= t0 - encounter start <= ``max_hours`` (36 h);
+      2. no ICD diagnosis code of the primary label families recorded at or before t0 (any encounter; ``meta__label_dx_before_t0``);
+      3. no sedative / opioid exposure in the 6 h before t0 (Baseline A sedation features).
+    A component that cannot be established counts as not met, so the subgroup never grows through missing data. EEG-derived
+    information is not used."""
+    n = len(sel)
+    hours, hsrc = hours_since_encounter(sel, bl)
+    early = np.isfinite(hours) & (hours >= 0) & (hours <= max_hours)
+    dx = bl["meta__label_dx_before_t0"].to_numpy(float) if "meta__label_dx_before_t0" in bl else np.full(n, np.nan)
+    no_dx = np.isfinite(dx) & (dx == 0)
+    sed = sedation_6h_flag(bl)
+    no_sed = (~sed) if sed is not None else np.zeros(n, bool)
+    flag = early & no_dx & no_sed
+    return flag, {"early": early, "no_dx": no_dx, "no_sedation": no_sed,
+                  "sources": {"visit_start": hsrc, "label_family_dx": ("baselines meta (build_baselines)" if "meta__label_dx_before_t0" in bl
+                                                                           else "unavailable"),
+                              "sedation_6h": "Baseline A sedation features" if sed is not None else "unavailable"}}
 
 
 def _site_counts(sites: pd.Series, mask: np.ndarray) -> dict:
@@ -322,6 +409,7 @@ def assemble(a) -> Assembly:
     sel, sel_bl, sel_eeg, y, m = sel.iloc[idx].reset_index(drop=True), sel_bl.iloc[idx].reset_index(drop=True), \
         sel_eeg.iloc[idx].reset_index(drop=True), y[idx], m[idx]
     Hs = Hs.iloc[idx].reset_index(drop=True) if len(Hs.columns) else pd.DataFrame(index=range(len(sel)))
+    ssites = sel["SiteID"].astype(str)                       # re-derived: the row filter above must reach the site vector too
     flow = {"steps": [{"step": s, "n_total": suppress_count(int(msk.sum())),
                        "per_site": {site_labels.get(k, k): suppress_count(v) for k, v in _site_counts(sites_s, msk).items()}}
                       for s, msk in steps],
@@ -329,9 +417,24 @@ def assemble(a) -> Assembly:
                                "n_primary_rows_read": suppress_count(eeg_stats["n_primary_rows_read"])}}
 
     # ---- design matrices and covariates
-    all_c = bl_cols["C"]
+    all_c = list(dict.fromkeys(bl_cols["C"] + bl_cols.get("P", [])))
     baseline = sel_bl[all_c].astype(float)
     bsets = {"A": list(bl_cols["A"]), "C": list(bl_cols["C"])}
+    iu_sets = {"prior": []}
+    if bl_cols.get("AGE_SEX"):
+        iu_sets["agesex"] = list(bl_cols["AGE_SEX"])
+    if bl_cols.get("P"):
+        iu_sets["P"] = list(bl_cols["P"])
+    flag, parts = undifferentiated_flag(sel, sel_bl, a.undiff_max_hours)
+    sub_sites = ssites.to_numpy(object)
+    subgroup_info = {
+        "definition": {"max_hours_from_visit_start": a.undiff_max_hours, "label_family_dx_before_t0": "none",
+                       "sedative_opioid_window_hours": UNDIFF_SEDATION_H, "sources": parts["sources"]},
+        "n": suppress_count(int(flag.sum())), "share_of_analysed": suppress_proportion(int(flag.sum()), len(flag)),
+        "per_site": {site_labels[s_]: suppress_count(int((flag & (sub_sites == s_)).sum())) for s_ in uniq},
+        "components_met": {"visit_day_0_1": suppress_count(int(parts["early"].sum())),
+                           "no_label_family_dx_before_t0": suppress_count(int(parts["no_dx"].sum())),
+                           "no_sedative_opioid_6h": suppress_count(int(parts["no_sedation"].sum()))}}
     eeg_df = sel_eeg[feat_cols].astype(float)
     qmiss = pd.to_numeric(sel_eeg.get("qc_n_missing_or_dead_min"), errors="coerce") if "qc_n_missing_or_dead_min" in sel_eeg \
         else pd.Series(np.nan, index=sel.index)
@@ -343,14 +446,17 @@ def assemble(a) -> Assembly:
            "severity": (15.0 - gcs_eq).to_numpy(float),
            "sedated": sedation_flag(sel_bl, Hs, a.sedation_source)}
     return Assembly(sel, baseline, eeg_df, y, m, names, primary, e7_primary, bsets, cov, ssites.to_numpy(object),
-                    sel["t0"].to_numpy("datetime64[us]"), flow, label_report, site_labels)
+                    sel["t0"].to_numpy("datetime64[us]"), flow, label_report, site_labels, iu_sets, flag, subgroup_info,
+                    baseline_scope(a.baselines))
 
 
 # ===================================================================================== model data per scheme
-def build_model_data(A: Assembly, scheme: str, dev_frac: float, test_fraction: float, seed: int) -> ModelData:
+def build_model_data(A: Assembly, scheme: str, dev_frac: float, test_fraction: float, seed: int,
+                     eval_mask: np.ndarray | None = None) -> ModelData:
     """ModelData with the SILVER labels in both roles. Dev rows (tune + recalibrate inside training folds) are drawn at random
     within site (LOSO) or from the training region of the temporal split; every other row is 'eval' and is scored only when
-    it is a test row of the fold."""
+    it is a test row of the fold. ``eval_mask`` (bool, n) restricts scoring to a subgroup: other non-dev rows get role 'none',
+    so they still train the head (silver labels) but are never scored; the dev draw is unchanged."""
     n = len(A.frame)
     rng = np.random.default_rng(seed)
     role = np.full(n, "eval", dtype=object)
@@ -364,6 +470,8 @@ def build_model_data(A: Assembly, scheme: str, dev_frac: float, test_fraction: f
     for ix in pool.values():
         k = int(round(dev_frac * len(ix)))
         role[rng.choice(ix, size=k, replace=False)] = "dev"
+    if eval_mask is not None:
+        role[(role == "eval") & ~np.asarray(eval_mask, bool)] = "none"
     return ModelData(A.baseline, A.eeg, A.y, A.m, A.y.copy(), A.m.copy(), role, A.sites, A.label_names,
                      A.times, dict(A.covariates))
 
@@ -575,6 +683,97 @@ def circularity_block(A: Assembly, md: ModelData, taps_loso: PredictionTap, rf: 
     return out
 
 
+# ============================================================================== intended use (D-145)
+def _iu_rung(res, bname: str, rung: str) -> dict:
+    """Aggregate Delta block of one comparison (headline rung vs its baseline set); counts suppressed by ``rung_to_aggregate``."""
+    from sortinghat.models.report import rung_to_aggregate
+    rr = res.get(rung, bname)
+    return clean({**rung_to_aggregate(rr, res.site_labels), "n_eval": suppress_count(res.n_eval),
+                  "loss_reference": rr.loss_baseline, "loss_with_eeg": rr.loss_model})
+
+
+def subgroup_estimable(A: Assembly) -> str | None:
+    """None when Delta can be estimated in the subgroup, else the reason (sizes are never printed unsuppressed)."""
+    if A.subgroup is None or not A.subgroup.any():
+        return "the undifferentiated subgroup is empty (a component could not be established or none met it)"
+    if int(A.subgroup.sum()) < IU_MIN_SUBGROUP:
+        return f"fewer than {IU_MIN_SUBGROUP} patients in the subgroup"
+    small = [A.site_labels[s] for s in np.unique(A.sites) if int((A.subgroup & (A.sites == s)).sum()) < MIN_SITE_CELL]
+    return f"fewer than {MIN_SITE_CELL} subgroup patients at {', '.join(small)}" if small else None
+
+
+def run_intended_use(A: Assembly, a, cfg: LadderConfig, headline: str, splits: list[str]) -> dict:
+    """The "Intended use: undifferentiated AMS" block: three comparisons, each Delta = masked log loss(set + EEG) - masked log
+    loss(set) on the SAME evaluation rows, under both validation schemes, for the whole analysed set and for the
+    undifferentiated subgroup (trained on all training-fold rows, scored on subgroup rows only). Headline EEG rung only.
+
+      a. 'prior'  : EEG-only vs the prevalence prior (no baseline columns; the reference is the smoothed training prevalence)
+      b. 'agesex' : EEG + age/sex vs age/sex
+      c. 'P'      : EEG + Baseline P (Presentation) vs P
+
+    EEG-derived information is never an input or label evidence: the sets hold no EEG-derived column, and the silver labels are
+    EEG-blind (E3 and the EEG-report flags are excluded; reports_findings feeds only the circularity audit)."""
+    spec = [r for r in DEFAULT_RUNGS if r.name == headline]
+    sets = {k: A.iu_sets[k] for k, _ in IU_COMPARISONS if k in A.iu_sets}
+    out: dict = {"title": IU_TITLE, "question": "Given an unknown EEG recorded in the ED or early in an admission, with little or no "
+                 "history known, what is the cause (E1 structural, E2 hypoxic-ischemic, E4a toxic-antidote, E5 metabolic, E6 "
+                 "infectious-septic, E7 autoimmune)?",
+                 "baseline_scope": A.baseline_scope, "headline_rung": headline,
+                 "comparisons": {k: lab for k, lab in IU_COMPARISONS if k in sets},
+                 "comparisons_unavailable": {lab: ("no Baseline P columns in the baselines file (rebuild with build_baselines.py)"
+                                                   if k == "P" else "no age/sex columns in the baselines file")
+                                             for k, lab in IU_COMPARISONS if k not in sets},
+                 "eeg_derived_inputs": "No baseline column and no label is derived from EEG (silver labels are EEG-blind; E3 and EEG-report "
+                                       "flags are excluded; reports_findings is used only in the circularity audit)",
+                 "subgroup": A.subgroup_info, "populations": {}, "negative_controls": {}}
+    not_est = subgroup_estimable(A)
+    for split in splits:
+        out["populations"][split] = {}
+        for pop in ("all_analysed", "undifferentiated"):
+            if pop == "undifferentiated" and not_est:
+                out["populations"][split][pop] = {"not_estimable": not_est}
+                continue
+            md = build_model_data(A, split, a.dev_frac, a.temporal_fraction, a.seed,
+                                  eval_mask=A.subgroup if pop == "undifferentiated" else None)
+            try:
+                res = run_ladder(md, sets, spec, cfg, split)
+                if pop == "undifferentiated":                          # same rule as the severity strata: < 50 rows, or < 11 at a site
+                    small = [lab for s_, lab in res.site_labels.items() if int((res.eval_sites.astype(str) == s_).sum()) < MIN_SITE_CELL]
+                    if res.n_eval < IU_MIN_SUBGROUP or small:
+                        out["populations"][split][pop] = {"not_estimable": f"fewer than {IU_MIN_SUBGROUP} subgroup rows scored in "
+                                                          f"this scheme, or fewer than {MIN_SITE_CELL} at a site"}
+                        continue
+                out["populations"][split][pop] = {k: _iu_rung(res, k, headline) for k in sets}
+            except (ValueError, ZeroDivisionError) as e:               # too few rows at a site for the scheme
+                out["populations"][split][pop] = {"not_estimable": type(e).__name__}
+    if not a.skip_controls:
+        n_small = max(200, min(a.n_boot, 1000))
+        cfg_s = replace(cfg, per_label=False, n_boot=n_small)
+        for split in splits:
+            md = build_model_data(A, split, a.dev_frac, a.temporal_fraction, a.seed)
+            out["negative_controls"][split] = {}
+            for k, cols in sets.items():
+                nl, ne = [], None
+                for r in range(a.null_reps):
+                    try:
+                        nl.append(next(iter(negative_control(md, "labels", spec, cfg_s, {k: cols}, split, a.seed + 1 + r)["rungs"].values())))
+                    except (ValueError, StopIteration):
+                        continue
+                try:
+                    ne = next(iter(negative_control(md, "eeg", spec, cfg_s, {k: cols}, split, a.seed + 101)["rungs"].values()))
+                except (ValueError, StopIteration):
+                    pass
+                out["negative_controls"][split][k] = {
+                    "shuffled_labels_mean_delta": float(np.mean([x["delta"] for x in nl])) if nl else None,
+                    "shuffled_labels_reps_with_spurious_gain_95": int(sum(x["spurious_gain"] for x in nl)),
+                    "shuffled_labels_reps": len(nl),
+                    "permuted_eeg_delta": None if ne is None else round(ne["delta"], 5),
+                    "permuted_eeg_spurious_gain_95": None if ne is None else bool(ne["spurious_gain"])}
+    else:
+        out["negative_controls"] = {"skipped": "--skip-controls was set: the negative controls of this block were NOT run"}
+    return clean(out)
+
+
 # ==================================================================================================== driver
 def run_analysis(A: Assembly, a, store=None) -> dict:
     cfg = LadderConfig(n_boot=a.n_boot, seed=a.seed, include_e7=A.include_e7, temporal_test_fraction=a.temporal_fraction)
@@ -586,8 +785,9 @@ def run_analysis(A: Assembly, a, store=None) -> dict:
     headline = "combined" if "combined" in avail_rungs else (avail_rungs[0] if avail_rungs else None)
     if headline is None:
         raise SystemExit("no qeeg./conn. feature columns found")
-    R: dict = {"banner": BANNER, "headline_rung": headline, "ladder": {}, "discrimination_calibration": {}, "controls": {},
-               "circularity_audit": None}
+    R: dict = {"banner": BANNER, "headline_rung": headline, "intended_use": None, "ladder": {}, "discrimination_calibration": {},
+               "controls": {}, "circularity_audit": None}
+    R["intended_use"] = run_intended_use(A, a, cfg, headline, splits)             # D-145: reported FIRST
     taps: dict = {}
     mds: dict = {}
     results: dict = {}
@@ -634,13 +834,14 @@ def run_analysis(A: Assembly, a, store=None) -> dict:
 def report_json(A: Assembly, a, R: dict) -> dict:
     return clean({
         "banner": BANNER,
-        "decisions": ["D-143 (this analysis)", "D-120 (two-site schemes)", "D-095 (99% within-site CI + every-site rule)",
+        "intended_use": R.get("intended_use"),                     # D-145: the first reported block
+        "decisions": ["D-145 (intended-use block, Baseline P, current-encounter baselines)", "D-143 (this analysis)", "D-120 (two-site schemes)", "D-095 (99% within-site CI + every-site rule)",
                       "D-123 (structured-only silver)", "D-124 (t0 anchors)", "D-107 (Baseline D dropped)",
                       "D-122 (no imaging in C, no NESI in A)"],
         "settings": {"cohort_definition": a.cohort_def, "sites": list(A.site_labels.values()),
                      "n_boot": a.n_boot, "auc_boot": a.auc_boot, "null_reps": a.null_reps, "seed": a.seed,
                      "dev_fraction": a.dev_frac, "temporal_test_fraction": a.temporal_fraction,
-                     "sedation_source": a.sedation_source,
+                     "sedation_source": a.sedation_source, "baseline_scope": A.baseline_scope,
                      "ci_policy": "99% within-site stratified bootstrap (D-095, evaluation_sample_size.md s8) with the every-site "
                                   "rule; 95% within_site / cluster / two_stage / site_t co-reported (cluster, two_stage and site_t "
                                   "are degenerate or extremely wide with two sites)",
@@ -650,7 +851,7 @@ def report_json(A: Assembly, a, R: dict) -> dict:
                                          "e7_primary": A.include_e7, "detail": A.label_report},
         "n_analysed": suppress_count(len(A.frame)),
         "n_eeg_features": len(A.eeg.columns), "n_baseline_columns": {b: len(c) for b, c in A.baseline_sets.items()},
-        **{k: v for k, v in R.items() if k != "banner"}, "limitations": list(LIMITATIONS)})
+        **{k: v for k, v in R.items() if k not in ("banner", "intended_use")}, "limitations": list(LIMITATIONS)})
 
 
 def _f(x, nd=4):
@@ -691,12 +892,66 @@ def _controls_markdown(c: dict) -> list[str]:
     return L
 
 
+def _iu_markdown(iu: dict) -> list[str]:
+    """The first block of report.md (D-145)."""
+    L = [f"## {iu['title']}", "", f"**Question.** {iu['question']}", "",
+         f"Baselines in this block use **{iu['baseline_scope']}** events (D-145). "
+         f"Top available EEG rung: `{iu['headline_rung']}`. Delta = masked log loss(set + EEG) - masked log loss(set) on the same "
+         "evaluation rows; negative = EEG helps. Comparisons: " + "; ".join(iu["comparisons"].values()) + ". "
+         "'Pattern' = 99% within-site CI upper bound < 0 and Delta < 0 at every site (descriptive here).", "",
+         f"**EEG-derived information is never an input or label evidence.** {iu['eeg_derived_inputs']}.", ""]
+    if iu["comparisons_unavailable"]:
+        L += ["Not run: " + "; ".join(f"{k} ({v})" for k, v in iu["comparisons_unavailable"].items()) + ".", ""]
+    sg = iu["subgroup"]
+    d = sg["definition"]
+    L += ["### Undifferentiated subgroup", "",
+          f"All three: EEG on encounter day 0-1 (t0 within {d['max_hours_from_visit_start']:g} h of the encounter start); no ICD "
+          f"diagnosis code of the primary label families recorded at or before t0; no sedative or opioid exposure in the "
+          f"{d['sedative_opioid_window_hours']:g} h before t0 (Baseline A sedation features). A component that cannot be established "
+          f"counts as not met. Sources: {d['sources']}.", "",
+          f"Size: {sg['n']} of the analysed set ({sg['share_of_analysed']}); per site "
+          + ", ".join(f"{k}: {v}" for k, v in sg["per_site"].items()) + f". Components met: {sg['components_met']}.", "",
+          "### Delta by comparison", "",
+          "| Scheme | Population | Comparison | n eval | Reference loss | Delta | 99% CI | 95% CI | per-site Delta | every site < 0 | pattern |",
+          "|---|---|---|---|---|---|---|---|---|---|---|"]
+    for split, pops in iu["populations"].items():
+        for pop, comps in pops.items():
+            if "not_estimable" in comps:
+                L.append(f"| {split} | {pop} | all | n/a | n/a | not estimable: {comps['not_estimable']} | | | | | |")
+                continue
+            for k, r in comps.items():
+                ci99, ci95 = r.get("ci_primary_within_site", {}), r.get("ci_95", {}).get("within_site", {})
+                ps = ", ".join(f"{s_}: {_f(v['delta'])} (n={v['n']})" for s_, v in r.get("per_site", {}).items())
+                L.append(f"| {split} | {pop} | {iu['comparisons'][k]} | {r.get('n_eval', '')} | {_f(r.get('loss_reference'))} | "
+                         f"{_f(r.get('delta'))} | [{_f(ci99.get('lo'))}, {_f(ci99.get('hi'))}] | "
+                         f"[{_f(ci95.get('lo'))}, {_f(ci95.get('hi'))}] | {ps} | {r.get('all_sites_favorable')} | "
+                         f"{r.get('h1h2_rule_met')} |")
+    L += ["", "Reference = the prevalence prior (a), age/sex only (b), Baseline P only (c), each fitted with the same head, grid and "
+          "recalibration as the EEG model. The subgroup rows are scored from models trained on all training-fold rows.", ""]
+    nc = iu.get("negative_controls", {})
+    if "skipped" in nc:
+        L += [nc["skipped"], ""]
+    elif nc:
+        L += ["### Negative controls of this block (whole analysed set)", "",
+              "| Scheme | Comparison | shuffled-label mean Delta | reps with spurious gain | permuted-EEG Delta | permuted-EEG spurious gain |",
+              "|---|---|---|---|---|---|"]
+        for split, per in nc.items():
+            for k, v in per.items():
+                L.append(f"| {split} | {iu['comparisons'][k]} | {_f(v['shuffled_labels_mean_delta'], 5)} | "
+                         f"{v['shuffled_labels_reps_with_spurious_gain_95']}/{v['shuffled_labels_reps']} | "
+                         f"{_f(v['permuted_eeg_delta'], 5)} | {v['permuted_eeg_spurious_gain_95']} |")
+        L.append("")
+    return L
+
+
 def render_markdown(J: dict) -> str:
     L = [f"# {J['banner']}", "",
          "Models trained, tuned and scored on structured, EEG-blind silver labels (D-143). Pre-Gate-0. Nothing below tests H1-H6.",
          "", f"Cohort definition `{J['settings']['cohort_definition']}`; sites shown as pseudonyms in lexicographic order; "
-         f"bootstrap B={J['settings']['n_boot']}; seed {J['settings']['seed']}.", "",
-         "## Data flow (counts < 11 shown as <11)", "", "| Step | n | " + " | ".join(
+         f"bootstrap B={J['settings']['n_boot']}; seed {J['settings']['seed']}; baselines: {J['settings'].get('baseline_scope', '')}.", ""]
+    if J.get("intended_use"):
+        L += _iu_markdown(J["intended_use"])
+    L += ["## Data flow (counts < 11 shown as <11)", "", "| Step | n | " + " | ".join(
              sorted({s for st in J["data_flow"]["steps"] for s in st["per_site"]})) + " |",
          "|---|---|" + "---|" * len({s for st in J["data_flow"]["steps"] for s in st["per_site"]})]
     sites = sorted({s for st in J["data_flow"]["steps"] for s in st["per_site"]})
@@ -794,6 +1049,8 @@ def build_parser() -> argparse.ArgumentParser:
     ap.add_argument("--temporal-fraction", type=float, default=0.2)
     ap.add_argument("--sedation-source", choices=["baseline", "e4b", "either"], default="either")
     ap.add_argument("--seed", type=int, default=0)
+    ap.add_argument("--undiff-max-hours", type=float, default=UNDIFF_MAX_H,
+                    help="undifferentiated subgroup: EEG within this many hours of the encounter start (default 36, D-145)")
     ap.add_argument("--blas-threads", type=int, default=1,
                     help="BLAS/OpenMP threads during model fitting (1 is several times faster for these small logistic fits "
                          "than oversubscribed defaults; 0 = library default)")
@@ -827,6 +1084,16 @@ def _run(a) -> int:
     safe_write_json(out / "report.json", J, known)
     safe_write_text(out / "report.md", render_markdown(J), known)
     safe_print(BANNER, known_ids=known)
+    safe_print(f"{IU_TITLE} (baselines: {A.baseline_scope}); undifferentiated subgroup n={J['intended_use']['subgroup']['n']}", known_ids=known)
+    for split, pops in J["intended_use"]["populations"].items():
+        for pop, comps in pops.items():
+            if "not_estimable" in comps:
+                safe_print(f"  {split} {pop}: not estimable ({comps['not_estimable']})", known_ids=known)
+                continue
+            for k, r in comps.items():
+                ci = r.get("ci_primary_within_site", {})
+                safe_print(f"  {split} {pop} {J['intended_use']['comparisons'][k]}: Delta={_f(r.get('delta'))} 99% CI "
+                           f"[{_f(ci.get('lo'))}, {_f(ci.get('hi'))}] every-site<0={r.get('all_sites_favorable')}", known_ids=known)
     safe_print(f"analysed={J['n_analysed']} labels={','.join(A.label_names)} primary={','.join(A.primary)} rung={R['headline_rung']}",
                known_ids=known)
     for split, lad in J["ladder"].items():

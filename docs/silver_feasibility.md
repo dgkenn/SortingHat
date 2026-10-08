@@ -2,7 +2,8 @@
 
 **EXPLORATORY — silver-label feasibility; not a test of preregistered hypotheses.**
 
-Status: built and tested on synthetic data only (CLAUDE.md rule 1). Authorised by the project lead; recorded as D-143.
+Status: built and tested on synthetic data only (CLAUDE.md rule 1). Authorised by the project lead; recorded as D-143. Intended-use
+block, Baseline P and current-encounter baselines added by D-145 (section 2.3).
 Code: `scripts/build_baselines.py`, `scripts/run_silver_feasibility.py`. Tests: `tests/test_silver_feasibility*.py`.
 Reads the harness in `sortinghat/models/`, `sortinghat/metrics/`, `sortinghat/baselines/`, `sortinghat/labels/` unchanged.
 
@@ -20,7 +21,7 @@ not count toward any gate, and must not be quoted without the banner above.
 ## 2. What it runs
 
 ```
-cohort_study1.csv ─┬─> scripts/build_baselines.py ──> baselines_AC.parquet (+ .columns.json)   Baselines A, C (as_of at t0)
+cohort_study1.csv ─┬─> scripts/build_baselines.py ──> baselines_AC.parquet (+ .columns.json)   Baselines A, C, P (as_of at t0)
 (local_only)       │
                    └─> scripts/run_silver_feasibility.py <── features/part-*.parquet          primary window, QC pass
                                     ^                    <── silver/silver_labels.csv         E1 E2 E4a E5 E6 (E7)
@@ -51,11 +52,28 @@ reported as skipped.) Synthetic dry run: `python3 -m pytest -o addopts="" -q tes
   prefilter removes events whose event time is after t0 and charted vitals/scores/pupils/POC glucose older than their
   window plus 1 h; it never admits a row. A test proves the matrix is identical with and without it, and equal to the
   package's in-memory build; a second test injects post-t0 events in every domain (1 s to 400 days) and shows the matrix does not move.
-* Outputs: `baselines_AC.parquet` (person_id + A-C columns, float64, mode 0600, under `local_only/`) and a names-only
-  sidecar listing which column belongs to A, B, C. The imaging group is not written (no imaging at the Study 1 sites, D-122);
+* Outputs: `baselines_AC.parquet` (person_id + the A-C and P columns and the two `meta__` subgroup columns, float64, mode 0600, under
+  `local_only/`; the file name is kept for the stage-2 driver) and a names-only sidecar listing which column belongs to A, B, C, P and
+  meta, plus the encounter scope. The imaging group is not written (no imaging at the Study 1 sites, D-122);
   NESI stays as a 100%-missing column (no source, D-122) and is dropped inside each training fold.
-* Stdout: per baseline the pooled missing rate of its value-type variables overall, by group and by site, and how many
+* Stdout: the encounter scope and how the encounter start was resolved; per baseline (A, B, C, P) the pooled missing rate of its value-type variables overall, by group and by site, and how many
   variables are observed in < 11 patients / missing at least 90% / 50-90% / 10-50% / under 10%. Counts and rates < 11 are suppressed.
+
+**Encounter scope and Baseline P (D-145).** By default every baseline (A, B, C and the new P) uses only events of the CURRENT
+encounter: events timed before the encounter start are removed when the event frame is built, so a prior visit's labs, drugs,
+vitals, scores or diagnosis codes never reach a model input, and `as_of` then limits what is left to t0. The encounter start is the
+cohort table's `encounter_start` (the covering visit chained back along acute visits, as in the cohort builder); a cohort table
+written before D-145 has no such column, so `build_baselines.py` re-runs the cohort's visit rule on the visit table, and a person
+no visit covers gets t0 minus 3 days. The build log counts the three sources and the removed events. `--with-history` writes the
+labelled sensitivity variant that also allows prior-encounter events (`encounter_scope` in the sidecar; the report says "with
+history"; a sidecar without the field is reported as "not recorded"). **Baseline P "Presentation"** = age, sex, the GCS / FOUR /
+RASS nearest to t0 in [-6 h, +1 h] (the cohort's strict-severity rule; the one bounded exception to the t0 mask, a second call of
+the gate restricted to the `score` domain, `presentation_score_after_h`), and the first vitals and point-of-care glucose of the
+current encounter before t0. No diagnosis codes, no history; not nested in A to C. The parquet also carries two `meta__` columns
+(hours from the encounter start to t0; a primary-label-family ICD code recorded at or before t0, any encounter) that define the
+subgroup and are listed under "meta" in the sidecar, never in a model set. Streaming keeps the first vital and glucose of the
+encounter through the memory prefilter (the earliest older row per person and key) and the +1 h score grace; a test proves the
+streamed matrices equal the in-memory build with and without the prefilter.
 
 ### 2.2 Analysis (`run_silver_feasibility.py`)
 
@@ -93,6 +111,9 @@ Also reported: per-site Delta, per-label Delta with 95% CI, per-label AUROC (poo
 < 11), AUROC difference (+EEG minus baseline) with a paired within-site bootstrap interval, and calibration (O/E, CITL, ECE, Brier,
 and slope only for labels with >= 100 events, D-094).
 
+**Intended use first (D-145).** See section 2.3; that block is the first thing in `report.md`, `report.json` and stdout, ahead of the
+A / C comparisons below.
+
 **Mandatory controls** (headline rung, both schemes, both baselines):
 
 | Control | How |
@@ -110,6 +131,47 @@ mapped to the label (E1 <- foc slowing/LPD/LRDA; E2 <- BS/low voltage; E5 <- GPD
 EEG-clinician sign-off) and (ii) the silver label. The silver label stands where the plan's audit uses gold. It is run for the
 baseline-only and the headline EEG model of each baseline. `reports_findings` is read only here and never produces a label.
 
+### 2.3 Intended-use analyses (D-145)
+
+The intended use is undifferentiated altered mental status or unexplained unconsciousness in the ED, with little or no history:
+"given an unknown EEG, what is the cause?". The first reported block, **Intended use: undifferentiated AMS**, asks that question
+with baselines the intended user would have. For the headline rung and both validation schemes it reports Delta = masked log loss(set
++ EEG) - masked log loss(set) on the same evaluation rows (99% within-site interval, 95% interval, per-site Delta, every-site rule):
+
+| | Reference set | EEG model |
+|---|---|---|
+| a | the smoothed training prevalence (no features) | EEG only |
+| b | age and sex (A's demographic columns) | EEG + age/sex |
+| c | Baseline P (Presentation) | EEG + P |
+
+All three use the same head, grid and recalibration as the A / C comparisons. They are reported twice: for the whole analysed set,
+and for the **undifferentiated subgroup**, defined from the cohort and baseline columns and requiring all of:
+
+1. EEG on encounter day 0 to 1: 0 <= t0 - encounter start <= 36 h (`--undiff-max-hours`; the cohort's `encounter_start`, else the
+   `meta__hours_since_encounter_start` that `build_baselines.py` resolved for an older cohort table);
+2. no ICD diagnosis code of the primary label families recorded at or before t0, in any encounter (acute structural dx, arrest,
+   asphyxia: the `code_event_items` with condition codes that are anchor items; an unknown-time code counts as recorded, a date-only
+   one counts from the start of its day);
+3. no sedative or opioid exposure in the 6 h before t0 from the Baseline A sedation features (running at t0, or a recorded quantity
+   attributable to the 6 h window).
+
+A component that cannot be established counts as not met, so missing data never enlarges the subgroup. The report gives the
+subgroup size (overall and per site, suppressed below 11) and how many patients meet each component. The subgroup comparisons train
+on all training-fold rows and score only subgroup rows (the dev draw is unchanged); a scheme with fewer than 50 scored subgroup rows
+or fewer than 11 at a site is "not estimable". Shuffled-label and permuted-EEG negative controls run for the three comparisons on
+the whole set. **EEG-derived information is never an input or label evidence:** no baseline, P or meta column is derived from EEG, the
+silver labels are EEG-blind (E3 and EEG-report flags excluded), and `reports_findings` feeds only the circularity audit.
+
+Reading it: (a) says whether the EEG carries etiologic signal at all; (b) and (c) say whether it adds to what is known at the door.
+The A and C comparisons that follow answer a different question (an EEG recorded after a workup) and stay as before. A favourable
+(a) with an unfavourable (c) means the presentation already carries what the EEG carries on these labels.
+
+Limits specific to this block: the subgroup is a restriction on the same silver labels, so structured ascertainment is thinner
+there (little coded workup by construction) and the labels that need the workup (E5 labs, E6 cultures) are the least ascertained; a
+sedative bolus with no recorded quantity that ended before t0 is invisible to the Baseline A sedation features; ICD codes are timed
+at their start date, which can precede the coding time; encounter starts are date-granular because visits are date-only (D-112);
+the +1 h score window uses data charted after the EEG began (P only).
+
 ## 3. Deviations from the plan
 
 | Plan / earlier decision | This analysis | Why it is acceptable here |
@@ -124,6 +186,8 @@ baseline-only and the headline EEG model of each baseline. `reports_findings` is
 | H3 cut points fixed before unblinding (D-132) | Fixed in the script before any run | Three GCS-equivalent strata, see 2.2 |
 | Bootstrap B = 10,000 for final analyses (D-141) | B = 4,000 default | Exploratory |
 | Baseline D (D-107), imaging in C and NESI in A (D-122) | Dropped / absent | As decided |
+| Baselines A to C may use prior-encounter data (earlier behaviour) | Current encounter only by default; `--with-history` is the labelled variant (D-145) | The intended user has no prior history |
+| Baselines are t0-masked | Baseline P reads GCS / FOUR / RASS up to 1 h after t0 (D-145) | The cohort's own severity window (D-105); `presentation_score_after_h = 0` restores strict masking |
 | Cohort, baselines and silver at metadata start; features at signal onset (D-124) | Same | Baselines precede the feature window |
 
 ## 4. Interpretation limits (read before quoting anything)
@@ -180,3 +244,7 @@ exception class only. No LLM sees any record.
 * Check what share of `reports_findings` rows carry a usable patient id at S0001/S0002 (the audit prints coverage; blank
   `BDSPPatientID` rows cannot be matched).
 * If cohort sizes allow, repeat with `--cohort-def broad` as a sensitivity analysis.
+* Run `build_baselines.py --with-history` to a second parquet and `run_silver_feasibility.py --baselines <that file> --out <another dir>`
+  for the "with history" sensitivity variant; compare it with the default (current encounter only) report.
+* Check the `encounter start from {...}` line of the baseline build: 'cohort' or 'visits' for (nearly) everyone; many 'fallback' rows
+  mean the covering visit was not found and the current-encounter restriction used t0 minus 3 days.

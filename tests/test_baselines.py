@@ -127,8 +127,9 @@ def test_history_flags_recent_vs_any_and_no_diagnosis_leak():
         {"person_id": 1, "condition_start_datetime": T0 + H(5), "condition_source_value": "G40.909"}])
     t = add_rows(t, "omop_observation", [{"person_id": 1, "observation_datetime": T0 - H(1),
                                           "observation_source_value": "Witnessed convulsion", "value_as_string": "yes"}])
-    r = row(build(t))
+    r = row(build(t, encounter_scope="with_history"))                  # D-145: "any time" needs the history variant
     assert r["hx__arrest_any"] == 1 and r["hx__arrest_recent"] == 0
+    assert row(build(t))["hx__arrest_any"] == 0                         # default: a 400-day-old code is a prior encounter
     assert r["hx__head_trauma_recent"] == 1 and r["hx__trauma_recent"] == 1
     assert r["hx__convulsion_recent"] == 1
 

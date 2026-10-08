@@ -183,8 +183,11 @@ def test_cli_writes_a_private_matrix_and_prints_only_aggregates(synth_dir, cohor
     side_path = out.with_name("baselines_AC.columns.json")
     assert oct(os.stat(side_path).st_mode & 0o777) == "0o600"
     side = json.loads(side_path.read_text())["baselines"]
-    assert set(side) == {"A", "B", "C"} and set(side["A"]) <= set(side["B"]) <= set(side["C"])
-    assert set(df.columns) == {"person_id", *side["C"]}
+    meta = json.loads(side_path.read_text())["meta"]
+    assert set(side) == {"A", "B", "C", "P"} and set(side["A"]) <= set(side["B"]) <= set(side["C"])
+    assert set(side["P"]) & set(side["C"]) == {c for c in side["A"] if c.startswith("demo__")}      # P shares only age / sex
+    assert set(df.columns) == {"person_id", *side["C"], *side["P"], *meta}
+    assert json.loads(side_path.read_text())["encounter_scope"] == "current"
     assert not [c for c in df.columns if c.startswith(("ind__", "img__"))]          # Baseline D dropped; no imaging in C
     assert sorted(df["person_id"]) == sorted(coh["person_id"]) and df["person_id"].is_unique
     assert all(df[c].dtype == "float64" for c in df.columns if c != "person_id")
@@ -220,7 +223,7 @@ def test_missingness_summary_pools_and_suppresses(synth_dir, index, tables):
     store = data_io.open_store(synth_dir)
     fs, _ = bb.build_matrices(StoreSources(store), index, CFG)
     s = bb.missingness_summary(fs, index)
-    assert set(s["baselines"]) == {"A", "B", "C"}
+    assert set(s["baselines"]) == {"A", "B", "C", "P"}
     for b, v in s["baselines"].items():
         assert v["n_columns"] >= v["n_value_variables"] > 0
         assert 0 <= v["pooled_missing_rate"] <= 1 or v["pooled_missing_rate"] == "<11"
@@ -229,13 +232,15 @@ def test_missingness_summary_pools_and_suppresses(synth_dir, index, tables):
             if site["n"] == "<11":
                 assert site["pooled_missing_rate"] == "<11"
     assert s["baselines"]["A"]["n_columns"] < s["baselines"]["B"]["n_columns"] < s["baselines"]["C"]["n_columns"]
+    assert s["baselines"]["P"]["n_columns"] > 4
 
 
 def test_the_analysis_script_reads_what_the_baseline_runner_writes(synth_dir, cohort_csv):
     out = cohort_csv.parent / "bl_handoff.parquet"
     run_cli(synth_dir, cohort_csv, out, "--sites", "all")
     bl, cols = rsf.load_baselines(out)
-    assert set(cols) == {"A", "C"} and set(cols["A"]) < set(cols["C"])
+    assert set(cols) == {"A", "C", "P", "AGE_SEX", "meta"} and set(cols["A"]) < set(cols["C"])
+    assert rsf.baseline_scope(out) == "current encounter only"
     assert {"sed__sedative__on_t0", "sed__opioid__on_t0", "score__gcs__value", "demo__age_years"} <= set(cols["A"])
     assert set(cols["C"]) <= set(bl.columns) and bl["person_id"].is_unique
     flag = rsf.sedation_flag(bl.set_index("person_id").reset_index(drop=True), pd.DataFrame(index=range(len(bl))), "baseline")

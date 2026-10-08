@@ -1,5 +1,5 @@
 #!/usr/bin/env python3
-"""Baselines A-C feature matrices for the Study 1 cohort (real-data runner; Baseline D dropped, D-107).
+"""Baselines A-C and P (Presentation) feature matrices for the Study 1 cohort (real-data runner; Baseline D dropped, D-107).
 
     # synthetic data, or a local mirror of the HEEDB layout
     python3 scripts/build_baselines.py --data data/synthetic --cohort out/local_only/cohort_study1.csv \
@@ -24,6 +24,16 @@ What it does
     * writes the record-level matrix (person_id + the A-C columns, float64) to ``--out`` (must be under local_only/, mode
       0600) and a names-only sidecar ``<out>.columns.json`` (which column belongs to A, B, C).
 
+Current-encounter restriction and Baseline P (D-145)
+    * By default every baseline (A, B, C, P) uses only events of the CURRENT encounter, from the encounter start up to t0 (the
+      cohort's ``encounter_start`` column, else the cohort's covering-visit rule re-run on the visit table, else
+      ``t0 - 3 days``; the basis counts are printed). ``--with-history`` builds the labelled sensitivity variant that also
+      allows prior-encounter events; the sidecar records the scope and ``run_silver_feasibility.py`` labels its report.
+    * Baseline P "Presentation": age, sex, the GCS / FOUR / RASS nearest to t0 in [-6 h, +1 h], and the FIRST vitals and
+      point-of-care glucose of the current encounter; no diagnosis codes, no history. Written next to A-C (columns listed
+      under "P" in the sidecar). The ``meta__`` columns (hours since the encounter start; a primary-label-family ICD code
+      recorded by t0) define the undifferentiated subgroup and are never model inputs.
+
 Stdout carries aggregates only (``sortinghat.safe_output``; n < 11 shown as "<11"): per baseline the pooled missing rate of
 its value-type variables overall, per group and per site, and how many variables are observed in < 11 / few / most patients.
 """
@@ -47,13 +57,14 @@ from sortinghat.audit import field_audit as fa  # noqa: E402
 from sortinghat.baselines import BaselineConfig, features as bl_features  # noqa: E402
 from sortinghat.baselines import lexicon as lx  # noqa: E402
 from sortinghat.baselines.asof import EVENT_COLUMNS, empty_events  # noqa: E402
-from sortinghat.baselines.events import drug_events, history_events, measurement_events  # noqa: E402
+from sortinghat.baselines.encounter import resolve_encounter_start, restrict_to_current_encounter  # noqa: E402
+from sortinghat.baselines.events import drug_events, history_events, label_dx_events, measurement_events  # noqa: E402
 from sortinghat.cohort import StoreSources  # noqa: E402
 from sortinghat.cohort.memguard import peak_rss_gb, run_guarded  # noqa: E402
 from sortinghat.cohort.sources import remap_ids  # noqa: E402
 from sortinghat.safe_output import safe_print, safe_write_json, suppress_count, suppress_proportion  # noqa: E402
 
-BASELINES_OUT = ("A", "B", "C")                      # D dropped (D-107)
+BASELINES_OUT = ("A", "B", "C", "P")                 # D dropped (D-107); P = Presentation (D-145)
 TEXT_COLS = ("SiteID", "SessionID", "BidsFolder", "EEGFolder")
 STUDY_SITES = ("S0001", "S0002")                     # D-120: the only sites with labelled patients
 COHORT_DEFS = {"table": None, "strict": "in_strict", "strict_pm6": "in_strict_pm6", "broad": "in_broad"}
@@ -100,6 +111,8 @@ def load_cohort(path: str | Path, sites=None, cohort_def: str = "table") -> pd.D
     else:
         df["person_id_source"] = df["person_id"]
     df["t0"] = schema.parse_datetimes(df["t0"])
+    if "encounter_start" in df:                                  # added to the cohort table by D-145; older tables lack it
+        df["encounter_start"] = schema.parse_datetimes(df["encounter_start"])
     for c in ("in_strict", "in_strict_pm6", "in_broad"):
         if c in df:
             df[c] = _as_bool(df[c])
@@ -150,43 +163,89 @@ def sex_lookup(store, cohort: pd.DataFrame) -> pd.Series:
 
 
 def make_index(cohort: pd.DataFrame, sex_male: pd.Series) -> pd.DataFrame:
-    """The baseline index (``baselines.events.build_index`` columns) from the cohort table; no referral indication."""
+    """The baseline index (``baselines.events.build_index`` columns) from the cohort table; no referral indication.
+    ``encounter_start`` is the cohort table's column when it has one (NaT otherwise: ``ensure_encounters`` completes it)."""
     age = pd.to_numeric(cohort["age_years"], errors="coerce") if "age_years" in cohort else \
         pd.Series(np.nan, index=cohort.index)
+    enc = cohort["encounter_start"].astype("datetime64[us]") if "encounter_start" in cohort else \
+        pd.Series(pd.NaT, index=cohort.index, dtype="datetime64[us]")
     return pd.DataFrame({
         "person_id": cohort["person_id"].astype("int64").to_numpy(), "SiteID": cohort["SiteID"].astype(str).to_numpy(),
         "SessionID": cohort["SessionID"].astype(str).to_numpy(), "t0": cohort["t0"].astype("datetime64[us]").to_numpy(),
         "age_years": age.to_numpy(float), "sex_male": sex_male.reindex(cohort.index).to_numpy(float),
-        "indication_raw": None}).sort_values("person_id").reset_index(drop=True)
+        "indication_raw": None, "encounter_start": enc.to_numpy()}).sort_values("person_id").reset_index(drop=True)
+
+
+def ensure_encounters(src, index: pd.DataFrame, cfg: BaselineConfig, mm: dict | None = None) -> pd.DataFrame:
+    """Index with ``encounter_start`` and ``encounter_basis`` ('cohort' | 'visits' | 'fallback') for every row. Rows without a
+    cohort start get the cohort's covering-visit rule (``cohort.rules.match_visits``) on the streamed visit table; rows still
+    unmatched get ``t0 - cfg.encounter_fallback_days``. The start is never after t0."""
+    given = index["encounter_start"] if "encounter_start" in index else None
+    need = pd.Series(True, index=index.index) if given is None else given.isna()
+    if "encounter_basis" in index and not need.any():
+        return index
+    visits = None
+    if need.any() and hasattr(src, "visits"):
+        from sortinghat.cohort.config import CohortConfig
+        cc = CohortConfig()
+        sub = index[need]
+        rev: dict[int, list[int]] = {}
+        for old, new in (mm or {}).items():
+            rev.setdefault(new, []).append(old)
+        pids = {int(p) for p in sub["person_id"]}
+        ids = pids | {o for p in pids for o in rev.get(p, [])}
+        bounds = sub.groupby("person_id")["t0"].agg(lo="min", hi="max").astype("datetime64[s]")
+        visits = src.visits(sorted(ids), bounds=bounds, remap=mm or None, slack_h=cc.visit_slack_h, dates_only=cc.visit_dates_only)
+    start, basis = resolve_encounter_start(index.reset_index(drop=True), None if given is None else given.reset_index(drop=True),
+                                           visits, cfg.encounter_fallback_days)
+    return index.assign(encounter_start=start.to_numpy(), encounter_basis=basis.to_numpy())
 
 
 # ------------------------------------------------------------------------------------------ event streaming
-def prune_events(ev: pd.DataFrame, t0: pd.Series, cfg: BaselineConfig, prefilter: bool = True) -> pd.DataFrame:
+def prune_events(ev: pd.DataFrame, t0: pd.Series, cfg: BaselineConfig, prefilter: bool = True,
+                 enc: pd.Series | None = None) -> pd.DataFrame:
     """MEMORY PREFILTER (never admits a row; ``as_of`` stays the gate). Drops events whose event time is after the
-    person's t0 (``t_avail >= t_event``, so ``as_of`` would drop them anyway) and charted vital/score/pupil/POC-glucose rows
-    older than their feature window plus a margin. Also blanks the two text columns no extractor reads."""
+    person's t0 (``t_avail >= t_event``, so ``as_of`` would drop them anyway; ``score`` rows keep the presentation grace
+    ``cfg.presentation_score_after_h`` that Baseline P's bounded gate may admit) and charted vital/score/pupil/POC-glucose
+    rows older than their feature window plus a margin. With ``enc`` (encounter start per person) the older vital and POC
+    glucose rows are not all dropped: Baseline P needs the FIRST value of the current encounter, so per (person, key) the
+    earliest older row at or after the encounter start is kept. Also blanks the two text columns no extractor reads."""
     if ev.empty:
         return ev
     ev = ev.assign(raw_name=None, unit=None)
     if not prefilter:
         return ev
     t = ev["person_id"].map(t0)
-    keep = (ev["t_event"].isna() | (ev["t_event"] <= t)) & t.notna()      # NaT event time: as_of decides
+    cut = t.where(ev["domain"] != "score", t + pd.Timedelta(hours=cfg.presentation_score_after_h))
+    keep = (ev["t_event"].isna() | (ev["t_event"] <= cut)) & t.notna()      # NaT event time: as_of decides
     win = {"score": cfg.score_window_h, "vital": cfg.vital_window_h, "pupil": cfg.vital_window_h,
            "poc_glucose": cfg.poc_glucose_window_h}
+    first_dom = ("vital", "poc_glucose")
+    older = pd.Series(False, index=ev.index)
     for dom, w in win.items():
         old = (ev["domain"] == dom) & (ev["t_event"] < t - pd.to_timedelta(w + PREFILTER_MARGIN_H, unit="h"))
         keep &= ~old
-    return ev[keep.to_numpy(bool)]
+        if enc is not None and dom in first_dom:
+            older |= old
+    out = ev[keep.to_numpy(bool)]
+    if enc is not None and older.any():
+        cand = ev[(older & (ev["t_event"] <= t) & (ev["t_event"] >= ev["person_id"].map(enc))).to_numpy(bool)]
+        if len(cand):
+            cand = cand.sort_values(["person_id", "key", "t_event", "t_avail", "value"], kind="stable"
+                                    ).drop_duplicates(["person_id", "key"])
+            out = pd.concat([out, cand], ignore_index=True)
+    return out
 
 
-def prune_rows(chunk: pd.DataFrame, t0: pd.Series, dt_col: str, date_col: str | None = None) -> pd.DataFrame:
+def prune_rows(chunk: pd.DataFrame, t0: pd.Series, dt_col: str, date_col: str | None = None,
+               grace_h: float = 0.0) -> pd.DataFrame:
     """RAW-ROW prefilter, same contract as ``prune_events`` (removes only rows no event could survive ``as_of`` from): drops
     rows timed after the person's t0 by their datetime, else (date-only) by a date after t0's calendar day. Rows with no
-    usable time are kept for the event builder to judge. Ids must already be the surviving ids."""
+    usable time are kept for the event builder to judge. Ids must already be the surviving ids. ``grace_h`` widens the cut by
+    Baseline P's presentation window (D-145); ``as_of`` still decides."""
     if chunk.empty or dt_col not in chunk:
         return chunk
-    t = chunk["person_id"].map(t0)
+    t = chunk["person_id"].map(t0) + pd.Timedelta(hours=grace_h)
     dt = chunk[dt_col]
     late = dt.notna() & (dt > t)
     if date_col is not None and date_col in chunk:
@@ -213,24 +272,28 @@ def drug_concept_names(store, on_error=None) -> pd.DataFrame:
 
 def collect_events(src: StoreSources, index: pd.DataFrame, cfg: BaselineConfig, mm: dict | None = None,
                    prefilter: bool = True, chunk_rows: int = CHUNK_ROWS) -> tuple[pd.DataFrame, dict]:
-    """Baseline events for the indexed people, streamed table by table, row group by row group."""
+    """Baseline events for the indexed people, streamed table by table, row group by row group. With the default
+    ``cfg.encounter_scope == "current"`` (D-145) events before the person's encounter start (``index['encounter_start']``) are
+    removed at the end; that is a restriction of the model inputs, not a memory prefilter, so it also runs with
+    ``prefilter=False``."""
     pids = {int(p) for p in index["person_id"]}
     rev: dict[int, list[int]] = {}
     for old, new in (mm or {}).items():
         rev.setdefault(new, []).append(old)
     ids = set(pids) | {o for p in pids for o in rev.get(p, [])}
     t0 = index.set_index("person_id")["t0"]
-    diag: dict = {"n_measurement_rows_unmapped": 0}
+    enc = index.set_index("person_id")["encounter_start"] if "encounter_start" in index else None
+    diag: dict = {"n_measurement_rows_unmapped": 0, "n_events_prior_encounter_dropped": 0}
     parts: list[pd.DataFrame] = []
 
     def add(ev: pd.DataFrame) -> None:
-        ev = prune_events(ev, t0, cfg, prefilter)
+        ev = prune_events(ev, t0, cfg, prefilter, enc)
         if len(ev):
             parts.append(ev)
 
     def early(chunk, dt_col, date_col=None):
         chunk = remap_ids(chunk, mm)
-        return prune_rows(chunk, t0, dt_col, date_col) if prefilter else chunk
+        return prune_rows(chunk, t0, dt_col, date_col, cfg.presentation_score_after_h) if prefilter else chunk
 
     for chunk in src.iter_rows("omop_measurement", MEAS_COLS, ids, chunk_rows):
         d: dict = {}
@@ -250,8 +313,15 @@ def collect_events(src: StoreSources, index: pd.DataFrame, cfg: BaselineConfig, 
     for table, cols in (("omop_condition_occurrence", COND_COLS), ("omop_procedure_occurrence", PROC_COLS),
                         ("omop_observation", OBS_COLS)):
         for chunk in src.iter_rows(table, cols, ids, chunk_rows):
-            add(history_events({table: remap_ids(chunk, mm)}, pids))      # small tables: events pruned, rows kept
+            chunk = remap_ids(chunk, mm)
+            add(history_events({table: chunk}, pids))                     # small tables: events pruned, rows kept
+            if table == "omop_condition_occurrence":
+                add(label_dx_events({table: chunk}, pids))                # subgroup definition only (domain dxlab)
     ev = pd.concat(parts, ignore_index=True) if parts else empty_events()
+    if cfg.encounter_scope == "current":
+        if enc is None:
+            raise ValueError("encounter_scope='current' needs index['encounter_start'] (see ensure_encounters)")
+        ev, diag["n_events_prior_encounter_dropped"] = restrict_to_current_encounter(ev[EVENT_COLUMNS], enc)
     return ev[EVENT_COLUMNS], diag
 
 
@@ -259,9 +329,11 @@ def build_matrices(src: StoreSources, index: pd.DataFrame, cfg: BaselineConfig, 
                    prefilter: bool = True, chunk_rows: int = CHUNK_ROWS):
     """(FeatureSet, number of events fed to the gate) with the package's own ``build_feature_set``: the streamed events
     replace its in-memory ``build_events`` step, everything after it (the ``as_of`` gate, the extractors) is untouched."""
+    index = ensure_encounters(src, index, cfg, mm)
     ev, diag = collect_events(src, index, cfg, mm, prefilter, chunk_rows)
     with mock.patch.object(bl_features, "build_events", lambda tables, idx, c: (ev, diag)):
         fs = bl_features.build_feature_set({}, cfg, index)
+    fs.diagnostics["encounter_basis"] = {k: int(v) for k, v in index["encounter_basis"].value_counts().items()}
     return fs, len(ev)
 
 
@@ -269,19 +341,19 @@ def build_matrices(src: StoreSources, index: pd.DataFrame, cfg: BaselineConfig, 
 def baseline_columns(fs, baselines=BASELINES_OUT) -> dict[str, list[str]]:
     """Output columns per baseline: the package's A/B/C subsets minus the imaging group (D-122: no imaging at the Study 1
     sites, and this runner does not read the imaging table, so those columns would be a constant 0 that means nothing)."""
-    grp = fs.provenance.set_index("feature")["group"]
+    grp = fs.all_provenance().set_index("feature")["group"]
     return {b: [c for c in fs.columns(b) if grp[c] != "imaging"] for b in baselines}
 
 
 def missingness_summary(fs, index: pd.DataFrame, baselines=BASELINES_OUT) -> dict:
     """Aggregate-only missingness of the VALUE-type variables (NaN = not observed by t0) per baseline."""
-    prov = fs.provenance.set_index("feature")
+    prov = fs.all_provenance().set_index("feature")
     n = len(fs.X)
     site = index.set_index("person_id")["SiteID"].reindex(fs.X.index).to_numpy()
     out = {"n_patients": suppress_count(n), "baselines": {}}
     for b, cols in baseline_columns(fs, baselines).items():
         val = [c for c in cols if prov.at[c, "role"] in ("value", "age_h")]
-        X = fs.X[val]
+        X = fs.all_x()[val]
         n_obs = X.notna().sum()
         cells_total, cells_miss = n * len(val), int(X.isna().to_numpy().sum())
         bins = {"observed_in_fewer_than_11": 0, "missing_ge_90pct": 0, "missing_50_to_90pct": 0,
@@ -309,9 +381,19 @@ def missingness_summary(fs, index: pd.DataFrame, baselines=BASELINES_OUT) -> dic
     return out
 
 
-def print_summary(summ: dict, n_events: int, rss: float) -> None:
-    safe_print("Baselines A-C built (aggregate-only output; n<11 suppressed). Baseline D dropped (D-107). "
+def encounter_notes(fs, cfg: BaselineConfig) -> list[str]:
+    """Aggregate lines on the encounter scope (D-145): scope label, how the encounter start was resolved, rows removed."""
+    d = fs.diagnostics
+    basis = {k: suppress_count(v) for k, v in sorted(d.get("encounter_basis", {}).items())}
+    return [f"encounter scope: {'WITH HISTORY (sensitivity variant: prior-encounter events allowed)' if cfg.encounter_scope == 'with_history' else 'current encounter only (default, D-145)'}; "
+            f"encounter start from {basis}; prior-encounter events removed={suppress_count(d.get('n_events_prior_encounter_dropped', 0))}"]
+
+
+def print_summary(summ: dict, n_events: int, rss: float, notes: list[str] | None = None) -> None:
+    safe_print("Baselines A-C and P built (aggregate-only output; n<11 suppressed). Baseline D dropped (D-107). "
                f"patients={summ['n_patients']}; events kept after the as_of gate inputs={suppress_count(n_events)}")
+    for line in notes or []:
+        safe_print("  " + line)
     for b, s in summ["baselines"].items():
         safe_print(f"  Baseline {b}: {s['n_columns']} columns, {s['n_value_variables']} value variables, pooled missing "
                    f"rate {s['pooled_missing_rate']}; variables by missingness {s['variables_by_missingness']}")
@@ -323,8 +405,10 @@ def print_summary(summ: dict, n_events: int, rss: float) -> None:
 
 # -------------------------------------------------------------------------------------------------- driver
 def write_outputs(fs, index: pd.DataFrame, cfg: BaselineConfig, out: Path) -> Path:
-    cols = baseline_columns(fs)["C"]                             # A subset B subset C
-    X = fs.X.reindex(index["person_id"].to_numpy())[cols].astype("float64")
+    sets = baseline_columns(fs)
+    meta = fs.columns("meta")
+    cols = list(dict.fromkeys([*sets["C"], *sets["P"], *meta]))   # A subset B subset C; P overlaps A (age, sex); meta = subgroup
+    X = fs.all_x().reindex(index["person_id"].to_numpy())[cols].astype("float64")
     df = X.reset_index()
     df["person_id"] = df["person_id"].astype("int64")
     out.parent.mkdir(parents=True, exist_ok=True)
@@ -332,9 +416,15 @@ def write_outputs(fs, index: pd.DataFrame, cfg: BaselineConfig, out: Path) -> Pa
     df.to_parquet(out, index=False)
     os.chmod(out, 0o600)
     side = out.with_name(out.stem + ".columns.json")
-    side.write_text(json.dumps({"baselines": baseline_columns(fs),
+    side.write_text(json.dumps({"baselines": sets, "meta": meta,
+                                "encounter_scope": cfg.encounter_scope,
+                                "encounter_scope_label": ("with history" if cfg.encounter_scope == "with_history"
+                                                          else "current encounter only"),
                                 "t0_basis": "metadata EEG start (D-124)", "baseline_d": "dropped (D-107)",
                                 "imaging": "no imaging inputs (D-122); img__* columns not written",
+                                "baseline_p": "Presentation (D-145): age, sex, GCS/FOUR/RASS nearest to t0 in [-6 h, +1 h], first "
+                                              "vitals and POC glucose of the current encounter; no diagnosis codes, no history",
+                                "meta_note": "meta__ columns define the undifferentiated subgroup; they are never model inputs",
                                 "config": cfg.to_dict()}, indent=1, default=list))
     os.chmod(side, 0o600)
     return side
@@ -353,6 +443,9 @@ def main(argv=None) -> int:
     ap.add_argument("--out", default="out/local_only/baselines_AC.parquet", help="record-level parquet (under local_only/)")
     ap.add_argument("--summary", help="optional aggregate JSON (safe_write_json)")
     ap.add_argument("--merge-cols", nargs=2, metavar=("OLD", "NEW"), help="PatientMergeHistory id columns (as build_cohort)")
+    ap.add_argument("--with-history", action="store_true",
+                    help="sensitivity variant 'with history' (D-145): prior-encounter events are allowed; the default uses the "
+                         "current encounter only, for every baseline")
     ap.add_argument("--chunk-rows", type=int, default=CHUNK_ROWS)
     ap.add_argument("--no-prefilter", action="store_true", help="skip the memory prefilter (tests; needs much more memory)")
     ap.add_argument("--max-memory-gb", type=float, default=None, help="RLIMIT_AS guard (see build_cohort.py)")
@@ -371,13 +464,13 @@ def _run(a) -> int:
     sex = sex_lookup(store, cohort)
     index = make_index(cohort, sex)
     del cohort
-    cfg = BaselineConfig()
+    cfg = BaselineConfig(encounter_scope="with_history" if a.with_history else "current")
     sources = StoreSources(store, merge_cols=tuple(a.merge_cols) if a.merge_cols else None)
     mm, _status = sources.merge_map()
     fs, n_events = build_matrices(sources, index, cfg, mm or None, not a.no_prefilter, a.chunk_rows)
     write_outputs(fs, index, cfg, out)
     summ = missingness_summary(fs, index)
-    print_summary(summ, n_events, peak_rss_gb())
+    print_summary(summ, n_events, peak_rss_gb(), encounter_notes(fs, cfg))
     if a.summary:
         safe_write_json(a.summary, summ)
     return 0

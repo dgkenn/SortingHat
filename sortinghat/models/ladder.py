@@ -104,6 +104,15 @@ def fit_predict_fold(data: ModelData, train_idx, test_idx, baseline_cols: Sequen
     sel = primary_label_indices(data.label_names, cfg.include_e7)
     preds, info, models = {}, {}, {}
     for name, eeg_cols in variants.items():
+        if not len(baseline_cols) and not len(eeg_cols):
+            # No baseline columns and no EEG columns: the model IS the smoothed prevalence prior (training silver rows). This is the
+            # reference of the "EEG-only vs prevalence prior" comparison (D-145); it has no features to select or recalibrate.
+            preds[name] = np.tile(prevalence_prior(tr.y_silver[fit_rows], tr.m_silver[fit_rows]), (len(test_idx), 1))
+            info[name] = {"selected_c": float("nan"), "selected_eeg_scale": float("nan"), "used_dev": False,
+                          "calibrated": False, "n_train": int(len(fit_rows)), "n_dev": 0, "n_features_in": 0,
+                          "n_features_out": 0}
+            models[name] = None
+            continue
         Xtr = tr.design(fit_rows, baseline_cols, eeg_cols)
         Xdev = tr.design(dev_rows, baseline_cols, eeg_cols)
         mdl = fit_model(Xtr, tr.y_silver[fit_rows], tr.m_silver[fit_rows],

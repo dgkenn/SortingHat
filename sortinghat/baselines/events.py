@@ -14,15 +14,17 @@ from ..audit import field_audit as fa
 from . import lexicon as lx
 from .asof import EVENT_COLUMNS, empty_events
 from .config import BaselineConfig
+from .encounter import resolve_encounter_start, restrict_to_current_encounter
 
 ONE_DAY = pd.Timedelta(days=1)
 
 
 # ----------------------------------------------------------------------------------------------- index
-def build_index(tables: dict[str, pd.DataFrame]) -> pd.DataFrame:
+def build_index(tables: dict[str, pd.DataFrame], cfg: BaselineConfig | None = None) -> pd.DataFrame:
     """One row per adult patient: first qualifying (acute-care, start-time-present) EEG.
 
-    Columns: person_id, SiteID, SessionID, t0 (= ``StartTime(EEG)``), age_years, sex_male, indication_raw.
+    Columns: person_id, SiteID, SessionID, t0 (= ``StartTime(EEG)``), age_years, sex_male, indication_raw, encounter_start,
+    encounter_basis (D-145: the cohort's covering-visit rule; ``t0 - encounter_fallback_days`` when no visit covers t0).
     Selection mirrors ``field_audit.build_candidates`` so the cohort is the audit's cohort; it additionally
     keeps the session so the referral indication of *that* EEG is read.
     """
@@ -62,7 +64,16 @@ def build_index(tables: dict[str, pd.DataFrame]) -> pd.DataFrame:
         "SessionID": first["SessionID"].astype(str), "t0": first["StartTime"].astype("datetime64[us]"),
         "age_years": first["AgeAtVisit"].astype(float), "sex_male": sex_male.to_numpy(float),
         "indication_raw": first.get("ReferralIndication")})
-    return out.sort_values("person_id").reset_index(drop=True)
+    out = out.sort_values("person_id").reset_index(drop=True)
+    return add_encounter_start(out, tables.get("omop_visit_occurrence"), cfg or BaselineConfig())
+
+
+def add_encounter_start(index: pd.DataFrame, visits: pd.DataFrame | None, cfg: BaselineConfig,
+                        given: "pd.Series | None" = None) -> pd.DataFrame:
+    """Index plus ``encounter_start`` / ``encounter_basis`` (``given``: a positionally aligned start, e.g. the cohort column)."""
+    idx = index.drop(columns=[c for c in ("encounter_start", "encounter_basis") if c in index]).reset_index(drop=True)
+    start, basis = resolve_encounter_start(idx, given, visits, cfg.encounter_fallback_days)
+    return idx.assign(encounter_start=start.to_numpy(), encounter_basis=basis.to_numpy())
 
 
 # ------------------------------------------------------------------------------------------------ utils
@@ -241,6 +252,51 @@ def history_events(tables: dict, pids: set[int]) -> pd.DataFrame:
     return pd.concat(frames, ignore_index=True) if frames else empty_events()
 
 
+# -------------------------------------------------------------------------------- label-family diagnosis codes
+UNKNOWN_TIME = pd.Timestamp("1900-01-01")
+
+
+def label_dx_items() -> tuple[str, ...]:
+    """Event items with ICD condition codes that are anchor items of the silver labels E1-E7 (``configs/anchor_concepts.yaml``
+    and ``silver_anchors.yaml``: acute structural dx, arrest, asphyxia). Helper items (for example ESRD) are not anchors."""
+    from ..labels.anchors import load_anchor_config
+    from ..labels.concepts import ConceptMap
+    cm = ConceptMap()
+    anchors = set(load_anchor_config()["items"])
+    return tuple(sorted(it for it, d in cm.event_items.items() if d.get("condition_codes") and it in anchors))
+
+
+def label_dx_events(tables: dict, pids: set[int]) -> pd.DataFrame:
+    """ICD diagnosis codes of the primary label families (domain ``dxlab``), at ANY time up to what ``as_of`` admits.
+
+    Used only to define the undifferentiated subgroup (no such code recorded before t0): never a model input, exempt from the
+    current-encounter restriction. Coding time is unknown (often discharge), so the condition start is used, and the
+    conservative direction for the subgroup is taken: a date-only start is the START of its day and a code with no time at
+    all counts as recorded long ago, so an ambiguous code can only remove a patient from the subgroup."""
+    c = tables.get("omop_condition_occurrence")
+    if c is None or not len(c):
+        return empty_events()
+    from ..labels.concepts import ConceptMap
+    cm = ConceptMap()
+    items = set(label_dx_items())
+    c = _restrict(c, pids)
+    src = c["condition_source_value"].astype("string")
+    uniq = {u: tuple(i for i in cm.condition_source_hits(u) if i in items) for u in src.dropna().unique()}
+    hits = src.map(lambda u: uniq.get(u, ()) if isinstance(u, str) else ())
+    keep = hits.map(len).gt(0).to_numpy(bool)
+    if not keep.any():
+        return empty_events()
+    c, hits = c[keep], hits[keep]
+    t = schema.parse_datetimes(c["condition_start_datetime"]).astype("datetime64[us]")
+    unknown = t.isna()
+    t = t.fillna(UNKNOWN_TIME)
+    rows = [(i, it) for i, hs in zip(range(len(c)), hits) for it in hs]
+    ii = np.array([r[0] for r in rows])
+    return _frame(c["person_id"].astype("int64").to_numpy()[ii], "dxlab", np.array([r[1] for r in rows], dtype=object), 1.0, np.nan,
+                  t.to_numpy()[ii], t.to_numpy()[ii], pd.NaT, np.where(unknown.to_numpy()[ii], "unknown_time", "coded"), True,
+                  None, c["condition_source_value"].to_numpy(object)[ii])
+
+
 # ----------------------------------------------------------------------------------------------- imaging
 def imaging_events(tables: dict, pids: set[int], cfg: BaselineConfig) -> pd.DataFrame:
     im = tables.get("imaging")
@@ -268,12 +324,21 @@ def imaging_events(tables: dict, pids: set[int], cfg: BaselineConfig) -> pd.Data
 
 def build_events(tables: dict[str, pd.DataFrame], index: pd.DataFrame, cfg: BaselineConfig | None = None
                  ) -> tuple[pd.DataFrame, dict]:
-    """Long event frame for the indexed patients (ALL times, including after t0: the gate is ``as_of``)."""
+    """Long event frame for the indexed patients (ALL times after the encounter start, including after t0: the t0 gate is
+    ``as_of``). With ``cfg.encounter_scope == "current"`` (default, D-145) rows timed before the person's encounter start are
+    dropped here, so a prior encounter can never reach a baseline; ``diag['n_events_prior_encounter_dropped']`` counts them.
+    ``index`` must carry ``encounter_start`` (``build_index`` and ``add_encounter_start`` add it)."""
     cfg = cfg or BaselineConfig()
     pids = {int(p) for p in index["person_id"]}
     diag: dict = {}
     parts = [drug_events(tables, pids, cfg), measurement_events(tables, pids, cfg, diag),
-             history_events(tables, pids), imaging_events(tables, pids, cfg)]
+             history_events(tables, pids), label_dx_events(tables, pids), imaging_events(tables, pids, cfg)]
     parts = [p for p in parts if len(p)]
     ev = pd.concat(parts, ignore_index=True) if parts else empty_events()
+    diag["n_events_prior_encounter_dropped"] = 0
+    if cfg.encounter_scope == "current":
+        if "encounter_start" not in index:
+            raise ValueError("encounter_scope='current' needs index['encounter_start'] (see add_encounter_start)")
+        ev, diag["n_events_prior_encounter_dropped"] = restrict_to_current_encounter(
+            ev, index.set_index("person_id")["encounter_start"])
     return ev, diag

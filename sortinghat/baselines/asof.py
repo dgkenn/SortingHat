@@ -12,6 +12,11 @@ in the package that compares an event with t0. It
 
 Feature extractors accept only the frame returned here and re-verify the invariant with ``assert_masked``.
 Static fields (age, sex, referral indication) are not events and are read from the index table.
+
+One bounded exception (D-145), ``as_of_presentation``: Baseline P reads the GCS / FOUR / RASS nearest to t0 in
+[t0 - 6 h, t0 + ``after_h``] (default 1 h), the cohort's own strict-severity window (D-105). It is a second call of the same
+gate with t0 shifted by ``after_h``, restricted to the ``score`` domain; every other domain, and every other baseline, stays
+masked at t0. Set ``presentation_score_after_h = 0`` for a strictly t0-masked P.
 """
 
 from __future__ import annotations
@@ -80,4 +85,42 @@ def assert_masked(masked: pd.DataFrame) -> pd.DataFrame:
         raise AssertionError("event available after t0 reached a feature extractor")
     if (masked["t_end"].notna() & (masked["t_end"] > masked["t0"])).any():
         raise AssertionError("interval end after t0 reached a feature extractor")
+    return masked
+
+
+PRESENTATION_DOMAINS = ("score",)
+
+
+def as_of_presentation(events: pd.DataFrame, t0: "pd.Series | Mapping | pd.Timestamp", after_h: float) -> pd.DataFrame:
+    """The ``score``-domain events a presentation exam may use: available by ``t0 + after_h`` (see module docstring).
+
+    Same contract as ``as_of`` with the gate moved to ``t0 + after_h``, then ``t0`` is restored to the true index time so
+    ``hours_since_event`` is negative for a score charted after the EEG start. Only ``PRESENTATION_DOMAINS`` rows pass."""
+    ev = events[events["domain"].isin(PRESENTATION_DOMAINS)]
+    shift = pd.Timedelta(hours=float(after_h))
+    shifted = (t0 + shift) if isinstance(t0, pd.Timestamp) else (pd.Series(t0) + shift)
+    out = as_of(ev, shifted)
+    out.attrs["as_of_presentation_after_h"] = float(after_h)
+    if out.empty:
+        return out
+    out["t0"] = (out["t0"] - shift).astype("datetime64[us]")
+    out["hours_since_event"] = (out["t0"] - out["t_event"]).dt.total_seconds() / 3600.0
+    out["hours_since_avail"] = (out["t0"] - out["t_avail"]).dt.total_seconds() / 3600.0
+    out.attrs["as_of"] = False
+    out.attrs["as_of_presentation_after_h"] = float(after_h)
+    return out
+
+
+def assert_presentation_masked(masked: pd.DataFrame, after_h: float) -> pd.DataFrame:
+    """Raise unless ``masked`` came out of ``as_of_presentation`` and respects its bounds."""
+    if masked.attrs.get("as_of_presentation_after_h") is None and not masked.empty:
+        raise ValueError("presentation extractors accept only the output of as_of_presentation")
+    if masked.empty:
+        return masked
+    if "t_end_raw" in masked.columns:
+        raise ValueError("uncensored interval end present")
+    if not masked["domain"].isin(PRESENTATION_DOMAINS).all():
+        raise AssertionError("a non-score event reached the presentation extractor")
+    if (masked["t_avail"] > masked["t0"] + pd.Timedelta(hours=float(after_h))).any():
+        raise AssertionError("event available after t0 + after_h reached the presentation extractor")
     return masked

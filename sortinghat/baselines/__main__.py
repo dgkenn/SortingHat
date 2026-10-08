@@ -25,18 +25,27 @@ def main(argv: list[str] | None = None) -> int:
     ap.add_argument("--drug-time-basis", default="auto", choices=["auto", "order", "admin"])
     ap.add_argument("--lab-time-basis", default="auto", choices=["auto", "collect_plus_lag", "result"])
     ap.add_argument("--imaging-time-basis", default="auto", choices=["auto", "study_plus_lag", "result"])
+    ap.add_argument("--with-history", action="store_true",
+                    help="sensitivity variant 'with history' (D-145): prior-encounter events are allowed; the default uses the "
+                         "current encounter only")
     a = ap.parse_args(argv)
     agent_safety.assert_not_restricted_in_agent(a.data)
     cfg = BaselineConfig(drug_time_basis=a.drug_time_basis, lab_time_basis=a.lab_time_basis,
-                         imaging_time_basis=a.imaging_time_basis)
+                         imaging_time_basis=a.imaging_time_basis,
+                         encounter_scope="with_history" if a.with_history else "current")
     fs = build_feature_set(load_tables(a.data), cfg)
     out = Path(a.out)
     safe_write_text(out / "feature_provenance.csv", fs.provenance.to_csv(index=False))
     write_local_only(out / "local_only" / "features.csv", fs.X.reset_index().to_csv(index=False))
+    safe_write_text(out / "feature_provenance_extra.csv", fs.provenance_extra.to_csv(index=False))   # Baseline P + meta columns
+    write_local_only(out / "local_only" / "features_extra.csv", fs.X_extra.reset_index().to_csv(index=False))
     n = len(fs.X)
     safe_print(f"Baseline feature matrix built (aggregate-only; n<11 suppressed): patients={suppress_count(n)}")
     for b in BASELINES:
         safe_print(f"  Baseline {b}: {len(fs.columns(b))} columns")
+    safe_print(f"  Baseline P (Presentation): {len(fs.columns('P'))} columns; encounter scope: "
+               f"{'with history (sensitivity variant)' if a.with_history else 'current encounter only'}; "
+               f"prior-encounter events dropped={suppress_count(fs.diagnostics.get('n_events_prior_encounter_dropped', 0))}")
     for g, feats in fs.provenance[fs.provenance["role"] == "missing_indicator"].groupby("group")["feature"]:
         rate = fs.X[feats.tolist()].to_numpy(float).mean()      # pooled over patients and variables
         safe_print(f"  mean missing-indicator rate, {g}: {round(float(rate), 3) if n >= 11 else "<11"}")

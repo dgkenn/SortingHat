@@ -240,7 +240,7 @@ def build_cohort(src, cfg: CohortConfig | None = None) -> CohortResult:
     run.stage.loc[S["_sess_idx"].to_numpy()] = 10**6
 
     cols = ["SiteID", "person_id", "person_id_source", "SessionID", "BidsFolder", "EEGFolder", "t0", "age_years", "ServiceName",
-            "bids_filled", "visit_class", "visit_match", "visit_inpatient_length", "acute_basis", "duration_s", "duration_basis", "onset", "onset_basis",
+            "bids_filled", "visit_class", "visit_match", "visit_inpatient_length", "acute_basis", "encounter_start", "duration_s", "duration_basis", "onset", "onset_basis",
             "hours_since_onset", *[f"onset_le_{h:g}h" for h in cfg.onset_windows_h], "gcs_min_window",
             "four_min_window", "gcs_nearest_window", "four_nearest_window", "n_score_obs_window", "severity_strict",
             "severity_strict_pm6", "phenotype", "in_strict", "in_strict_pm6", "in_broad",

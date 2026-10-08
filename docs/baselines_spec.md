@@ -91,6 +91,27 @@ One-hot of `ReferralIndication` mapped to rule_out_ncse, post_arrest, unexplaine
 `lexicon.indication_category`; **[ASSUMED]** column and category wording, verify against the real field). Nothing else from the EEG
 order or report enters D.
 
+### 2.5 Baseline P "Presentation" and the current-encounter default (D-145)
+
+Not nested in A to D. Age and sex (A's demographic columns); `pres_score__{gcs,four,rass}__{value,miss}` = the value charted nearest to
+t0 in [t0 - 6 h, t0 + 1 h], the earlier chart on a tie (the cohort's strict-severity rule); `pres_first__{vital}__{value,miss}` and
+`pres_first__poc_glucose__*` = the earliest value charted in the current encounter, available by t0. No diagnosis codes, no history,
+no labs. Its non-demographic columns and the two `meta__` columns live in `FeatureSet.X_extra` / `provenance_extra`
+(`columns("P")`, `columns("meta")`, `all_x()`), so the A to D matrix and its nesting are unchanged.
+
+* **The one exception to the t0 mask:** the +1 h of P's score window is a second call of the same gate, `asof.as_of_presentation`,
+  restricted to the `score` domain and `t_avail <= t0 + presentation_score_after_h`; `assert_presentation_masked` re-checks it. Every
+  other domain and every other baseline stays masked at t0 (tests inject post-t0 events at 1 microsecond to 24 h; only a score
+  charted within the hour reaches P, only its three score blocks move). `presentation_score_after_h = 0` restores strict masking.
+* **Current encounter:** `BaselineConfig.encounter_scope = "current"` (default) drops event rows timed before the encounter start when
+  the event frame is built (`encounter.restrict_to_current_encounter`; a row with no event time is dropped), so `as_of` keeps its
+  contract. Encounter start = the cohort's covering-visit rule (`cohort.rules.match_visits`), else `t0 - encounter_fallback_days` (3).
+  `"with_history"` keeps prior-encounter rows (a labelled sensitivity variant); P's *first* vitals and glucose stay current-encounter
+  by definition. A test proves A, B, C and P are identical with and without any prior-encounter event.
+* **meta columns (never model inputs):** `meta__hours_since_encounter_start`, and `meta__label_dx_before_t0` = an ICD code of the
+  primary label families (`events.label_dx_items`) recorded at or before t0 in ANY encounter (domain `dxlab`, exempt from the encounter
+  restriction; unknown-time codes count, date-only codes count from the start of the day). They define the undifferentiated subgroup.
+
 ## 3. Missing-data handling (SAP section 9, item 3)
 
 * Absence is information at t0: every variable that can be unobserved carries a `<name>__miss` indicator computed by the builder

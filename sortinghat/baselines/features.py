@@ -3,6 +3,11 @@
 One wide matrix (one row per patient, stable column names, raw NaN preserved) plus a provenance table that
 says which baseline each column belongs to. Baselines are nested column subsets: A subset B subset C subset D.
 
+Baseline P "Presentation" (D-145) is NOT nested: age, sex, the GCS / FOUR / RASS nearest to t0, and the FIRST vitals and
+point-of-care glucose of the current encounter. Its non-demographic columns, and the ``meta__`` columns that define the
+undifferentiated subgroup (never model inputs), live in ``FeatureSet.X_extra`` so the A-D matrix and its tests are unchanged.
+By default every baseline uses only the current encounter (``BaselineConfig.encounter_scope``).
+
     fs = build_feature_set(tables)                 # tables in the HEEDB layout (synthetic or real)
     XA = fs.matrix("A")                            # raw, NaN where unobserved (+ explicit __miss columns)
     imp = MedianImputer().fit(fs.matrix("C").loc[train_ids]); Xc = imp.transform(fs.matrix("C"))
@@ -18,11 +23,13 @@ import numpy as np
 import pandas as pd
 
 from . import lexicon as lx
-from .asof import as_of, assert_masked
+from .asof import as_of, as_of_presentation, assert_masked, assert_presentation_masked
 from .config import BaselineConfig
-from .events import build_events, build_index
+from .events import add_encounter_start, build_events, build_index
 
-BASELINES = ("A", "B", "C", "D")
+BASELINES = ("A", "B", "C", "D")                 # nested
+EXTRA_SETS = ("P", "meta")                       # P: Presentation (not nested); meta: subgroup definition, never a model input
+PRESENTATION_SCORE_KEYS = ("gcs", "four", "rass")
 PROVENANCE_COLUMNS = ["feature", "baseline", "group", "role", "source_table", "source_field", "time_basis",
                       "window", "imputation", "approximate_time_possible", "description"]
 
@@ -149,6 +156,35 @@ def build_registry(cfg: BaselineConfig) -> pd.DataFrame:
     for lev in lx.INDICATION_LEVELS:
         r.add(f"ind__{lev}", "D", "indication", "flag", "eeg_metadata", "ReferralIndication", "static (pre-EEG order)",
               "index EEG", "none (explicit 'missing' level)", f"EEG referral indication category = {lev}")
+    return r.frame()
+
+
+def build_registry_extra(cfg: BaselineConfig) -> pd.DataFrame:
+    """Provenance of the Baseline P specific columns and of the ``meta`` columns (see module docstring)."""
+    r = _Registry()
+    tbl, fld = "omop_measurement", "measurement_source_value, value_as_number"
+    win = f"nearest to t0 in [t0-{cfg.score_window_h:g}h, t0+{cfg.presentation_score_after_h:g}h]"
+    for k in PRESENTATION_SCORE_KEYS:
+        r.add(f"pres_score__{k}__value", "P", "pres_score", "value", tbl, fld, "charted", win, "median(train)",
+              f"{k.upper()}: value charted nearest to t0 (earlier on a tie); NaN if none in the window")
+        r.add(f"pres_score__{k}__miss", "P", "pres_score", "missing_indicator", tbl, fld, "charted", win, "none",
+              f"1 if no {k.upper()} in the window")
+    first = "first charted value of the current encounter, available by t0"
+    for k in lx.VITAL_KEYS:
+        r.add(f"pres_first__{k}__value", "P", "pres_first_vital", "value", tbl, fld, "charted", first, "median(train)",
+              f"{k.upper()}: first value charted in the current encounter (from the encounter start)")
+        r.add(f"pres_first__{k}__miss", "P", "pres_first_vital", "missing_indicator", tbl, fld, "charted", first, "none",
+              f"1 if no {k.upper()} charted in the current encounter before t0")
+    r.add("pres_first__poc_glucose__value", "P", "pres_first_glucose", "value", tbl, fld, "charted", first, "median(train)",
+          "POC glucose: first value charted in the current encounter")
+    r.add("pres_first__poc_glucose__miss", "P", "pres_first_glucose", "missing_indicator", tbl, fld, "charted", first, "none",
+          "1 if no POC glucose charted in the current encounter before t0")
+    r.add("meta__hours_since_encounter_start", "meta", "meta", "value", "cohort / omop_visit_occurrence", "visit start",
+          "static", "index EEG", "none", "hours from the encounter start to t0 (subgroup definition; not a model input)")
+    r.add("meta__label_dx_before_t0", "meta", "meta", "flag", "omop_condition_occurrence", "condition_source_value",
+          "coded", "any time <= t0", "none (0 = none recorded)",
+          "an ICD code of a primary-label family (acute structural dx, arrest, asphyxia) recorded at or before t0, ANY encounter; "
+          "unknown-time codes count (subgroup definition; not a model input)", True)
     return r.frame()
 
 
@@ -294,6 +330,47 @@ def _imaging(X, m):
     _put(X, "img__approx_time", im[im["approx"]].groupby("person_id").size().gt(0).astype(float))
 
 
+def _nearest_score(pres: pd.DataFrame, key: str, before_h: float, after_h: float) -> pd.Series:
+    """Per person, the value of ``key`` charted nearest to t0 in [t0-before_h, t0+after_h]; ties go to the earlier chart
+    (the cohort's strict-severity rule, ``cohort.rules.severity``)."""
+    h = pres["hours_since_event"]
+    s = pres[(pres["key"] == key) & pres["value"].notna() & (h <= before_h) & (h >= -after_h)]
+    if s.empty:
+        return pd.Series(dtype=float)
+    s = s.assign(_a=s["hours_since_event"].abs(), _post=(s["hours_since_event"] < 0).astype(int))
+    s = s.sort_values(["person_id", "_a", "_post", "t_event", "value"], kind="stable").drop_duplicates("person_id")
+    return s.set_index("person_id")["value"]
+
+
+def _first_value(df: pd.DataFrame, key: str, enc_start: pd.Series) -> pd.Series:
+    """Per person, the EARLIEST value of ``key`` at or after the encounter start (rows are already available by t0)."""
+    s = df[(df["key"] == key) & df["value"].notna()]
+    s = s[s["t_event"] >= s["person_id"].map(enc_start)]
+    if s.empty:
+        return pd.Series(dtype=float)
+    s = s.sort_values(["person_id", "t_event", "t_avail", "value"], kind="stable").drop_duplicates("person_id")
+    return s.set_index("person_id")["value"]
+
+
+def _presentation(E, m, pres, index, cfg):
+    """Baseline P columns (``E`` = X_extra). Scores come from the bounded presentation gate, first vitals / glucose from the
+    t0-masked frame, restricted to the current encounter even in the 'with_history' variant."""
+    for k in PRESENTATION_SCORE_KEYS:
+        _value_cols(E, "pres_score", k, _nearest_score(pres, k, cfg.score_window_h, cfg.presentation_score_after_h))
+    enc = index.set_index("person_id")["encounter_start"]
+    vi = m[m["domain"] == "vital"]
+    for k in lx.VITAL_KEYS:
+        _value_cols(E, "pres_first", k, _first_value(vi, k, enc))
+    pg = m[m["domain"] == "poc_glucose"]
+    _value_cols(E, "pres_first", "poc_glucose", _first_value(pg, "poc_glucose", enc))
+
+
+def _meta(E, m, index):
+    E["meta__hours_since_encounter_start"] = ((index["t0"] - index["encounter_start"]).dt.total_seconds() / 3600.0).to_numpy(float)
+    dx = m[m["domain"] == "dxlab"]
+    E.loc[E.index.intersection(dx["person_id"].unique()), "meta__label_dx_before_t0"] = 1.0
+
+
 def _static(X, index):
     X["demo__age_years"] = index["age_years"].to_numpy(float)
     X["demo__age_years__miss"] = index["age_years"].isna().to_numpy(float)
@@ -315,16 +392,35 @@ class FeatureSet:
     provenance: pd.DataFrame
     config: BaselineConfig
     diagnostics: dict = field(default_factory=dict)
+    X_extra: pd.DataFrame | None = None            # Baseline P specific columns and the meta columns (same row index as X)
+    provenance_extra: pd.DataFrame | None = None
 
     def columns(self, baseline: str) -> list[str]:
+        """Columns of a baseline. A-D are nested; "P" = age/sex (A's demographics) + the presentation columns;
+        "meta" = the subgroup-definition columns (never model inputs)."""
+        if baseline in EXTRA_SETS:
+            pe = self.provenance_extra
+            own = [] if pe is None else pe.loc[pe["baseline"] == baseline, "feature"].tolist()
+            if baseline == "meta":
+                return own
+            demo = self.provenance.loc[self.provenance["group"] == "demographics", "feature"].tolist()
+            return demo + own
         if baseline not in BASELINES:
-            raise ValueError(f"baseline must be one of {BASELINES}")
+            raise ValueError(f"baseline must be one of {BASELINES + EXTRA_SETS}")
         ok = BASELINES[:BASELINES.index(baseline) + 1]
         return self.provenance.loc[self.provenance["baseline"].isin(ok), "feature"].tolist()
 
+    def all_x(self) -> pd.DataFrame:
+        """A-D matrix plus the extra columns."""
+        return self.X if self.X_extra is None else pd.concat([self.X, self.X_extra], axis=1)
+
+    def all_provenance(self) -> pd.DataFrame:
+        return self.provenance if self.provenance_extra is None else pd.concat(
+            [self.provenance, self.provenance_extra], ignore_index=True)
+
     def matrix(self, baseline: str) -> pd.DataFrame:
         """Raw (un-imputed) feature matrix for a baseline (columns = A, then B, ... in provenance order)."""
-        return self.X[self.columns(baseline)]
+        return self.all_x()[self.columns(baseline)]
 
     def to_long(self, baseline: str = "D") -> pd.DataFrame:
         """Tidy long form: person_id, feature, value (plus the provenance baseline)."""
@@ -336,10 +432,16 @@ class FeatureSet:
 def build_feature_set(tables: dict[str, pd.DataFrame], cfg: BaselineConfig | None = None,
                       index: pd.DataFrame | None = None) -> FeatureSet:
     cfg = cfg or BaselineConfig()
-    index = build_index(tables) if index is None else index
+    index = build_index(tables, cfg) if index is None else index
+    if "encounter_start" not in index:
+        index = add_encounter_start(index, tables.get("omop_visit_occurrence"), cfg)
     prov = build_registry(cfg)
+    prov_x = build_registry_extra(cfg)
     events, diag = build_events(tables, index, cfg)
-    masked = assert_masked(as_of(events, index.set_index("person_id")["t0"]))     # THE t0 gate
+    t0_of = index.set_index("person_id")["t0"]
+    masked = assert_masked(as_of(events, t0_of))                                   # THE t0 gate
+    pres = assert_presentation_masked(as_of_presentation(events, t0_of, cfg.presentation_score_after_h),
+                                      cfg.presentation_score_after_h)               # P's bounded score window (D-145)
     X = pd.DataFrame(np.nan, index=pd.Index(index["person_id"].to_numpy(), name="person_id"), columns=prov["feature"])
     zero_cols = prov.loc[prov["role"].isin(ZERO_FILL_ROLES), "feature"]
     X[zero_cols] = 0.0
@@ -352,7 +454,12 @@ def build_feature_set(tables: dict[str, pd.DataFrame], cfg: BaselineConfig | Non
     _labs(X, masked, cfg, lab_keys)
     _imaging(X, masked)
     X = X[prov["feature"].tolist()].copy()          # defragment
+    E = pd.DataFrame(np.nan, index=X.index, columns=prov_x["feature"])
+    E[prov_x.loc[prov_x["role"].isin(ZERO_FILL_ROLES), "feature"]] = 0.0
+    _presentation(E, masked, pres, index, cfg)
+    _meta(E, masked, index)
+    E = E[prov_x["feature"].tolist()].copy()
     diag.update(n_patients=int(len(X)), n_events_total=int(len(events)), n_events_by_t0=int(len(masked)),
                 n_events_dropped_post_t0=int(len(events) - len(masked)))
     return FeatureSet(X=X, index=index[["person_id", "SiteID", "SessionID", "t0"]].reset_index(drop=True),
-                      provenance=prov, config=cfg, diagnostics=diag)
+                      provenance=prov, config=cfg, diagnostics=diag, X_extra=E, provenance_extra=prov_x)
