@@ -26,10 +26,16 @@ Outputs (aggregate-only, safe_output; n < 11 shown as "<11"):  <out>/report.md  
 Design
     labels      E1 E2 E4a E5 E6 primary; E7 primary only with >= 100 positives over >= 2 sites (else exploratory); E3 and E4b
                 excluded (D-002/D-003). A label with < 11 positives or negatives at any site is not analysed.
-    rungs       prior, qEEG, connectivity, qEEG+connectivity (the headline rung). MORGOTH / dynamics skipped. When --embeddings holds
+    rungs       prior, qEEG, connectivity, qEEG+connectivity (the headline rung). Dynamics skipped. When --embeddings holds
                 parquet parts from scripts/extract_embeddings.py, two more rungs are added: cbramod_frozen (frozen public CBraMod
                 embedding alone) and combined_cbramod (qEEG + connectivity + embedding); the headline rung is unchanged. No
-                embedding parts: both are skipped silently.
+                embedding parts: both are skipped silently. Likewise --morgoth (default <features>/../morgoth, parts from
+                scripts/extract_morgoth.py / extract_rungs.py) adds morgoth_findings (MORGOTH finding probabilities alone) and
+                combined_morgoth (qEEG + connectivity + MORGOTH). The report lists the rungs that ran and those skipped.
+    commercial-clean gap  only when cbramod_frozen AND morgoth_findings ran: Delta(cbramod_frozen + baseline) - Delta(morgoth_findings +
+                baseline), pooled and per site, paired patient-level bootstrap (same CI levels), plus a MORGOTH-exposure sensitivity
+                row (--morgoth-exposure, a local_only flag file from scripts/extract_morgoth.py exposure) that drops the flagged
+                patients from the scored rows. Reported after the headline Delta; the intended-use block stays first.
     comparators Baseline A (H1-style) and Baseline C (H2-style): Delta = masked log loss(baseline + EEG) - masked log loss(baseline).
     validation  (a) leave-one-site-out across the two sites, (b) late-calendar temporal holdout within site (D-120).
     labels used the SAME structured silver labels train, tune (20% development rows) and score. No gold exists.
@@ -58,13 +64,14 @@ import build_baselines as bb  # noqa: E402
 from sortinghat import agent_safety, checkpoint, data_io  # noqa: E402
 from sortinghat.labels.circularity_audit import run_circularity_audit  # noqa: E402
 from sortinghat.labels.extract import eeg_impression_comparator, load_reports_findings  # noqa: E402
-from sortinghat.metrics.bootstrap import bootstrap_ci  # noqa: E402
+from sortinghat.metrics.bootstrap import bootstrap_ci, paired_bootstrap_delta  # noqa: E402
 from sortinghat.metrics.calibration import per_label_report  # noqa: E402
 from sortinghat.metrics.hypotheses import h3_severity_stratified  # noqa: E402
 from sortinghat.metrics.labels import e7_eligible  # noqa: E402
 from sortinghat.metrics.splits import late_temporal_holdout  # noqa: E402
-from sortinghat.models import (CBRAMOD_FROZEN_RUNG, COMMERCIAL_RUNGS, DEFAULT_RUNGS, LadderConfig, ModelData,  # noqa: E402
-                               RungSpec, delta_concentration_by_site, leakage_probes, negative_control, run_ladder, sedative_excluded_rerun)
+from sortinghat.models import (CBRAMOD_FROZEN_RUNG, COMMERCIAL_RUNGS, DEFAULT_RUNGS, MORGOTH_FINDINGS_RUNG,  # noqa: E402
+                               LadderConfig, ModelData, RungSpec, delta_concentration_by_site, leakage_probes,
+                               load_morgoth_findings, negative_control, run_ladder, sedative_excluded_rerun)
 from sortinghat.models import ladder as ladder_mod  # noqa: E402
 from sortinghat.models.controls import control_failed  # noqa: E402
 from sortinghat.models.report import clean  # noqa: E402
@@ -78,7 +85,9 @@ EXCLUDED_BY_RULE = {"E3": "partly EEG-defined; the pipeline's positive control, 
 RUNG_NAMES = ("prior", "qeeg", "connectivity", "combined")
 EEG_PREFIXES = ("qeeg.", "conn.")
 CBRAMOD_PREFIX = "emb.cbramod."
-EXTRA_RUNG_NAMES = ("cbramod_frozen", "combined_cbramod")
+MORGOTH_PREFIX = "morgoth."
+EXTRA_RUNG_NAMES = ("cbramod_frozen", "combined_cbramod", "morgoth_findings", "combined_morgoth")
+GAP_RUNGS = ("cbramod_frozen", "morgoth_findings")           # the commercial-clean gap pair (Delta of the first minus the second)
 # "combined" here is qEEG + connectivity whatever else is loaded (DEFAULT_RUNGS' combined also lists emb./morgoth./dyn. columns)
 BASE_RUNGS = [RungSpec(r.name, EEG_PREFIXES) if r.name == "combined" else r for r in DEFAULT_RUNGS if r.name in RUNG_NAMES]
 QC_COLS = ("recording_id", "window", "qc_pass", "usable_fraction", "onset_offset_s", "qc_n_missing_or_dead_min")
@@ -258,6 +267,48 @@ def load_cbramod_primary(emb_dir, rec_ids: set[str]) -> tuple[pd.DataFrame, dict
     return df[[c for c in df.columns if str(c).startswith(CBRAMOD_PREFIX)]], st
 
 
+def load_morgoth_primary(mg_dir, rec_ids: set[str]) -> tuple[pd.DataFrame, dict]:
+    """Primary-window, QC-passing MORGOTH finding probabilities (``morgoth.*``, one row per recording, indexed by recording_id)
+    from the parquet parts written by ``scripts/extract_morgoth.py features`` (``inputs.load_morgoth_findings``). A missing /
+    empty directory returns an empty frame (the rung is then skipped); an existing directory outside local_only/ is refused.
+    Counts only."""
+    d = Path(mg_dir)
+    require_local_only(d, "--morgoth")
+    parts = sorted(d.glob("part-*.parquet")) if d.is_dir() else []
+    if not parts:
+        return pd.DataFrame(), {"n_parts": 0, "n_recordings": 0, "n_morgoth_ok": 0}
+    ids = sorted(rec_ids)
+    df = load_morgoth_findings(d, ids)
+    if df is None or not len(ids):
+        return pd.DataFrame(), {"n_parts": len(parts), "n_recordings": 0, "n_morgoth_ok": 0}
+    df.index = pd.Index(ids, name="recording_id")
+    df = df[df.notna().any(axis=1)]
+    return df, {"n_parts": len(parts), "n_recordings": int(len(df)), "n_morgoth_ok": int(len(df))}
+
+
+def load_morgoth_exposure(path) -> tuple[pd.Series, str] | None:
+    """Per-patient MORGOTH exposure flag (1.0 exposed / 0.0 not, indexed by person_id; RECORD-LEVEL, memory only) and the basis
+    used, from the local_only parquet written by ``sortinghat.morgoth.exposure.write_flags``: ``in_morgoth_train_split`` when the
+    lists carried a split column, else ``in_morgoth_lists`` (any list: training, validation or test; the conservative flag).
+    None when the file does not exist or holds neither column."""
+    p = Path(path)
+    require_local_only(p, "--morgoth-exposure")
+    if not p.is_file():
+        return None
+    df = pd.read_parquet(p)
+    if "person_id" not in df:
+        return None
+    for col, basis in (("in_morgoth_train_split", "MORGOTH training split"),
+                       ("in_morgoth_lists", "any MORGOTH data list (training / validation / test not separable)")):
+        if col in df and df[col].notna().any():
+            f = df[col].map(lambda v: np.nan if pd.isna(v) else float(bool(v)))
+            f.index = pd.to_numeric(df["person_id"], errors="coerce")
+            f = f[f.index.notna()]
+            f.index = f.index.astype("int64")
+            return f.groupby(level=0).max(), basis
+    return None
+
+
 # ============================================================================================== assembly
 @dataclass
 class Assembly:
@@ -281,6 +332,8 @@ class Assembly:
     subgroup_info: dict = field(default_factory=dict)    # aggregate, suppressed
     baseline_scope: str = UNKNOWN_SCOPE
     embedding_info: dict = field(default_factory=dict)   # aggregate, suppressed: frozen-CBraMod coverage (empty = rung skipped)
+    morgoth_info: dict = field(default_factory=dict)     # aggregate, suppressed: MORGOTH-findings coverage (empty = rung skipped)
+    morgoth_exposure: dict = field(default_factory=dict)  # {"flag": float (n,) 1/0/NaN (RECORD-LEVEL, memory only), "basis": str} or {}
 
 
 def gcs_equivalent(gcs: pd.Series, four: pd.Series) -> pd.Series:
@@ -367,6 +420,8 @@ def assemble(a) -> Assembly:
     feat_cols = [c for c in eeg.columns if str(c).startswith(EEG_PREFIXES)]
     emb, emb_stats = load_cbramod_primary(getattr(a, "embeddings", None) or Path(a.features).parent / "embeddings", set(cohort["rid"].dropna()))
     emb_cols = list(emb.columns)
+    mg, mg_stats = load_morgoth_primary(getattr(a, "morgoth", None) or Path(a.features).parent / "morgoth", set(cohort["rid"].dropna()))
+    mg_cols = list(mg.columns)
 
     sites_s = cohort["SiteID"]
     has_bl = cohort["person_id"].isin(bl["person_id"]).to_numpy(bool)
@@ -385,6 +440,7 @@ def assemble(a) -> Assembly:
     sel_eeg = eeg.reindex(sel["rid"])[[c for c in ("qc_n_missing_or_dead_min", "usable_fraction") if c in eeg] + feat_cols
                                       ].reset_index(drop=True) if len(eeg) else pd.DataFrame(index=range(len(sel)))
     sel_emb = emb.reindex(sel["rid"])[emb_cols].reset_index(drop=True) if emb_cols else pd.DataFrame(index=range(len(sel)))
+    sel_mg = mg.reindex(sel["rid"])[mg_cols].reset_index(drop=True) if mg_cols else pd.DataFrame(index=range(len(sel)))
     Ys = Y.reindex(sel["person_id"]).reset_index(drop=True)
     Hs = hints.reindex(sel["person_id"]).reset_index(drop=True) if len(hints.columns) else pd.DataFrame(index=range(len(sel)))
     ssites = sel["SiteID"].astype(str)
@@ -433,6 +489,7 @@ def assemble(a) -> Assembly:
     sel, sel_bl, sel_eeg, y, m = sel.iloc[idx].reset_index(drop=True), sel_bl.iloc[idx].reset_index(drop=True), \
         sel_eeg.iloc[idx].reset_index(drop=True), y[idx], m[idx]
     sel_emb = sel_emb.iloc[idx].reset_index(drop=True)
+    sel_mg = sel_mg.iloc[idx].reset_index(drop=True)
     Hs = Hs.iloc[idx].reset_index(drop=True) if len(Hs.columns) else pd.DataFrame(index=range(len(sel)))
     ssites = sel["SiteID"].astype(str)                       # re-derived: the row filter above must reach the site vector too
     flow = {"steps": [{"step": s, "n_total": suppress_count(int(msk.sum())),
@@ -472,6 +529,23 @@ def assemble(a) -> Assembly:
                               "share_analysed_with_embedding": suppress_proportion(int(has_emb.sum()), len(sel_emb)),
                               "per_site_with_embedding": {site_labels.get(s_, s_): suppress_count(int((has_emb & (ssites.to_numpy() == s_)).sum()))
                                                           for s_ in uniq}}
+    morgoth_info: dict = {}
+    morgoth_exposure: dict = {}
+    if mg_cols:
+        has_mg = sel_mg.notna().any(axis=1).to_numpy(bool)
+        if has_mg.sum() >= MIN_SITE_CELL:                # rows without MORGOTH output stay NaN (fold-local imputation + indicator)
+            eeg_df = pd.concat([eeg_df, sel_mg.astype(float)], axis=1)
+            morgoth_info = {"family": "morgoth_findings", "dim": len(mg_cols),
+                            "n_recordings_with_findings_in_cohort": suppress_count(mg_stats["n_morgoth_ok"]),
+                            "n_analysed_with_findings": suppress_count(int(has_mg.sum())),
+                            "share_analysed_with_findings": suppress_proportion(int(has_mg.sum()), len(sel_mg)),
+                            "per_site_with_findings": {site_labels.get(s_, s_): suppress_count(int((has_mg & (ssites.to_numpy() == s_)).sum()))
+                                                       for s_ in uniq}}
+            expo_path = getattr(a, "morgoth_exposure", None) or Path(getattr(a, "morgoth", None) or Path(a.features).parent / "morgoth") / "exposure.parquet"
+            ex = load_morgoth_exposure(expo_path)
+            if ex is not None:
+                flags, basis = ex
+                morgoth_exposure = {"flag": sel["person_id"].map(flags).to_numpy(float), "basis": basis}
     qmiss = pd.to_numeric(sel_eeg.get("qc_n_missing_or_dead_min"), errors="coerce") if "qc_n_missing_or_dead_min" in sel_eeg \
         else pd.Series(np.nan, index=sel.index)
     gcs_eq = gcs_equivalent(sel.get("gcs_nearest_window", pd.Series(np.nan, index=sel.index)),
@@ -483,7 +557,7 @@ def assemble(a) -> Assembly:
            "sedated": sedation_flag(sel_bl, Hs, a.sedation_source)}
     return Assembly(sel, baseline, eeg_df, y, m, names, primary, e7_primary, bsets, cov, ssites.to_numpy(object),
                     sel["t0"].to_numpy("datetime64[us]"), flow, label_report, site_labels, iu_sets, flag, subgroup_info,
-                    baseline_scope(a.baselines), embedding_info)
+                    baseline_scope(a.baselines), embedding_info, morgoth_info, morgoth_exposure)
 
 
 # ===================================================================================== model data per scheme
@@ -810,13 +884,80 @@ def run_intended_use(A: Assembly, a, cfg: LadderConfig, headline: str, splits: l
     return clean(out)
 
 
+# ============================================================================ commercial-clean gap
+GAP_NOTE = ("Gap = Delta(cbramod_frozen + baseline) - Delta(morgoth_findings + baseline) on the same evaluation rows (per-patient "
+            "differences d_i, paired patient-level bootstrap within site). Positive = the frozen public CBraMod embedding helps LESS "
+            "than the MORGOTH findings. Reported, not tested. MORGOTH is the commercial-clean-lineage comparator; CBraMod is public "
+            "research weights.")
+EXPOSURE_NOTE = ("MORGOTH exposure accounting: patients whose EEG is in MORGOTH's own data lists (sortinghat.morgoth.exposure) may have "
+                 "been seen by the model that produced the findings, which could flatter the MORGOTH rung. The sensitivity row drops "
+                 "the flagged patients from the SCORED rows (models are not refitted) and re-estimates both Deltas and the gap.")
+
+
+def _gap_stats(da: np.ndarray, db: np.ndarray, sites: np.ndarray, n_boot: int, seed: int, alpha99: float, alpha95: float) -> dict:
+    """Mean d_a, mean d_b and mean (d_a - d_b) over the rows where both are defined, with the paired within-site bootstrap interval
+    of the gap at both levels. Fewer than MIN_SITE_CELL rows: every number is suppressed."""
+    ok = ~(np.isnan(da) | np.isnan(db))
+    n = int(ok.sum())
+    out = {"n": suppress_count(n)}
+    if n < MIN_SITE_CELL:
+        return {**out, "delta_a": SUPPRESSED, "delta_b": SUPPRESSED, "gap": SUPPRESSED, "ci_99_within_site": SUPPRESSED,
+                "ci_95_within_site": SUPPRESSED}
+    da, db, sites = da[ok], db[ok], np.asarray(sites)[ok]
+    diff = da - db
+    out.update(delta_a=float(da.mean()), delta_b=float(db.mean()), gap=float(diff.mean()))
+    for key, al in (("ci_99_within_site", alpha99), ("ci_95_within_site", alpha95)):
+        try:
+            ci = paired_bootstrap_delta(diff, sites, "within_site", n_boot, seed, al)
+            out[key] = {"lo": float(ci.lo), "hi": float(ci.hi)}
+        except ValueError:
+            out[key] = None
+    return out
+
+
+def _gap_by_site(da, db, sites, site_labels, n_boot, seed, alpha99, alpha95) -> dict:
+    return {site_labels.get(str(s_), str(s_)): _gap_stats(da[sites == s_], db[sites == s_], sites[sites == s_], n_boot, seed, alpha99, alpha95)
+            for s_ in sorted(np.unique(sites))}
+
+
+def commercial_gap_block(res, A: Assembly, cfg: LadderConfig, baseline: str) -> dict:
+    """Commercial-clean gap for one scheme x baseline set; ``{"available": False}`` unless both rungs were fitted."""
+    ra, rb = res.get(GAP_RUNGS[0], baseline), res.get(GAP_RUNGS[1], baseline)
+    if not (ra.available and rb.available):
+        return {"available": False}
+    da, db = np.asarray(ra.d, float), np.asarray(rb.d, float)
+    sites = np.asarray(res.eval_sites).astype(str)
+    args = (cfg.n_boot, cfg.seed, cfg.alpha_primary, cfg.alpha_secondary)
+    out = {"available": True, "pooled": _gap_stats(da, db, sites, *args),
+           "per_site": _gap_by_site(da, db, sites, res.site_labels, *args)}
+    ex = A.morgoth_exposure
+    if not ex:
+        out["exposure_sensitivity"] = {"not_run": "no MORGOTH exposure flag file found (--morgoth-exposure; written by "
+                                                  "scripts/extract_morgoth.py exposure)"}
+        return out
+    flag = np.asarray(ex["flag"], float)[np.asarray(res.eval_idx)]
+    excl = flag == 1.0
+    keep = ~excl
+    n_exc = int(excl.sum())
+    out["exposure_sensitivity"] = {
+        "basis": ex["basis"], "n_excluded": suppress_count(n_exc),
+        "n_without_flag_kept": suppress_count(int(np.isnan(flag).sum())),
+        "n_kept": suppress_count(int(keep.sum())) if n_exc >= MIN_SITE_CELL else SUPPRESSED,   # no complement of a small excluded cell
+        "pooled": _gap_stats(da[keep], db[keep], sites[keep], *args),
+        "per_site": _gap_by_site(da[keep], db[keep], sites[keep], res.site_labels, *args)}
+    return out
+
+
 # ==================================================================================================== driver
 def run_analysis(A: Assembly, a, store=None) -> dict:
     cfg = LadderConfig(n_boot=a.n_boot, seed=a.seed, include_e7=A.include_e7, temporal_test_fraction=a.temporal_fraction)
     rungs = list(BASE_RUNGS)
     has_emb = any(str(c).startswith(CBRAMOD_PREFIX) for c in A.eeg.columns)
+    has_mg = any(str(c).startswith(MORGOTH_PREFIX) for c in A.eeg.columns)
     if has_emb:
         rungs += [CBRAMOD_FROZEN_RUNG, next(r for r in COMMERCIAL_RUNGS if r.name == "combined_cbramod")]
+    if has_mg:
+        rungs += [MORGOTH_FINDINGS_RUNG, next(r for r in COMMERCIAL_RUNGS if r.name == "combined_morgoth")]
     n_sites = len(np.unique(A.sites))
     splits = [s for s in a.splits if (s == "temporal" or n_sites >= 2)]
     avail_rungs = [r for r in RUNG_NAMES if r != "prior" and any(c.startswith(p) for c in A.eeg.columns
@@ -826,7 +967,7 @@ def run_analysis(A: Assembly, a, store=None) -> dict:
     if headline is None:
         raise SystemExit("no qeeg./conn. feature columns found")
     R: dict = {"banner": BANNER, "headline_rung": headline, "intended_use": None, "ladder": {}, "discrimination_calibration": {},
-               "controls": {}, "circularity_audit": None}
+               "commercial_clean_gap": {"available": False}, "controls": {}, "circularity_audit": None}
     R["intended_use"] = run_intended_use(A, a, cfg, headline, splits)             # D-145: reported FIRST
     taps: dict = {}
     mds: dict = {}
@@ -840,6 +981,12 @@ def run_analysis(A: Assembly, a, store=None) -> dict:
         R["discrimination_calibration"][split] = {
             b: discrimination_calibration(md, res, tap, b, headline, res.site_labels, min(a.n_boot, a.auc_boot), a.seed)
             for b in A.baseline_sets}
+    if has_emb and has_mg:
+        R["commercial_clean_gap"] = {"available": True, "rungs": list(GAP_RUNGS), "note": GAP_NOTE, "exposure_note": EXPOSURE_NOTE,
+                                     "by_scheme": {sp: {b: commercial_gap_block(results[sp], A, cfg, b) for b in A.baseline_sets}
+                                                   for sp in splits}}
+    else:
+        R["commercial_clean_gap"] = {"available": False, "reason": "needs both cbramod_frozen and morgoth_findings to have run"}
     R["anchor_overlap_suspected"] = {
         sp: {b: [lab for lab, v in R["discrimination_calibration"][sp][b]["auroc"]["baseline_only"].items()
                  if isinstance(v["pooled"], float) and v["pooled"] >= ANCHOR_OVERLAP_AUROC] for b in A.baseline_sets}
@@ -856,6 +1003,11 @@ def run_analysis(A: Assembly, a, store=None) -> dict:
         emb_cols = [c for c in A.eeg.columns if str(c).startswith(CBRAMOD_PREFIX)]
         R["controls"]["leakage_probes_cbramod_frozen"] = clean(leakage_probes(
             first.eeg[emb_cols], first.sites, A.covariates["duration_s"] if np.isfinite(A.covariates["duration_s"]).any() else None,
+            A.covariates["n_channels"] if np.isfinite(A.covariates["n_channels"]).any() else None, seed=a.seed))
+    if has_mg:
+        mg_cols = [c for c in A.eeg.columns if str(c).startswith(MORGOTH_PREFIX)]
+        R["controls"]["leakage_probes_morgoth_findings"] = clean(leakage_probes(
+            first.eeg[mg_cols], first.sites, A.covariates["duration_s"] if np.isfinite(A.covariates["duration_s"]).any() else None,
             A.covariates["n_channels"] if np.isfinite(A.covariates["n_channels"]).any() else None, seed=a.seed))
     R["controls"]["by_scheme"] = {}
     n_small = max(200, min(a.n_boot, 1000))
@@ -892,13 +1044,23 @@ def report_json(A: Assembly, a, R: dict) -> dict:
                                   "are degenerate or extremely wide with two sites)",
                      "rungs": ["prior", "qeeg", "connectivity", "combined (= qeeg + connectivity, the headline rung)"]
                               + (["cbramod_frozen (frozen public CBraMod embedding alone)", "combined_cbramod (= qeeg + connectivity + embedding)"]
-                                 if A.embedding_info else []),
-                     "skipped_rungs": ["morgoth", "dynamics"] + ([] if A.embedding_info else ["embeddings (CBraMod)"])},
+                                 if A.embedding_info else [])
+                              + (["morgoth_findings (MORGOTH finding probabilities alone)", "combined_morgoth (= qeeg + connectivity + MORGOTH)"]
+                                 if A.morgoth_info else []),
+                     "rungs_ran": ["prior", "qeeg", "connectivity", "combined"]
+                                  + (list(EXTRA_RUNG_NAMES[:2]) if A.embedding_info else []) + (list(EXTRA_RUNG_NAMES[2:]) if A.morgoth_info else []),
+                     "rungs_skipped": (["dynamics"] + ([] if A.embedding_info else list(EXTRA_RUNG_NAMES[:2]))
+                                       + ([] if A.morgoth_info else list(EXTRA_RUNG_NAMES[2:]))),
+                     "skipped_rungs": ["dynamics"] + ([] if A.morgoth_info else ["morgoth"])
+                                      + ([] if A.embedding_info else ["embeddings (CBraMod)"]),
+                     "morgoth_exposure_flags": (A.morgoth_exposure["basis"] if A.morgoth_exposure else "none (no flag file)")},
         "data_flow": A.flow, "labels": {"analysed": list(A.label_names), "primary_for_delta": list(A.primary),
                                          "e7_primary": A.include_e7, "detail": A.label_report},
         "n_analysed": suppress_count(len(A.frame)),
         "n_eeg_features": sum(str(c).startswith(EEG_PREFIXES) for c in A.eeg.columns),
-        "frozen_cbramod": A.embedding_info or {"skipped": "no embedding parquet parts found (scripts/extract_embeddings.py)"}, "n_baseline_columns": {b: len(c) for b, c in A.baseline_sets.items()},
+        "frozen_cbramod": A.embedding_info or {"skipped": "no embedding parquet parts found (scripts/extract_embeddings.py)"},
+        "morgoth_findings": A.morgoth_info or {"skipped": "no MORGOTH findings parquet parts found (scripts/extract_morgoth.py)"},
+        "n_baseline_columns": {b: len(c) for b, c in A.baseline_sets.items()},
         **{k: v for k, v in R.items() if k not in ("banner", "intended_use")}, "limitations": list(LIMITATIONS)})
 
 
@@ -920,6 +1082,8 @@ def _controls_markdown(c: dict) -> list[str]:
         L.append(f"| {nm} | {_f(p['auroc'])} | {p['flagged']} |")
     for nm, p in c.get("leakage_probes_cbramod_frozen", {}).get("probes", {}).items():
         L.append(f"| {nm} (frozen CBraMod embedding alone) | {_f(p['auroc'])} | {p['flagged']} |")
+    for nm, p in c.get("leakage_probes_morgoth_findings", {}).get("probes", {}).items():
+        L.append(f"| {nm} (MORGOTH findings alone) | {_f(p['auroc'])} | {p['flagged']} |")
     L += ["", "### Site concentration, sedative-excluded subset, negative controls", "",
           "| Scheme | Baseline | top-site share of gain | carried by one site | site probe control failed | sedative-excluded Delta | 99% CI | every site < 0 | n excluded | shuffled-label mean Delta | reps with spurious gain | permuted-EEG Delta |", "|---|---|---|---|---|---|---|---|---|---|---|---|"]
     for split, per in c["by_scheme"].items():
@@ -994,6 +1158,40 @@ def _iu_markdown(iu: dict) -> list[str]:
     return L
 
 
+def _gap_markdown(g: dict | None) -> list[str]:
+    """"Commercial-clean gap" section; empty unless both cbramod_frozen and morgoth_findings ran."""
+    if not g or not g.get("available"):
+        return []
+    L = ["", "## Commercial-clean gap: CBraMod (frozen) vs MORGOTH findings", "", g["note"], "",
+         "| Scheme | Baseline | Row | n | Delta CBraMod | Delta MORGOTH | gap | 99% CI | 95% CI |", "|---|---|---|---|---|---|---|---|---|"]
+
+    def row(sp, b, label, r):
+        c99, c95 = r.get("ci_99_within_site"), r.get("ci_95_within_site")
+        fmt = lambda c: c if isinstance(c, str) or c is None else f"[{_f(c.get('lo'))}, {_f(c.get('hi'))}]"  # noqa: E731
+        return (f"| {sp} | {b} | {label} | {r.get('n', '')} | {_f(r.get('delta_a'))} | {_f(r.get('delta_b'))} | {_f(r.get('gap'))} | "
+                f"{'n/a' if c99 is None else fmt(c99)} | {'n/a' if c95 is None else fmt(c95)} |")
+    for sp, per in g["by_scheme"].items():
+        for b, blk in per.items():
+            if not blk.get("available"):
+                continue
+            L.append(row(sp, b, "all sites", blk["pooled"]))
+            L += [row(sp, b, s_, v) for s_, v in blk["per_site"].items()]
+            ex = blk["exposure_sensitivity"]
+            if "not_run" in ex:
+                continue
+            L.append(row(sp, b, "excluding MORGOTH-exposed patients", ex["pooled"]))
+            L += [row(sp, b, f"{s_} excluding exposed", v) for s_, v in ex["per_site"].items()]
+    L += ["", g["exposure_note"], ""]
+    for sp, per in g["by_scheme"].items():
+        for b, blk in per.items():
+            if not blk.get("available"):
+                continue
+            ex = blk["exposure_sensitivity"]
+            L.append(f"- {sp}/{b}: " + (ex["not_run"] if "not_run" in ex else
+                     f"flag basis: {ex['basis']}; excluded {ex['n_excluded']}, kept {ex['n_kept']}, kept without a flag {ex['n_without_flag_kept']}."))
+    return L
+
+
 def render_markdown(J: dict) -> str:
     L = [f"# {J['banner']}", "",
          "Models trained, tuned and scored on structured, EEG-blind silver labels (D-143). Pre-Gate-0. Nothing below tests H1-H6.",
@@ -1014,6 +1212,13 @@ def render_markdown(J: dict) -> str:
         L += [f"Frozen CBraMod embedding rung: {fc['dim']} dimensions; analysed patients with an embedding {fc['n_analysed_with_embedding']} "
               f"({fc['share_analysed_with_embedding']}); rows without one are imputed fold-locally with a missingness indicator. "
               "Rungs `cbramod_frozen` and `combined_cbramod` are added to the Delta table; the headline rung is unchanged.", ""]
+    mf = J.get("morgoth_findings", {})
+    if "dim" in mf:
+        L += [f"MORGOTH findings rung: {mf['dim']} features; analysed patients with MORGOTH output {mf['n_analysed_with_findings']} "
+              f"({mf['share_analysed_with_findings']}); rows without one are imputed fold-locally with a missingness indicator. "
+              "Rungs `morgoth_findings` and `combined_morgoth` are added to the Delta table; the headline rung is unchanged.", ""]
+    s_ = J["settings"]
+    L += [f"Rungs that ran: {', '.join(s_['rungs_ran'])}. Skipped: {', '.join(s_['rungs_skipped']) or 'none'}.", ""]
     L += ["## Labels", "",
           f"Analysed: {', '.join(J['labels']['analysed'])}. Primary for Delta: {', '.join(J['labels']['primary_for_delta'])}.", "",
           "| Label | n assessable | n positive | prevalence | per-site positives | note |", "|---|---|---|---|---|---|"]
@@ -1044,6 +1249,7 @@ def render_markdown(J: dict) -> str:
                 row = [f"[{_f(r['ci_95'][m].get('lo'))}, {_f(r['ci_95'][m].get('hi'))}]" if m in r["ci_95"] else "n/a"
                        for m in ("within_site", "cluster", "two_stage", "site_t")]
                 L.append(f"| {split} | {b} | " + " | ".join(row) + " |")
+    L += _gap_markdown(J.get("commercial_clean_gap"))
     L += ["", "## Per-label Delta (headline rung, 95% within-site CI)", "", "| Scheme | Baseline | Label | n | Delta | 95% CI | AUROC baseline | AUROC +EEG | Delta AUROC [95% CI] |", "|---|---|---|---|---|---|---|---|---|"]
     for split, lad in J["ladder"].items():
         for b, rungs in lad["rungs"].items():
@@ -1096,6 +1302,13 @@ def build_parser() -> argparse.ArgumentParser:
     ap.add_argument("--embeddings", default=None,
                     help="frozen-CBraMod parquet parts from scripts/extract_embeddings.py (default: <features dir>/../embeddings); "
                          "adds the cbramod_frozen and combined_cbramod rungs when present, skipped silently otherwise")
+    ap.add_argument("--morgoth", default=None,
+                    help="MORGOTH findings parquet parts from scripts/extract_morgoth.py / extract_rungs.py (default: <features dir>/../morgoth); "
+                         "adds the morgoth_findings and combined_morgoth rungs (and the commercial-clean gap section when --embeddings "
+                         "also ran) when parts are present, skipped silently otherwise")
+    ap.add_argument("--morgoth-exposure", default=None,
+                    help="local_only exposure-flag parquet from `scripts/extract_morgoth.py exposure` (default: <morgoth dir>/exposure.parquet); "
+                         "if present, the gap section adds a sensitivity row excluding the flagged patients (aggregate only)")
     ap.add_argument("--recording-map", help="optional CSV (person_id, recording_id) if the extractor input carried explicit ids")
     ap.add_argument("--out", default="out/silver_feasibility")
     ap.add_argument("--cohort-def", choices=sorted(bb.COHORT_DEFS), default="strict")
