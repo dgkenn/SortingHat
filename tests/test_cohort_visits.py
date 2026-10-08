@@ -88,8 +88,9 @@ def test_cohort_uses_the_robust_rules_end_to_end():
     w.eeg(1); w.score(1, GCS, T0 - H(1), 8)
     w.visit(1, "Inpatient", T0 - H(100), end=T0 + H(100)); w.visit(1, "Outpatient", T0 - H(2), end=T0 - H(1))
     w.eeg(2); w.score(2, GCS, T0 - H(1), 8); w.visit(2, "ICU", T0 + H(3), end=T0 + H(50))   # EEG precedes the visit
-    assert build_cohort(FrameSources(w.tables())).table["person_id"].tolist() == [1]
-    r = build_cohort(FrameSources(w.tables()), CohortConfig(visit_slack_h=6.0))
+    exact = dict(study_sites=None, visit_dates_only=False, visit_slack_h=0.0)
+    assert build_cohort(FrameSources(w.tables()), CohortConfig(**exact)).table["person_id"].tolist() == [1]
+    r = build_cohort(FrameSources(w.tables()), CohortConfig(**{**exact, "visit_slack_h": 6.0}))
     t = r.table.set_index("person_id")
     assert sorted(t.index) == [1, 2] and t.loc[1, "visit_match"] == "exact" and t.loc[2, "visit_match"] == "slack"
 
@@ -124,3 +125,46 @@ def test_cli_debug_flow(synth_dir, tmp_path):
     assert "DEBUG FLOW" in p.stdout and "No visit covering the EEG start | excluded" in p.stdout
     assert (tmp_path / "cohort" / "flow_debug.md").read_text().startswith("# Study 1 cohort flow")
     assert (tmp_path / "cohort" / "flow.md").exists()
+
+
+# ------------------------------------------------------------- D-112: date-only visits, +-24 h, latest start
+def dmatch(rows):
+    return rules.match_visits(sess(), vis(rows), ACUTE, 6.0, slack_h=24.0, dates_only=True).iloc[0]
+
+
+def day(n):
+    return T0.normalize() + pd.Timedelta(days=n)           # the EEG (12:00) is on day 0
+
+
+def test_date_only_cover_is_start_date_minus_24h_to_end_date_plus_24h():
+    assert dmatch([{"visit_start_datetime": day(-3), "visit_end_datetime": day(-1)}])["visit_match"] == "slack"   # ended yesterday
+    assert pd.isna(dmatch([{"visit_start_datetime": day(-5), "visit_end_datetime": day(-2)}])["visit_start"])   # 2 days ago: no
+    assert dmatch([{"visit_start_datetime": day(1), "visit_end_datetime": day(4)}])["visit_match"] == "slack"      # starts tomorrow
+    assert pd.isna(dmatch([{"visit_start_datetime": day(2), "visit_end_datetime": day(4)}])["visit_start"])
+    r = dmatch([{"visit_start_datetime": day(-2) + H(15), "visit_end_datetime": day(0) + H(9)}])                # times are reduced to dates
+    assert r["visit_match"] == "exact" and r["visit_start"] == day(-2)
+    assert dmatch([{"visit_start_datetime": day(0), "visit_end_datetime": day(0)}])["visit_match"] == "exact"   # same-day visit
+
+
+def test_inpatient_length_is_end_date_after_start_date():
+    assert dmatch([{"visit_start_datetime": day(-1), "visit_end_datetime": day(1)}])["visit_inpatient_length"]
+    assert not dmatch([{"visit_start_datetime": day(0) + H(1), "visit_end_datetime": day(0) + H(20)}])["visit_inpatient_length"]
+    assert not dmatch([{"visit_start_datetime": day(-1), "visit_end_datetime": pd.NaT}])["visit_inpatient_length"]
+
+
+def test_ties_go_to_the_covering_visit_with_the_latest_start_on_or_before_the_eeg_date():
+    r = dmatch([{"visit_start_datetime": day(-9), "visit_end_datetime": day(3)},
+                {"visit_start_datetime": day(-4), "visit_end_datetime": day(2)},
+                {"visit_start_datetime": day(1), "visit_end_datetime": day(8)}])        # starts after the EEG date
+    assert r["visit_start"] == day(-4)
+    # an inpatient-length visit outranks a same-day visit that started later
+    r = dmatch([{"visit_start_datetime": day(-3), "visit_end_datetime": day(2)},
+                {"visit_start_datetime": day(0), "visit_end_datetime": day(0)}])
+    assert r["visit_start"] == day(-3) and r["visit_inpatient_length"]
+
+
+def test_cohort_default_uses_the_date_only_cover():
+    w = World()
+    w.eeg(1); w.score(1, GCS, T0 - H(1), 8)
+    w.visit(1, "ICU", day(-3), end=day(-1), concept=False)                       # date-only, ended yesterday: covered by +24 h
+    assert build_cohort(FrameSources(w.tables()), CohortConfig(study_sites=None)).table["person_id"].tolist() == [1]

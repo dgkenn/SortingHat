@@ -38,13 +38,15 @@ def main(argv=None) -> int:
     ap.add_argument("--onset-rule", choices=ONSET_RULES, default="score_then_visit")
     ap.add_argument("--score-rule", choices=SCORE_RULES, default="nearest",
                     help="primary strict rule in [-6 h, +1 h] of t0 (D-105); strict_pm6 is always reported too")
-    ap.add_argument("--service-fallback", action="store_true",
-                    help="treat an unclassifiable visit as acute care when ServiceName is LTM (decision C-03)")
+    ap.add_argument("--no-service-proxy", action="store_true",
+                    help="do not count an acute ServiceName (LTM, ICU, ED, inpatient) as acute care (D-111)")
+    ap.add_argument("--all-sites", action="store_true",
+                    help="do not restrict to the Study 1 sites I0002, I0003, S0001, S0002 (D-113)")
     ap.add_argument("--debug-flow", action="store_true",
                     help="also write out/cohort/flow_debug.md/json and print the ALL-sites table with EVERY step on its "
                          "own row (only counts < 11 suppressed; not for sharing)")
-    ap.add_argument("--visit-slack-h", type=float, default=0.0,
-                    help="widen every visit interval by this many hours both sides when matching an EEG (decision C-19)")
+    ap.add_argument("--visit-slack-h", type=float, default=24.0,
+                    help="widen every visit date interval by this many hours both sides when matching an EEG (D-112)")
     ap.add_argument("--open-visit-days", type=float, default=30.0,
                     help="a visit with no end is treated as open this many days after its start (C-19)")
     ap.add_argument("--merge-cols", nargs=2, metavar=("OLD", "NEW"),
@@ -52,9 +54,6 @@ def main(argv=None) -> int:
     ap.add_argument("--max-memory-gb", type=float, default=None,
                     help="guard: set RLIMIT_AS to this many GB (address space, an upper bound on RSS; pick generously) "
                          "and print a clear aggregate error instead of a traceback if exceeded")
-    ap.add_argument("--duration-scale", nargs="*", default=[], metavar="SITE=FACTOR",
-                    help="unit fix for DurationInSeconds / RecordingDuration after reading the flow's unit check, "
-                         "e.g. I0008=60")
     a = ap.parse_args(argv)
     return run_guarded(lambda: _run(a), a.max_memory_gb, "cohort build")
 
@@ -64,10 +63,9 @@ def _run(a) -> int:
     if a.data:
         agent_safety.assert_not_restricted_in_agent(a.data)
     store = data_io.open_store(a.data, profile=a.profile)            # make_client refuses inside an agent session
-    scale = tuple((kv.split("=")[0], float(kv.split("=")[1])) for kv in a.duration_scale)
-    cfg = CohortConfig(onset_rule=a.onset_rule, score_rule=a.score_rule, use_service_fallback=a.service_fallback,
-                       duration_scale_by_site=scale, visit_slack_h=a.visit_slack_h,
-                       open_visit_days=a.open_visit_days)
+    cfg = CohortConfig(onset_rule=a.onset_rule, score_rule=a.score_rule, use_service_proxy=not a.no_service_proxy,
+                       study_sites=None if a.all_sites else CohortConfig().study_sites,
+                       visit_slack_h=a.visit_slack_h, open_visit_days=a.open_visit_days)
     result = build_cohort(StoreSources(store, a.sites, merge_cols=tuple(a.merge_cols) if a.merge_cols else None), cfg)
     paths = write_outputs(result, a.out, a.debug_flow)
 

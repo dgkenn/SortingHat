@@ -33,7 +33,8 @@ from .config import CohortConfig
 from .flow import FlowRecorder, debug_report, flow_report
 
 KEY_LIST_COLUMNS = ["SiteID", "person_id", "SessionID", "BidsFolder", "EEGFolder", "edf_key",
-                    "task_token_assumed", "window_start_s", "window_duration_s", "in_strict", "in_strict_pm6", "in_broad"]
+                    "task_token_assumed", "window_start_s", "window_duration_s", "clock_duration_s", "in_strict", "in_strict_pm6",
+                    "in_broad"]
 INCLUDED = "included"
 LATER_SESSION = "Not the patient's first qualifying EEG"
 SESS, PAT = "EEG sessions", "patients"
@@ -56,18 +57,16 @@ def _hours(a: pd.Series, b: pd.Series) -> pd.Series:
 
 
 def _duration(S: pd.DataFrame, cfg: CohortConfig) -> tuple[pd.Series, pd.Series]:
-    """Recording duration in seconds: metadata value x per-site unit scale; else EndTime - StartTime."""
-    scale = S["SiteID"].map(dict(cfg.duration_scale_by_site)).fillna(1.0).astype(float)
-    meta = pd.to_numeric(S["duration_raw_s"], errors="coerce") * scale
+    """Recording duration in seconds = EndTime - StartTime (the clock; D-115). The metadata duration
+    (``DurationInSeconds`` / ``RecordingDuration``) is not used: it disagrees with the clock at I0003. The streaming
+    extractor confirms the length from the EDF header (n_records x record duration) and drops windows that do not fit."""
     clock = (S["t_end"] - S["t0"]).dt.total_seconds()
     clock = clock.where(clock > 0)
-    dur = meta.where(meta.notna(), clock)
-    basis = pd.Series(np.where(meta.notna(), "metadata", np.where(clock.notna(), "clock", "none")), index=S.index)
-    return dur, basis
+    return clock, pd.Series(np.where(clock.notna(), "clock", "none"), index=S.index)
 
 
 def duration_unit_check(S: pd.DataFrame, sites: list[str]) -> dict:
-    """Aggregate check of the DurationInSeconds / RecordingDuration unit: quartiles of metadata duration over the
+    """INFORMATIONAL (the cohort uses the clock duration, D-115). Aggregate check of the metadata duration: quartiles of metadata duration over the
     EndTime - StartTime clock duration per site (about 1 if the unit really is seconds)."""
     out = {}
     clock = (S["t_end"] - S["t0"]).dt.total_seconds()
@@ -140,6 +139,10 @@ def build_cohort(src, cfg: CohortConfig | None = None) -> CohortResult:
     n_unstamped = S0[S0["person_id"].notna() & S0["t0"].isna()].groupby("person_id").size()
 
     # ------------------------------------------------------------------ session-level qualification
+    flow.excluded_sites = [x for x in sites if cfg.study_sites is not None and x not in cfg.study_sites]
+    if cfg.study_sites is not None:
+        run.drop("Site is not a Study 1 site (no EHR rows; excluded from labelled analyses)",
+                 run.S["SiteID"].astype(str).isin(cfg.study_sites), SESS)
     run.drop("Patient id not resolvable", run.S["person_id"].notna(), SESS)
     run.drop("EEG start time missing", run.S["t0"].notna(), SESS)
     run.drop("Age missing", run.S["age_years"].notna(), SESS)
@@ -150,18 +153,23 @@ def build_cohort(src, cfg: CohortConfig | None = None) -> CohortResult:
     bounds = S.groupby("person_id")["t0"].agg(lo="min", hi="max").astype("datetime64[s]")
     visits = fetch(src.visits, S["person_id"].unique(), bounds=bounds, slack_h=cfg.visit_slack_h)
     run.S = S.join(rules.match_visits(S, visits, cfg.acute_classes, cfg.visit_chain_gap_h, cfg.visit_slack_h,
-                                      cfg.open_visit_days, cfg.date_only_end_of_day))
+                                      cfg.open_visit_days, cfg.date_only_end_of_day, dates_only=cfg.visit_dates_only))
+    del visits
     run.S["ServiceName"] = run.S["ServiceName"].astype("string").str.strip().str.upper()
     run.drop("No visit covering the EEG start", run.S["visit_start"].notna(), SESS)
 
+    # acute-care proxy (D-111): a visit classified by concept id / text (no-op while all ids are 0) decides by its class;
+    # otherwise the covering visit is inpatient-length OR ServiceName names an acute setting
     S = run.S
-    unknown = S["visit_class"].isna()
-    acute_v = S["visit_class"].isin(cfg.acute_classes)
-    acute_s = unknown & cfg.use_service_fallback & S["ServiceName"].isin([x.upper() for x in cfg.service_acute]
-                                                                         ).fillna(False)
-    run.drop("Visit care setting unclassifiable", ~unknown | acute_s, SESS)
-    run.drop("Non-acute care setting (outpatient)", acute_v | acute_s, SESS)
-    run.S = run.S.assign(acute_basis=np.where(run.S["visit_class"].isin(cfg.acute_classes), "visit", "service"))
+    known = S["visit_class"].notna()
+    by_class = known & S["visit_class"].isin(cfg.acute_classes)
+    by_length = ~known & S["visit_inpatient_length"].astype(bool)
+    svc = S["ServiceName"].fillna("")
+    by_service = ~known & cfg.use_service_proxy & pd.Series(
+        [any(tok in x for tok in cfg.service_acute) for x in svc], index=S.index)
+    run.drop("Not acute care (visit shorter than a day and no acute ServiceName)", by_class | by_length | by_service, SESS)
+    run.S = run.S.assign(acute_basis=np.where(by_class[run.S.index], "visit_class",
+                                              np.where(by_length[run.S.index], "visit_length", "service")))
     run.drop("OR or EMU service (not an ACI work-up)",
              ~run.S["ServiceName"].isin([x.upper() for x in cfg.exclude_services]).fillna(False), SESS)
 
@@ -223,7 +231,7 @@ def build_cohort(src, cfg: CohortConfig | None = None) -> CohortResult:
     run.stage.loc[S["_sess_idx"].to_numpy()] = 10**6
 
     cols = ["SiteID", "person_id", "person_id_source", "SessionID", "BidsFolder", "EEGFolder", "t0", "age_years", "ServiceName",
-            "visit_class", "visit_match", "acute_basis", "duration_s", "duration_basis", "onset", "onset_basis",
+            "visit_class", "visit_match", "visit_inpatient_length", "acute_basis", "duration_s", "duration_basis", "onset", "onset_basis",
             "hours_since_onset", *[f"onset_le_{h:g}h" for h in cfg.onset_windows_h], "gcs_min_window",
             "four_min_window", "gcs_nearest_window", "four_nearest_window", "n_score_obs_window", "severity_strict",
             "severity_strict_pm6", "phenotype", "in_strict", "in_strict_pm6", "in_broad",
@@ -270,9 +278,9 @@ def _partitions(flow: FlowRecorder, t: pd.DataFrame, cfg: CohortConfig) -> None:
     flow.partition("Onset proxy basis (table rows)", {
         "first abnormal score": site[t["onset_basis"] == "abnormal_score"],
         "ED arrival or admission": site[t["onset_basis"] == "visit_start"]})
-    if cfg.use_service_fallback:
-        flow.partition("Acute-care basis (table rows)", {
-            "visit setting": site[t["acute_basis"] == "visit"], "service fallback": site[t["acute_basis"] == "service"]})
+    flow.partition("Acute-care basis (table rows)", {
+        "visit class": site[t["acute_basis"] == "visit_class"], "visit longer than a day": site[t["acute_basis"] == "visit_length"],
+        "ServiceName only": site[t["acute_basis"] == "service"]})
     flow.partition("First-EEG order uncertain: an unstamped EEG exists (table rows)", {
         "yes": site[t["n_unstamped_sessions"] > 0], "no": site[t["n_unstamped_sessions"] == 0]})
 
@@ -291,5 +299,6 @@ def make_key_list(t: pd.DataFrame, cfg: CohortConfig) -> pd.DataFrame:
         "BidsFolder": t["BidsFolder"], "EEGFolder": t["EEGFolder"], "edf_key": edf,
         "task_token_assumed": t["EEGFolder"].isna(),
         "window_start_s": cfg.window_start_s, "window_duration_s": cfg.window_duration_s,
+        "clock_duration_s": t["duration_s"],
         "in_strict": t["in_strict"], "in_strict_pm6": t["in_strict_pm6"], "in_broad": t["in_broad"]})
     return k[KEY_LIST_COLUMNS].reset_index(drop=True)

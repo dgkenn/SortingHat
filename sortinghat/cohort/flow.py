@@ -50,6 +50,7 @@ class FlowRecorder:
     steps: list[Step] = field(default_factory=list)
     partitions: list[Partition] = field(default_factory=list)
     checks: dict = field(default_factory=dict)
+    excluded_sites: list[str] = field(default_factory=list)       # sites kept out of the study (D-113): own block
 
     def _by_site(self, site_col) -> dict[str, int]:
         c = site_col.astype(str).value_counts()
@@ -71,7 +72,7 @@ class FlowRecorder:
                           for s in self.steps],
                 "partitions": [{"title": p.title, "parts": {k: dict(v) for k, v in p.parts.items()}}
                                for p in self.partitions],
-                "checks": self.checks}
+                "checks": self.checks, "excluded_sites": list(self.excluded_sites)}
 
 
 def _site_view(steps: list[Step], members: list[str]) -> list[tuple[str, str, int, bool]]:
@@ -84,13 +85,14 @@ def pool_sites(sites: list[str], steps: list[Step], k: int = SUPPRESS_BELOW) -> 
     final = {s: (steps[-1].remaining.get(s, 0) if steps else 0) for s in sites}
     fin = lambda g: sum(final[x] for x in g)          # noqa: E731
     groups = [[s] for s in sites]
-    while len(groups) > 1:
-        small = [g for g in groups if fin(g) < k]
-        if not small:
+    while True:
+        live = [g for g in groups if fin(g) > 0]          # a site with nothing left (e.g. excluded by design) is its own block
+        small = [g for g in live if fin(g) < k]
+        if not small or len(live) < 2:
             break
         g = min(small, key=fin)
         groups.remove(g)
-        other = min(groups, key=fin)
+        other = min((x for x in live if x is not g), key=fin)
         other.extend(g)
         other.sort()
     return groups
@@ -163,6 +165,8 @@ def flow_report(raw: dict, config: dict | None = None, k: int = SUPPRESS_BELOW) 
                     "sites": {}, "partitions": {}, "checks": raw.get("checks", {})}
     groups = pool_sites(raw["sites"], steps, k)
     labelled = [("+".join(g), g) for g in groups]
+    excl = set(raw.get("excluded_sites", []))
+    report["excluded_site_blocks"] = [lab for lab, g in labelled if g and set(g) <= excl]
     if any(len(g) > 1 for g in groups):
         report["pooled_site_groups"] = [lab for lab, g in labelled if len(g) > 1]
     for lab, members in [(ALL, raw["sites"]), *labelled]:
@@ -204,7 +208,8 @@ def debug_report(raw: dict, config: dict | None = None, k: int = SUPPRESS_BELOW)
     report: dict = {"debug": "DIAGNOSTIC, NOT FOR SHARING: every step is listed; only individual counts < "
                              f"{k} are suppressed, so small exclusions are inferable from neighbouring exact counts",
                     "suppression": f"counts < {k} are shown as \"{SUPPRESSED}\"", "sites": {}, "partitions": {},
-                    "checks": raw.get("checks", {})}
+                    "checks": raw.get("checks", {}),
+                    "excluded_site_blocks": [x for x in raw["sites"] if x in set(raw.get("excluded_sites", []))]}
     for lab, members in [(ALL, raw["sites"]), *[(x, [x]) for x in raw["sites"]]]:
         view = _site_view(steps, members)
         if not view or view[0][2] < k:
@@ -241,7 +246,8 @@ def flow_markdown(report: dict, pending: list[str] | None = None) -> str:
          "Units: a row counts the unit of its last step. From \"Not the patient's first qualifying EEG\" on, one "
          "EEG per patient remains, so sessions = patients; that row's Excluded counts later sessions.", ""]
     for site, blk in report["sites"].items():
-        L += [f"## {'All sites' if site == ALL else site}", ""]
+        tag = " (excluded block: not a Study 1 site, no EHR rows)" if site in report.get("excluded_site_blocks", []) else ""
+        L += [f"## {'All sites' if site == ALL else site}{tag}", ""]
         if WITHHELD in blk:
             L += [f"Withheld: {blk[WITHHELD]}.", ""]
             continue

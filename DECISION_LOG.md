@@ -725,3 +725,33 @@
 - **Rationale:** After D-109, real-data aggregates (S0001, n = 56) gave a median usable fraction of 0.888 but only 32 of 56 passing; among the 24 failing windows the `disconnected` rule flagged 75% of minimum-set cells, driven by line noise (45%) and flat (27%), while amplitudes were plausible (std median 82 uV, p99 294 uV) and the line-noise ratio median was 0.68 (q75 11.5). A ratio of 1.0 and the line-noise route to `disconnected` mislabel mains-contaminated but connected channels, which the 60 Hz notch handles; the amplitude and epoch-fraction limits were set from the same aggregates. No label, outcome or model result was used.
 - **Source:** `scripts/diag_eeg_signals.py` aggregate output (coordinator report); D-097; `docs/eeg_pipeline.md`; `sortinghat/eeg/window.py`.
 
+### D-111 Acute-care proxy: inpatient-length covering visit or acute ServiceName
+- **Date:** 2026-10-08 · **Area:** data · **Outcome data seen?** No
+- **Decision:** An EEG is acute-care when the visit covering its date is inpatient-length (`visit_end_date` after `visit_start_date`) OR `ServiceName` indicates ICU, ED, inpatient or LTM (in hospital) where ServiceName exists; EMU and OR services remain excluded. The `visit_concept_id` classification is dropped (kept only as a no-op in case non-zero ids appear). Supersedes the visit-class part of C-02/C-03 in `docs/cohort_spec.md` and the "ServiceName fallback off" choice accepted in D-104.
+- **Rationale:** The first real diagnostic (aggregates only) showed `visit_concept_id` = 0 for all 28.8M visit rows and a mostly null `visit_source_value`, so the care setting cannot be read and the class-based step removed every patient. Visit length and ServiceName are the remaining acute-care signals.
+- **Source:** `scripts/diag_cohort.py` aggregates; `docs/cohort_spec.md` C-02, C-03.
+
+### D-112 Visit cover [visit_start_date - 24 h, visit_end_date + 24 h]
+- **Date:** 2026-10-08 · **Area:** data · **Outcome data seen?** No
+- **Decision:** Visits are treated as date-only. A visit covers an EEG when the EEG's date lies in [visit start date - 24 h, visit end date + 24 h]; among covering visits an exact cover is preferred to a slack-only cover, then an inpatient-length visit, then one that started on or before the EEG date, then the latest start. Amends the interval rule of D-104/C-19.
+- **Rationale:** 91-100% of visit starts and ends are at midnight, and widening by 24 h raised the covered share to 78-99% by site, against a near-zero match with timestamp intervals.
+- **Source:** `scripts/diag_cohort.py` aggregates; `docs/cohort_spec.md` C-19.
+
+### D-113 Study 1 sites are I0002, I0003, S0001 and S0002
+- **Date:** 2026-10-08 · **Area:** splits · **Outcome data seen?** No
+- **Decision:** I0008 and I0009 are excluded from all labelled analyses because their patients have no OMOP (EHR) rows. The cohort flow reports them as a separate excluded block. The site-count check of D-024 (at least 3 adult sites with at least 300 candidates each) is applied to the four Study 1 sites.
+- **Rationale:** Without EHR data there are no severity scores, visits, medications or labels to build baselines or reference standards at those sites.
+- **Source:** `scripts/diag_cohort.py` aggregates; `docs/cohort_spec.md` C-20.
+
+### D-114 Patient merge history applied: MergedBDSPPatientID to BDSPPatientID
+- **Date:** 2026-10-08 · **Area:** data · **Outcome data seen?** No
+- **Decision:** The merge-history files (columns `MergedBDSPPatientID`, `BDSPPatientID`, `LineNBR`, `BDSPLastModifiedDTS`) are applied before first-EEG selection: each merged id maps to `BDSPPatientID`, chains are followed, and when one merged id has several survivors the row with the latest `BDSPLastModifiedDTS` wins. Specifies the column names left open in D-106.
+- **Rationale:** The diagnostic read the column names of the real files; the rule for conflicts avoids an arbitrary choice.
+- **Source:** `scripts/diag_cohort.py` (column names only); `docs/cohort_spec.md` C-11.
+
+### D-115 Recording duration is the clock duration; the extractor confirms from the EDF header
+- **Date:** 2026-10-08 · **Area:** data · **Outcome data seen?** No
+- **Decision:** For the cohort, recording duration is EndTime minus StartTime; the metadata duration (`DurationInSeconds`, `RecordingDuration`) is not used. The streaming extractor confirms the length from the EDF header (number of records times record duration) and excludes recordings or windows that do not fit minutes 1-11. Supersedes the metadata-first duration rule of C-07.
+- **Rationale:** The metadata duration disagrees with the clock at I0003 (median ratio 2.35 with a heavy upper tail), so its unit or meaning is not reliable.
+- **Source:** `scripts/diag_cohort.py` aggregates; `docs/cohort_spec.md` C-07.
+

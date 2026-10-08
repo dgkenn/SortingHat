@@ -107,3 +107,23 @@ def test_explicit_merge_columns_override_the_name_guess(synth_dir, tmp_path):
     assert StoreSources(LocalStore(tmp_path / "d")).merge_map() == ({}, "unrecognised")
     mm, status = StoreSources(LocalStore(tmp_path / "d"), merge_cols=("colA", "colB")).merge_map()
     assert status == "applied" and mm == {2: 1}
+
+
+def test_real_merge_layout_is_detected_and_the_latest_modified_row_wins():
+    d = pd.DataFrame({"MergedBDSPPatientID": ["3", "3", "2", "7"], "BDSPPatientID": ["1", "9", "1", "7"],
+                      "LineNBR": [1, 2, 3, 4],
+                      "BDSPLastModifiedDTS": ["2020-01-01", "2021-01-01", "2019-01-01", "2020-01-01"]})
+    assert merge_pairs(d) == {2: 1, 3: 9}                     # 3 -> 9 is newer than 3 -> 1; self-merge 7 -> 7 dropped
+    d["BDSPLastModifiedDTS"] = ["2022-01-01", "2021-01-01", "2019-01-01", "2020-01-01"]
+    assert merge_pairs(d)[3] == 1
+
+
+def test_conflicts_across_files_are_resolved_by_modified_time(synth_dir, tmp_path):
+    shutil.copytree(synth_dir, tmp_path / "d")
+    m = tmp_path / "d" / "PatientMergeHistory"
+    m.mkdir()
+    cols = ["LineNBR", "MergedBDSPPatientID", "BDSPPatientID", "BDSPLastModifiedDTS"]
+    pd.DataFrame([[1, 2, 1, "2020-01-01"]], columns=cols).to_csv(m / "a.csv", index=False)
+    pd.DataFrame([[1, 2, 5, "2021-01-01"]], columns=cols).to_csv(m / "b.csv", index=False)
+    mm, status = StoreSources(LocalStore(tmp_path / "d")).merge_map()
+    assert status == "applied" and mm == {2: 5}

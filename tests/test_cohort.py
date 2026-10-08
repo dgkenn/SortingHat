@@ -6,7 +6,7 @@ import pandas as pd
 import pytest
 
 from sortinghat.audit import field_audit as fa
-from sortinghat.cohort import CohortConfig, FrameSources, build_cohort
+from sortinghat.cohort import CohortConfig, FrameSources, build_cohort, flow_markdown
 from sortinghat.cohort import rules
 from sortinghat.cohort.build import INCLUDED, duration_unit_check
 from test_cohort_helpers import FOUR, GCS, H, T0, World, remaining_after, removed_at
@@ -14,8 +14,13 @@ from test_cohort_helpers import FOUR, GCS, H, T0, World, remaining_after, remove
 PRE_FIRST = ("Patient id", "EEG start", "Age", "No visit", "Visit care", "Non-acute", "OR or EMU")
 
 
+# The hand-built scenario patients carry timestamped visits with real concept ids, so they are matched on the exact
+# intervals (the D-112 date-only +-24 h cover is tested separately in test_cohort_hepatients.py / test_cohort_visits.py).
+LEGACY = dict(study_sites=None, visit_dates_only=False, visit_slack_h=0.0)
+
+
 def build(w, **cfg):
-    return build_cohort(FrameSources(w.tables()), CohortConfig(**cfg))
+    return build_cohort(FrameSources(w.tables()), CohortConfig(**{**LEGACY, **cfg}))
 
 
 @pytest.fixture(scope="module")
@@ -80,7 +85,7 @@ def fate(res, pid):
 # ----------------------------------------------------------------------------------------------- exclusions
 @pytest.mark.parametrize("pid,prefix", [
     (2, "EEG start time missing"), (3, "Age missing"), (4, "Age <"), (6, "No visit"), (7, "No visit"),
-    (8, "Non-acute"), (9, "Visit care setting"), (11, "OR or EMU"), (12, "OR or EMU"),
+    (8, "Not acute care"), (9, "Not acute care"), (11, "OR or EMU"), (12, "OR or EMU"),
     (15, "Recording duration unknown"), (16, "Recording shorter"), (20, "EEG more than 48 h"),
     (23, "Neither"), (24, "Neither"), (27, "Neither"), (28, "Neither"), (31, "Neither"), (32, "Neither"),
     (34, "Neither"), (35, "Neither"), (39, "Age <"), (40, "EEG start time missing")])
@@ -101,8 +106,7 @@ def test_exact_step_counts(scenario):
     assert removed_at(r, "Age missing") == 1
     assert removed_at(r, "Age <") == 2                            # 4, 39
     assert removed_at(r, "No visit") == 2                         # 6, 7
-    assert removed_at(r, "Visit care") == 1                       # 9
-    assert removed_at(r, "Non-acute") == 2                        # 8 and 13's earlier outpatient EEG
+    assert removed_at(r, "Not acute care") == 3                   # 8, 9 (class unknown, short visit) and 13's earlier outpatient EEG
     assert removed_at(r, "OR or EMU") == 2
     assert removed_at(r, "Not the patient's first") == 1          # 14's later EEG
     assert removed_at(r, "Recording duration unknown") == 1
@@ -230,14 +234,34 @@ def test_scores_are_range_checked_not_clipped():
 
 
 # ---------------------------------------------------------------------------------- service fallback etc.
-def test_service_fallback_only_when_enabled():
+def test_acute_care_proxy_is_visit_length_or_service_when_the_class_is_unknown():
+    """D-111: all visit_concept_id are 0 in HEEDB, so the class is unknown and the proxy decides: the covering visit is
+    longer than a day (end date after start date), or ServiceName names an acute setting (LTM, ICU, ED, inpatient)."""
     w = World()
-    w.eeg(1, service="LTM"); w.visit(1, "ICU", T0 - H(3), concept=False); w.score(1, GCS, T0 - H(1), 8)
-    w.eeg(2, service="Routine"); w.visit(2, "ICU", T0 - H(3), concept=False); w.score(2, GCS, T0 - H(1), 8)
-    assert len(build(w).table) == 0
-    r = build(w, use_service_fallback=True)
-    assert r.table["person_id"].tolist() == [1] and r.table["acute_basis"].tolist() == ["service"]
-    assert fate(r, 2).startswith("Visit care setting")
+    day = T0.normalize()
+
+    def pt(pid, service, start, end):
+        w.eeg(pid, service=service); w.visit(pid, "ICU", start, end=end, concept=False); w.score(pid, GCS, T0 - H(1), 8)
+    pt(1, "Routine", day - pd.Timedelta(days=2), day + pd.Timedelta(days=3))     # multi-day visit
+    pt(2, "Routine", day, day)                                                   # same-day visit, routine service
+    pt(3, "LTM", day, day)                                                       # same-day visit, LTM service
+    pt(4, "EMU", day - pd.Timedelta(days=2), day + pd.Timedelta(days=3))         # multi-day but EMU: excluded
+    pt(5, "OR", day - pd.Timedelta(days=2), day + pd.Timedelta(days=3))
+    pt(6, "Routine", day - pd.Timedelta(days=1), None)                           # open visit: length unknown
+    r = build(w)
+    t = r.table.set_index("person_id")
+    assert sorted(t.index) == [1, 3]
+    assert t.loc[1, "acute_basis"] == "visit_length" and t.loc[3, "acute_basis"] == "service"
+    assert all(r.fates.loc[p].startswith(x) for p, x in ((2, "Not acute care"), (4, "OR or EMU"), (5, "OR or EMU"),
+                                                          (6, "Not acute care")))
+    assert build(w, use_service_proxy=False).table["person_id"].tolist() == [1]
+
+
+def test_a_known_visit_class_still_decides_when_concept_ids_are_ever_non_zero():
+    w = World()
+    w.eeg(1); w.visit(1, "Outpatient", T0 - H(30), end=T0 + H(30)); w.score(1, GCS, T0 - H(1), 8)    # multi-day but Outpatient
+    w.eeg(2); w.visit(2, "ED", T0 - H(2), end=T0 + H(1)); w.score(2, GCS, T0 - H(1), 8)               # same-day ED
+    assert build(w).table["person_id"].tolist() == [2]
 
 
 def test_visit_class_matches_the_audit_rule():
@@ -248,14 +272,18 @@ def test_visit_class_matches_the_audit_rule():
     assert m["visit_class"].tolist() == ["ED"] == [fa.visit_class(0, "Emergency Room")]
 
 
-def test_duration_scale_and_unit_check():
+def test_duration_is_the_clock_not_the_metadata_value():
+    """D-115: recording duration = EndTime - StartTime; the metadata duration (wrong unit or wrong value) is ignored."""
     w = World()
-    for i in range(12):                                          # RecordingDuration in MINUTES at I0008 (11 min)
-        w.patient(100 + i, site="I0008", dur=11.0, clock_dur=660.0)
-    assert len(build(w).table) == 0
-    assert len(build(w, duration_scale_by_site=(("I0008", 60.0),)).table) == 12
+    for i in range(12):                                          # metadata says 11 (minutes?), the clock says 30 min
+        w.patient(100 + i, site="I0008", dur=11.0, clock_dur=1800.0)
+    for i in range(12):                                          # metadata says 2 h, the clock says 5 min
+        w.patient(200 + i, site="S0001", dur=7200.0, clock_dur=300.0)
+    r = build(w)
+    assert sorted(r.table["person_id"]) == [100 + i for i in range(12)]
+    assert (r.table["duration_s"] == 1800.0).all() and (r.table["duration_basis"] == "clock").all()
     S = FrameSources(w.tables()).sessions()
-    assert "UNIT WARNING" in duration_unit_check(S, ["I0008"])["duration_over_clock_I0008"]
+    assert "UNIT WARNING" in duration_unit_check(S, ["I0008"])["duration_over_clock_I0008"]   # informational only
 
 
 def test_site_variants_are_read(scenario):
@@ -270,7 +298,7 @@ def test_agrees_with_the_audit_candidates_on_synthetic(synth):
     """The audit matches the visit with the latest start; the cohort matches any covering visit (acuity first), so it
     can only ADD patients (an inpatient stay covering a later outpatient-labelled EEG) or move t0 earlier."""
     tables = synth[0]
-    res = build_cohort(FrameSources(tables))
+    res = build_cohort(FrameSources(tables), CohortConfig(**LEGACY))
     cand = fa.build_candidates(fa.from_raw_tables(tables)["eeg_metadata"])
     late = ("Recording", "No ACI", "EEG more than", "Neither", INCLUDED)
     reached = res.fates[res.fates.str.startswith(late)]
@@ -308,17 +336,34 @@ def test_strict_flags_match_an_independent_recomputation(synth):
     assert t["severity_strict"].sum() > 100 and (t["severity_strict_pm6"] & ~t["severity_strict"]).sum() > 0
 
 
+def test_study_sites_default_excludes_i0008_i0009_as_a_separate_block(synth):
+    res = build_cohort(FrameSources(synth[0]))                    # defaults: D-111 to D-115
+    assert set(res.table["SiteID"]) <= {"I0002", "I0003", "S0001", "S0002"} and len(res.table) > 100
+    rep = res.report
+    assert rep["excluded_site_blocks"] == ["I0008", "I0009"] or rep["excluded_site_blocks"] == ["I0008+I0009"]
+    blk = rep["sites"][rep["excluded_site_blocks"][0]]["rows"]
+    assert blk[-1]["step"].startswith("Site is not a Study 1 site") and blk[-1]["n_remaining"] == "<11"
+    assert "excluded block" in flow_markdown(rep)
+    assert len(build_cohort(FrameSources(synth[0]), CohortConfig(study_sites=None)).table) > len(res.table)
+
+
 def test_synthetic_invariants(synth):
-    res = build_cohort(FrameSources(synth[0]))
+    res = build_cohort(FrameSources(synth[0]), CohortConfig(study_sites=None))
     t = res.table
     assert t["person_id"].is_unique and len(t) > 100
     assert (t["in_strict"] <= t["in_broad"]).all() and (t["in_strict"] <= t["in_strict_pm6"]).all()
     assert (t["duration_s"] >= 660).all()
-    assert (t["age_years"] >= 18).all() and t["visit_class"].isin(["ICU", "Inpatient", "ED"]).all()
+    assert (t["age_years"] >= 18).all() and (t["visit_inpatient_length"] | t["visit_class"].isin(["ICU", "Inpatient", "ED"])
+                                           | t["acute_basis"].eq("service")).all()
     assert (t["hours_since_onset"].between(0, 48)).all()
     assert set(t["SiteID"]) == {"S0001", "S0002", "I0002", "I0003", "I0008", "I0009"}   # both layouts present
     assert list(res.keys["person_id"]) == list(t["person_id"])
     assert (res.keys["window_start_s"] == 60.0).all() and (res.keys["window_duration_s"] == 600.0).all()
+
+
+def test_key_list_carries_the_clock_duration(scenario):
+    k = scenario[1].keys.set_index("person_id")
+    assert k.loc[17, "clock_duration_s"] == 660.0 and k.loc[1, "clock_duration_s"] == 1800.0
 
 
 def test_key_list_edf_keys(scenario):

@@ -44,9 +44,17 @@ _OLD_COL = re.compile(r"old|merged|retired|source|from|secondary|duplicate|prior
 _NEW_COL = re.compile(r"new|surviv|target|\bto\b|primary|master|current|final|canonical|kept", re.I)
 
 
-def merge_pairs(df: pd.DataFrame, cols: tuple[str, str] | None = None) -> dict[int, int] | None:
-    """{retired id: surviving id} from a merge-history frame, or None when the old/new columns are not identifiable
-    (exactly one id-like column matching the 'old' words and one matching the 'new' words are required)."""
+MERGE_DEFAULT_COLS = ("MergedBDSPPatientID", "BDSPPatientID")        # D-114: seen in the real merge-history CSVs
+MERGE_TIME_COL = "BDSPLastModifiedDTS"
+
+
+def merge_rows(df: pd.DataFrame, cols: tuple[str, str] | None = None) -> pd.DataFrame | None:
+    """Merge-history rows as ``old, new, mod`` (int64, int64, datetime), or None when the old/new id columns are not
+    identifiable. Column choice, in order: explicit ``cols``; the real layout ``MergedBDSPPatientID`` ->
+    ``BDSPPatientID`` (D-114); else exactly one id-like column matching the 'old' words and one matching the 'new'
+    words. ``mod`` is ``BDSPLastModifiedDTS`` when present (NaT otherwise)."""
+    if cols is None and set(MERGE_DEFAULT_COLS) <= set(df.columns):
+        cols = MERGE_DEFAULT_COLS
     if cols is not None:                                    # explicit names from the diagnostic
         old, new = ([cols[0]], [cols[1]]) if cols[0] in df and cols[1] in df else ([], [])
     else:
@@ -57,8 +65,24 @@ def merge_pairs(df: pd.DataFrame, cols: tuple[str, str] | None = None) -> dict[i
         return None
     o = pd.to_numeric(df[old[0]], errors="coerce")
     n = pd.to_numeric(df[new[0]], errors="coerce")
-    ok = o.notna() & n.notna() & (o != n)
-    return {int(a): int(b) for a, b in zip(o[ok], n[ok])}
+    ok = (o.notna() & n.notna() & (o != n)).to_numpy(bool)
+    mod = pd.to_datetime(df[MERGE_TIME_COL], errors="coerce") if MERGE_TIME_COL in df else pd.Series(pd.NaT, index=df.index)
+    return pd.DataFrame({"old": o[ok].astype("int64").to_numpy(), "new": n[ok].astype("int64").to_numpy(),
+                         "mod": mod[ok].astype("datetime64[us]").to_numpy()})
+
+
+def merge_pairs(df: pd.DataFrame, cols: tuple[str, str] | None = None) -> dict[int, int] | None:
+    """{retired id: surviving id} from one merge-history frame (see ``merge_rows``); conflicts: latest ``mod`` wins."""
+    r = merge_rows(df, cols)
+    return None if r is None else resolve_rows(r)
+
+
+def resolve_rows(rows: pd.DataFrame) -> dict[int, int]:
+    """One surviving id per retired id: when a retired id appears with several survivors, the row with the latest
+    ``BDSPLastModifiedDTS`` wins (rows without a time lose to rows with one; remaining ties: the later row)."""
+    r = rows.reset_index(drop=True).assign(_o=lambda d: d.index).sort_values(["mod", "_o"], na_position="first")
+    r = r.drop_duplicates("old", keep="last")
+    return {int(a): int(b) for a, b in zip(r["old"], r["new"])}
 
 
 def resolve_merges(m: dict[int, int], max_hops: int = 20) -> dict[int, int]:
@@ -229,8 +253,7 @@ class StoreSources:
     def merge_map(self) -> tuple[dict[int, int], str]:
         """Read ``PatientMergeHistory/`` if it has files (CSV or parquet); only whole-file reads, ids kept in memory."""
         keys = data_io.list_keys(self.s3, MERGE_PREFIX)
-        pairs: dict[int, int] = {}
-        found = False
+        frames = []
         for k in keys:
             low = k.lower()
             if not low.endswith((".csv", ".csv.gz", ".parquet", ".txt", ".tsv")):
@@ -238,13 +261,15 @@ class StoreSources:
             body = self.s3.get_object(Bucket=data_io.access_point(), Key=k)["Body"].read()
             df = pd.read_parquet(io.BytesIO(body)) if low.endswith(".parquet") else pd.read_csv(
                 io.BytesIO(body), dtype=str, sep="\t" if low.endswith((".tsv", ".txt")) else ",")
-            m = merge_pairs(df, self.merge_cols)
-            if m is not None:
-                pairs.update(m)
-                found = True
+            del body
+            r = merge_rows(df, self.merge_cols)
+            del df
+            if r is not None and len(r):
+                frames.append(r)
         if not keys:
             return {}, "absent"
-        return (resolve_merges(pairs), "applied") if found else ({}, "unrecognised")
+        return (resolve_merges(resolve_rows(pd.concat(frames, ignore_index=True))), "applied") if frames else (
+            {}, "unrecognised")
 
     def iter_rows(self, table: str, columns: list[str], person_ids, min_rows: int = 0):
         """Yield coerced pandas chunks of ``table`` for ``person_ids`` (filtered inside Arrow, row group by row group),

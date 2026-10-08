@@ -50,7 +50,8 @@ def _dt(df: pd.DataFrame, col: str) -> pd.Series:
     return pd.Series(pd.NaT, index=df.index, dtype="datetime64[us]")
 
 
-def compact_visits(visits: pd.DataFrame, date_only_end_of_day: bool = True) -> pd.DataFrame:
+def compact_visits(visits: pd.DataFrame, date_only_end_of_day: bool = True, dates_only: bool = False
+                   ) -> pd.DataFrame:
     """Raw ``omop_visit_occurrence`` rows -> a COMPACT frame ``person_id`` int64, ``_start`` / ``_end``
     datetime64[s] (``_end`` NaT = unknown) and ``_cls`` (category: ICU / ED / Inpatient / Outpatient, NaN =
     unclassified). Roughly 25 bytes per visit, so tens of millions of visits fit in memory. Explicit rules:
@@ -60,6 +61,9 @@ def compact_visits(visits: pd.DataFrame, date_only_end_of_day: bool = True) -> p
        at exactly 00:00:00) is the END of that day when ``date_only_end_of_day``.
     3. **End before start** is a charting error: the visit is zero-length at its start.
     4. ``person_id`` is cast to int64 (OMOP ``person_id`` may arrive as text, with or without leading zeros).
+    5. ``_inpt`` (inpatient-length, D-111): the end is known and its DATE is after the start's DATE.
+    6. ``dates_only`` (D-112): start and end are reduced to their dates (midnight), with no end-of-day shift; the
+       cover window is then [start date - slack, end date + slack].
     The null-end horizon (``open_days``) is applied at matching time (``with_horizon``)."""
     v = visits
     pid = pd.to_numeric(v["person_id"], errors="coerce")
@@ -74,6 +78,9 @@ def compact_visits(visits: pd.DataFrame, date_only_end_of_day: bool = True) -> p
         d_end = d_end.dt.normalize() + pd.Timedelta(days=1) - pd.Timedelta(microseconds=1)
     end = end.where(end.notna(), d_end)
     end = end.where(~(end < start), start)
+    inpt = end.notna() & (end.dt.normalize() > start.dt.normalize())
+    if dates_only:
+        start, end = start.dt.normalize(), end.dt.normalize()
     ok = (pid.notna() & start.notna()).to_numpy(bool)
     cls = pd.Series(pd.Categorical([None] * int(ok.sum()), categories=CLASS_CATS), dtype="category")
     cols = [c for c in ("visit_concept_id", "visit_source_value") if c in v]
@@ -89,7 +96,8 @@ def compact_visits(visits: pd.DataFrame, date_only_end_of_day: bool = True) -> p
     return pd.DataFrame({"person_id": pid[ok].astype("int64").to_numpy(),
                          "_start": start[ok].astype("datetime64[s]").to_numpy(),
                          "_end": end[ok].astype("datetime64[s]").to_numpy(),
-                         "_cls": pd.Categorical(cls.to_numpy(object), categories=CLASS_CATS)})
+                         "_cls": pd.Categorical(cls.to_numpy(object), categories=CLASS_CATS),
+                         "_inpt": inpt[ok].to_numpy(bool)})
 
 
 def with_horizon(v: pd.DataFrame, open_days: float | None = 30.0) -> pd.DataFrame:
@@ -99,10 +107,10 @@ def with_horizon(v: pd.DataFrame, open_days: float | None = 30.0) -> pd.DataFram
     return v.assign(end_known=known, _endf=v["_end"].where(known, v["_start"] + horizon))
 
 
-def prepare_visits(visits: pd.DataFrame, open_days: float | None = 30.0, date_only_end_of_day: bool = True
-                   ) -> pd.DataFrame:
+def prepare_visits(visits: pd.DataFrame, open_days: float | None = 30.0, date_only_end_of_day: bool = True,
+                   dates_only: bool = False) -> pd.DataFrame:
     """``compact_visits`` (unless already compact) plus the open-end horizon (``with_horizon``)."""
-    v = visits if "_start" in visits else compact_visits(visits, date_only_end_of_day)
+    v = visits if "_start" in visits else compact_visits(visits, date_only_end_of_day, dates_only)
     return with_horizon(v, open_days)
 
 
@@ -122,24 +130,30 @@ def prune_visits(v: pd.DataFrame, bounds: pd.DataFrame, slack_h: float = 0.0) ->
     return v[keep.to_numpy(bool)]
 
 
-def visit_keys(j: pd.DataFrame, slack_h: float) -> tuple[pd.Series, pd.Series, pd.Series]:
-    """For joined (session, visit) rows with columns ``t0``, ``_start``, ``_endf``, ``_cls``: ``(covered, key, exact)``;
-    ``covered`` is start - slack <= t0 <= end + slack, ``exact`` is the same without slack, and ``key`` is an integer
-    where LOWER is better: exact cover before slack-only
-    cover, then care-setting priority (ICU < ED < Inpatient < Outpatient < unclassified), then the LATEST start."""
+def visit_keys(j: pd.DataFrame, slack_h: float, dates_only: bool = False) -> tuple[pd.Series, pd.Series, pd.Series]:
+    """For joined (session, visit) rows with columns ``t0``, ``_start``, ``_endf``, ``_cls``, ``_inpt``:
+    ``(covered, key, exact)``. With ``dates_only`` (D-112) the EEG is compared by its DATE, so ``covered`` is
+    [visit start date - slack, visit end date + slack]. ``exact`` is the same without slack. ``key`` is an integer
+    where LOWER is better, in this order: exact before slack-only cover; inpatient-length visit (D-111); visit
+    started on or before the EEG date; care-setting class (ICU < ED < Inpatient < Outpatient < unclassified; a no-op
+    while every concept id is 0); then the LATEST start (D-112 tie-break)."""
     slack = pd.Timedelta(hours=slack_h)
-    exact = (j["_start"] <= j["t0"]) & (j["t0"] <= j["_endf"])
-    covered = (j["_start"] - slack <= j["t0"]) & (j["t0"] <= j["_endf"] + slack)
+    t = j["t0"].dt.normalize() if dates_only else j["t0"]
+    exact = (j["_start"] <= t) & (t <= j["_endf"])
+    covered = (j["_start"] - slack <= t) & (t <= j["_endf"] + slack)
     codes = pd.Series(pd.Categorical(j["_cls"], categories=CLASS_CATS).codes, index=j.index).astype("int64")
     rank = codes.where(codes >= 0, 4)
+    inpt = j["_inpt"] if "_inpt" in j else pd.Series(False, index=j.index)
+    after = (j["_start"] > t).astype("int64")
     start_s = j["_start"].astype("datetime64[s]").astype("int64") + _S_OFFSET
-    key = ((~exact).astype("int64") * 8 + rank) * (1 << 35) + ((1 << 34) - 1 - start_s)
+    flags = ((~exact).astype("int64") * 2 + (~inpt.astype(bool)).astype("int64")) * 2 + after
+    key = (flags * 8 + rank) * (1 << 35) + ((1 << 34) - 1 - start_s)
     return covered, key, exact
 
 
 def match_visits(sessions: pd.DataFrame, visits: pd.DataFrame, acute: tuple[str, ...], gap_h: float,
                  slack_h: float = 0.0, open_days: float | None = 30.0, date_only_end_of_day: bool = True,
-                 chunk: int = 20000) -> pd.DataFrame:
+                 chunk: int = 20000, dates_only: bool = False) -> pd.DataFrame:
     """Care-setting visit of each session (index = ``sessions`` index). ``visits`` is raw ``omop_visit_occurrence``
     or already compact (``compact_visits``). Sessions are processed ``chunk`` at a time, so memory is bounded by
     ``chunk`` x visits-per-person, not by the whole visit table.
@@ -152,7 +166,7 @@ def match_visits(sessions: pd.DataFrame, visits: pd.DataFrame, acute: tuple[str,
       2. then care-setting priority ICU > ED > Inpatient > Outpatient > unclassified,
       3. then the latest start.
     Columns: ``visit_class`` (None when the matched visit says nothing about its setting), ``visit_start``,
-    ``encounter_start``, ``visit_match`` ('exact' | 'slack'). ``encounter_start`` is the earliest start among the same
+    ``encounter_start``, ``visit_match`` ('exact' | 'slack'), ``visit_inpatient_length`` (end date after start date). ``encounter_start`` is the earliest start among the same
     person's ACUTE visits with a KNOWN end that overlap the matched visit or end within ``gap_h`` before it begins
     (one hop), so an ED visit followed by an admission counts from ED arrival; it is never later than t0 (a visit
     matched only through ``slack_h`` that starts after the EEG gives an encounter start of t0). NaT / None when
@@ -160,26 +174,27 @@ def match_visits(sessions: pd.DataFrame, visits: pd.DataFrame, acute: tuple[str,
     out = pd.DataFrame({"visit_class": pd.Series(None, index=sessions.index, dtype=object),
                         "visit_start": pd.Series(pd.NaT, index=sessions.index, dtype="datetime64[us]"),
                         "encounter_start": pd.Series(pd.NaT, index=sessions.index, dtype="datetime64[us]"),
-                        "visit_match": pd.Series(None, index=sessions.index, dtype=object)})
+                        "visit_match": pd.Series(None, index=sessions.index, dtype=object),
+                        "visit_inpatient_length": pd.Series(False, index=sessions.index, dtype=bool)})
     if not len(sessions) or not len(visits) or not ({"person_id"} <= set(visits)) or not (
             {"visit_start_datetime", "visit_start_date", "_start"} & set(visits)):
         return out
-    v = prepare_visits(visits, open_days, date_only_end_of_day)
+    v = prepare_visits(visits, open_days, date_only_end_of_day, dates_only)
     e = pd.DataFrame({"person_id": sessions["person_id"].astype("int64"),
                       "t0": sessions["t0"].astype("datetime64[s]"), "_i": sessions.index}).dropna()
     if not len(e) or not len(v):
         return out
     e = e.sort_values("person_id", kind="stable")
-    av = v[v["_cls"].isin(acute) & v["end_known"]][["person_id", "_start", "_end"]]
+    av = v[(v["_cls"].isin(acute) | v["_inpt"]) & v["end_known"]][["person_id", "_start", "_end"]]
     gap = pd.Timedelta(hours=gap_h)
-    vv = v[["person_id", "_start", "_endf", "_cls"]]
+    vv = v[["person_id", "_start", "_endf", "_cls", "_inpt"]]
     for a in range(0, len(e), chunk):
         ec = e.iloc[a:a + chunk]
         pids = ec["person_id"].unique()
         j = ec.merge(vv[vv["person_id"].isin(pids)], on="person_id")
         if not len(j):
             continue
-        covered, key, exact = visit_keys(j, slack_h)
+        covered, key, exact = visit_keys(j, slack_h, dates_only)
         j = j.assign(_key=key, _exact=exact)[covered.to_numpy(bool)]
         if not len(j):
             continue
@@ -188,6 +203,7 @@ def match_visits(sessions: pd.DataFrame, visits: pd.DataFrame, acute: tuple[str,
         out.loc[ix, "visit_class"] = m["_cls"].astype(object).where(m["_cls"].notna(), None).to_numpy()
         out.loc[ix, "visit_start"] = m["_start"].astype("datetime64[us]").to_numpy()
         out.loc[ix, "visit_match"] = np.where(m["_exact"], "exact", "slack")
+        out.loc[ix, "visit_inpatient_length"] = m["_inpt"].to_numpy(bool)
         k = m[["_i", "person_id", "_start", "t0"]].merge(av[av["person_id"].isin(m["person_id"].unique())],
                                                          on="person_id", suffixes=("", "_w"))
         k = k[(k["_start_w"] <= k["_start"]) & (k["_end"] >= k["_start"] - gap)]

@@ -18,18 +18,23 @@ SCORE_RULES = ("nearest", "any")
 @dataclass(frozen=True)
 class CohortConfig:
     # --- population
+    study_sites: tuple[str, ...] | None = ("I0002", "I0003", "S0001", "S0002")   # D-113; None = every site
     adult_age_years: float = 18.0                       # plan: adults
-    acute_classes: tuple[str, ...] = ("ICU", "Inpatient", "ED")        # plan: ICU, inpatient, ED
-    use_service_fallback: bool = False                  # C-03: visit class unknown + ServiceName in service_acute -> acute
-    service_acute: tuple[str, ...] = ("LTM",)
+    # Acute-care proxy (D-111): the covering visit is inpatient-length (visit_end_date > visit_start_date) OR ServiceName
+    # names an acute setting. ``acute_classes`` applies ONLY to a visit whose concept id / source text classify it
+    # (all visit_concept_id are 0 in HEEDB, so this is a no-op unless non-zero ids ever appear).
+    acute_classes: tuple[str, ...] = ("ICU", "Inpatient", "ED")
+    use_service_proxy: bool = True
+    service_acute: tuple[str, ...] = ("LTM", "ICU", "ED", "INPATIENT", "EMERGENCY")   # substring match, upper case
     exclude_services: tuple[str, ...] = ("OR", "EMU")   # C-04: intra-operative and epilepsy-unit EEGs are not ACI work-ups
-    visit_slack_h: float = 0.0                          # C-19: widen every visit interval by this many hours (0 = exact)
-    open_visit_days: float | None = 30.0                # C-19: a visit with no end is open this long after its start
-    date_only_end_of_day: bool = True                   # C-19: a date-only visit end covers the whole day
-    visit_chain_gap_h: float = 6.0                        # C-05: ED -> inpatient/ICU visits <= this gap apart form one encounter
-    # --- recording
+    # Visit cover (D-112): date-only visits, [visit_start_date - 24 h, visit_end_date + 24 h].
+    visit_dates_only: bool = True
+    visit_slack_h: float = 24.0
+    open_visit_days: float | None = 30.0                # a visit with no end is open this long after its start
+    date_only_end_of_day: bool = True                   # used only when visit_dates_only is False
+    visit_chain_gap_h: float = 6.0                      # C-05: ED -> inpatient/ICU visits <= this gap apart form one encounter
+    # --- recording (D-115): clock duration EndTime - StartTime; the metadata duration is not used
     min_duration_s: float = PRIMARY_START_S + PRIMARY_DURATION_S      # minutes 1-11 must exist (660 s)
-    duration_scale_by_site: tuple[tuple[str, float], ...] = ()        # C-07: unit fix, e.g. (("I0008", 60.0),) once checked
     # --- ACI onset (time since onset is a covariate; windows are sensitivity analyses)
     onset_rule: str = "score_then_visit"                # C-06
     abnormal_gcs_max: float = 14.0                      # "abnormal" GCS total for the onset proxy

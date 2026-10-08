@@ -205,9 +205,9 @@ class _Acc:
             self.latest[ii] = jb["_s"].astype("int64").to_numpy()[upd]
             self.latest_end_known[ii] = jb["_e"].notna().to_numpy()[upd]
         # ---- the cohort's current matching rule (rules.match_visits semantics, default knobs)
-        cv = rules.with_horizon(rules.compact_visits(raw))
-        j2 = es.merge(cv[["person_id", "_start", "_endf", "_cls"]], on="person_id")
-        covered, key, _ = rules.visit_keys(j2, 0.0)
+        cv = rules.with_horizon(rules.compact_visits(raw, dates_only=True))
+        j2 = es.merge(cv[["person_id", "_start", "_endf", "_cls", "_inpt"]], on="person_id")
+        covered, key, _ = rules.visit_keys(j2, 24.0, True)
         if covered.any():
             kk = pd.DataFrame({"_i": j2.loc[covered, "_i"].to_numpy(), "k": key[covered].to_numpy()}).groupby("_i")["k"].min()
             self.best_key[kk.index] = np.minimum(self.best_key[kk.index], kk.to_numpy())
@@ -340,9 +340,10 @@ def run_diag(store, sites: list[str] | None = None, min_rows: int = 500_000) -> 
 
     has_all = np.isin(acc.pid, vp)
     matched = acc.best_key < np.iinfo("int64").max
-    rank = (acc.best_key // (1 << 35)) % 8
-    names = np.array(rules.CLASS_CATS + ["unclassified"], dtype=object)
-    cls_name = np.where(matched, names[np.minimum(rank, 4)], "no_visit")
+    hi_part = acc.best_key // (1 << 35)
+    rank = hi_part % 8                                            # care-setting class (no-op: all concept ids are 0)
+    inpt = ((hi_part // 8) // 2) % 2 == 0                         # key flag: 0 = inpatient-length visit
+    cls_name = np.where(matched, np.where(inpt, "inpatient_length_visit", "short_visit"), "no_visit")
     pidx = np.searchsorted(acc.upids, acc.pid)
     for k, site in enumerate(site_list):
         m = acc.site_ix == k
@@ -379,8 +380,8 @@ def run_diag(store, sites: list[str] | None = None, min_rows: int = 500_000) -> 
         if has.any():
             blk["share_covered_of_eegs_with_a_visit_row"] = {n: _share(pd.Series(c[has])) for n, c in acc.cover.items()}
         blk["share_matched_by_current_rule"] = _share(pd.Series(matched[m]))
-        blk["share_matched_acute_by_current_rule"] = _share(pd.Series(matched[m] & (rank[m] <= 2)))
-        blk["current_rule_visit_class_counts"] = _counts(pd.Series(cls_name[m]))
+        blk["share_matched_multi_day_visit_by_current_rule"] = _share(pd.Series(matched[m] & inpt[m]))
+        blk["current_rule_matched_visit_kind_counts"] = _counts(pd.Series(cls_name[m]))
         report["sites"][site] = blk
 
     report["visit_concept_id"] = acc.concept.report(numeric=True)
