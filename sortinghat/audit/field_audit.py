@@ -23,6 +23,7 @@ from __future__ import annotations
 
 import argparse
 import difflib
+import math
 import re
 import sys
 from pathlib import Path
@@ -33,8 +34,9 @@ import pandas as pd
 from .. import agent_safety, data_io, schema
 from ..cohort import rules as cohort_rules
 from ..cohort.config import CohortConfig
+from . import alignment as al
 from ..cohort.sources import (StoreSources, concat_frames, iter_filtered_batches, remap_ids)
-from ..safe_output import (SUPPRESSED, safe_print, safe_quantiles, safe_write_json,
+from ..safe_output import (SUPPRESS_BELOW, SUPPRESSED, safe_print, safe_quantiles, safe_write_json,
                            safe_write_text, suppress_count, suppress_proportion,
                            write_local_only)
 
@@ -60,9 +62,11 @@ TYPE_VOCABS = ("Drug Type", "Type Concept")             # omop_concept.vocabular
 # "EHR administration record" is administration and "Prescription dispensed in pharmacy" is an order/dispense record.
 DRUG_ADMIN_RE = re.compile(r"administ|\bmar\b|infusion|given", re.I)
 DRUG_ORDER_RE = re.compile(r"prescri|\border|dispens|medication list|pharmacy", re.I)
-MISALIGN_DAYS = 30.0          # median |event - EEG start| above this => table misaligned
-MISALIGN_MAX_RATE = 0.05      # automated date-shift check tolerance (patients)
-MONOTONIC_MAX_RATE = 0.01     # within-record ordering violations tolerated
+# Date-shift gate (D-117): nearest-event alignment, see sortinghat/audit/alignment.py
+ALIGN_WINDOW_H = 24.0         # a candidate is aligned when SOME ancillary event is within +-24 h of its EEG start
+ALIGN_WIDE_H = 72.0           # reported as well
+ALIGN_MIN_SHARE = 0.80        # >= 80% of candidates aligned at every Study 1 site with clinical data
+DAY_MODE_MAX_SHARE = 0.05     # no non-zero whole-day gap mode may hold more than 5% of a site's candidates
 HANDCHECK_N = 20
 
 OMOP_TIME = {"omop_drug_exposure": "drug_exposure_start_datetime", "omop_measurement": "measurement_datetime",
@@ -292,6 +296,9 @@ def from_raw_tables(raw: dict[str, pd.DataFrame]) -> dict[str, pd.DataFrame]:
            "omop_concept": concept}
     for t in ("omop_note", "imaging"):
         out[t] = raw.get(t, pd.DataFrame())
+    # date-shift check (D-117): nearest-event gaps from the WHOLE raw tables (the filtered ones above keep only
+    # sedation / score / lab rows, which would understate how close the nearest event is)
+    out["alignment_gaps"], out["alignment_order"] = al.alignment_from_frames(build_candidates(eeg), raw)
     return {k: (v if k in ("eeg_metadata", "omop_concept") or "person_id" not in v
                 else v[v["person_id"].isin(cohort)]) for k, v in out.items()}
 
@@ -512,7 +519,44 @@ def load_audit_tables(s3, sites: list[str] | None = None, avail: dict | None = N
         out["omop_note"] = f_note.result()
         out["imaging"] = f_img.result()
     out["omop_concept"] = select_concepts(concept_all, _type_ids(out["omop_drug_exposure"]))
+    out["alignment_gaps"], out["alignment_order"] = load_alignment(s3, eeg, fetch_ids, remap, workers)
     return out
+
+
+def load_alignment(s3, eeg: pd.DataFrame, fetch_ids, remap, workers: int = 3) -> tuple[pd.DataFrame, pd.DataFrame]:
+    """Date-shift check inputs (D-117), STREAMED: for each candidate the signed gap in hours from EEG start to the
+    nearest row of visit_occurrence (start / end), measurement, observation, note, drug_exposure and condition_occurrence
+    (ALL rows of the candidates, not only the sedation / score rows), plus the covering-visit offset and the counts of
+    the secondary ordering checks. Only person_id and the time columns are read; memory is O(candidates). These full
+    reads of the big OMOP tables are the slow part of the audit."""
+    from concurrent.futures import ThreadPoolExecutor
+    cands = build_candidates(eeg)
+    cands = cands.assign(person_id=cands["person_id"].astype("int64"))
+
+    def small(table, cols):
+        parts = [remap_ids(b.to_pandas(), remap) for b in iter_filtered_batches(s3, table, fetch_ids, cols)]
+        return pd.concat(parts, ignore_index=True) if parts else pd.DataFrame(columns=cols)
+
+    birth, dend = al.life_arrays(cands["person_id"], small("person", al.BIRTH_COLS), small("death", al.DEATH_COLS))
+    acc = al.NearestGaps(cands, birth, dend)
+
+    def events(src):
+        tbl, dt, dd = al.EVENT_SOURCES[src]
+        for b in iter_filtered_batches(s3, tbl, fetch_ids, ["person_id", dt, dd]):
+            d = remap_ids(b.to_pandas(), remap)
+            acc.add_events(src, d["person_id"].to_numpy("int64"), al.event_times(d, dt, dd))
+
+    def visits():
+        for b in iter_filtered_batches(s3, "visit_occurrence", fetch_ids, al.VISIT_COLS):
+            d = remap_ids(b.to_pandas(), remap)
+            acc.add_visits(d["person_id"].to_numpy("int64"), al.event_times(d, "visit_start_datetime", "visit_start_date"),
+                           al.event_times(d, "visit_end_datetime", "visit_end_date"))
+
+    with ThreadPoolExecutor(max_workers=max(1, workers)) as pool:
+        futs = [pool.submit(visits)] + [pool.submit(events, src) for src in al.EVENT_SOURCES]
+        for f in futs:
+            f.result()
+    return acc.frame(), acc.order_frame()
 
 
 # ---------------------------------------------------------------- helpers
@@ -565,19 +609,41 @@ def build_candidates(eeg: pd.DataFrame) -> pd.DataFrame:
     return first[["person_id", "SiteID", "StartTime"]].rename(columns={"StartTime": "t0"})
 
 
+def pass_cell(num: int, den: int) -> dict:
+    """One suppressed pass / total / proportion cell.
+
+    Small-cell rules (n < 11 -> "<11") are applied to BOTH sides of the split, so that a hidden cell cannot be
+    recovered by subtraction:
+
+    * ``den < 11`` or ``num < 11``: ``n_pass`` and ``proportion`` are "<11" (``n_total`` is "<11" only if den < 11);
+    * fewer than 11 FAILURES (``den - num < 11``): the pass count is reported as a lower bound ``">=den-10"`` and the
+      proportion as the floored lower bound ``">=0.9998"`` (the failure count is "<11" and stays hidden). The earlier
+      code printed "<11" for the pass count here, which read as "almost nobody passes" at a site where nearly all
+      records pass (a near-perfect site looked like the worst one, inconsistent with the overall row);
+    * otherwise exact.
+    """
+    num, den = int(num), int(den)
+    total = suppress_count(den)
+    if den < SUPPRESS_BELOW or num < SUPPRESS_BELOW:
+        return {"n_pass": SUPPRESSED, "n_total": total, "proportion": SUPPRESSED}
+    if den - num < SUPPRESS_BELOW:
+        lo = den - SUPPRESS_BELOW + 1
+        return {"n_pass": f">={lo}", "n_total": total, "proportion": f">={math.floor(lo / den * 1e4) / 1e4:.4f}"}
+    return {"n_pass": num, "n_total": total, "proportion": round(num / den, 4)}
+
+
 def prop_block(flags: pd.Series, sites: pd.Series) -> tuple[dict, float]:
-    """Suppressed overall + per-site proportion block, plus the raw overall proportion."""
+    """Suppressed overall + per-site proportion block (``pass_cell``), plus the raw overall proportion.
+
+    Overall and per-site cells are built by the same function from the same boolean flags, so per-site pass counts
+    add up to the overall pass count (exactly where unsuppressed; within the suppression bounds elsewhere)."""
     flags = flags.astype(bool).reset_index(drop=True)
     sites = sites.reset_index(drop=True)
 
     def one(f: pd.Series) -> dict:
-        num, den = int(f.sum()), int(len(f))
-        prop = suppress_proportion(num, den)
-        # if the proportion is suppressed, the pass count is too (else den - num leaks)
-        return {"n_pass": SUPPRESSED if prop == SUPPRESSED else num,
-                "n_total": suppress_count(den), "proportion": prop}
+        return pass_cell(int(f.sum()), int(len(f)))
 
-    by_site = {str(s): one(flags[sites == s]) for s in sorted(sites.unique())}
+    by_site = {str(s): one(flags[sites == s]) for s in sorted(sites.dropna().unique())}
     raw = float(flags.mean()) if len(flags) else float("nan")
     return {"overall": one(flags), "by_site": by_site}, raw
 
@@ -599,32 +665,87 @@ def _row(field, needed, criterion, fallback, stop, observed, passed, extra=None)
 
 
 # ---------------------------------------------------------------- date shift
-def _alignment(cands, tables):
-    """Per-candidate: does any ancillary table sit far from the EEG start?"""
-    t0 = cands.set_index("person_id")["t0"]
-    spec = {"notes": ("omop_note", "note_datetime"),
-            "labs": ("omop_measurement", "measurement_datetime"),
-            "imaging": ("imaging", "study_datetime"),
-            "medications": ("omop_drug_exposure", "drug_exposure_start_datetime")}
-    mis = pd.Series(False, index=t0.index)
-    has = pd.Series(False, index=t0.index)
-    per_table = {}
-    for name, (tbl, col) in spec.items():
-        df = tables.get(tbl)
-        if df is None or col not in df or not len(df):
-            per_table[name] = (0, 0)
+def _site_alignment(cands: pd.DataFrame, gaps: pd.DataFrame) -> tuple[dict, pd.Series, dict]:
+    """Per-site nearest-event alignment report (aggregate-only) from the per-candidate gap frame.
+
+    Returns ``(by_site detail, within_24h flags per candidate, gate info)``. Whole-day gap = trunc(hours / 24)."""
+    g = gaps.reindex(cands["person_id"].to_numpy("int64"))
+    near = al.nearest_overall(g).to_numpy()
+    sites = cands["SiteID"].astype(str).to_numpy()
+    detail, evaluated, failed = {}, [], []
+    for s_ in sorted(set(sites)):
+        m = sites == s_
+        n = int(m.sum())
+        gm, nr = g[m], near[m]
+        has = ~np.isnan(nr)
+        w24 = has & (np.abs(nr) <= ALIGN_WINDOW_H)
+        w72 = has & (np.abs(nr) <= ALIGN_WIDE_H)
+        days = pd.Series(al.whole_days(pd.Series(nr)))
+        vc = days.dropna().astype(int).value_counts().head(5)
+        peaks = al.day_peaks(days, n, DAY_MODE_MAX_SHARE)
+        cov = gm["cov_off_days"].notna().to_numpy()
+        off, ln = gm["cov_off_days"].to_numpy(), gm["cov_len_days"].to_numpy()
+        inr = cov & (off >= 0) & (off <= ln)
+        has_clinical = bool(has.any())
+        share24 = float(w24.sum() / n) if n else float("nan")
+        site_pass = has_clinical and share24 >= ALIGN_MIN_SHARE and not peaks
+        if has_clinical:
+            evaluated.append(s_)
+            if not site_pass:
+                failed.append(s_)
+        detail[s_] = {
+            "n_candidates": suppress_count(n),
+            "has_clinical_data": has_clinical,
+            "candidates_with_any_event": pass_cell(int(has.sum()), n),
+            "nearest_event_within_24h": pass_cell(int(w24.sum()), n),
+            "nearest_event_within_72h": pass_cell(int(w72.sum()), n),
+            "nearest_gap_hours_signed": safe_quantiles(nr[has]),
+            "nearest_gap_hours_abs": safe_quantiles(np.abs(nr[has])),
+            "per_table_within_24h": {
+                src: pass_cell(int((gm[f"gap_h_{src}"].abs() <= ALIGN_WINDOW_H).sum()), n)["proportion"]
+                for src in al.GAP_SOURCES},
+            "per_table_nearest_gap_hours_q": {
+                src: safe_quantiles(gm[f"gap_h_{src}"].dropna().to_numpy()) for src in al.GAP_SOURCES},
+            "whole_day_gap_top5": [{"day": int(d), "n": suppress_count(c),
+                                    "share": pass_cell(int(c), n)["proportion"]} for d, c in vc.items()],
+            "nonzero_day_modes_over_5pct": peaks,
+            "shift_detection": {
+                "candidates_with_covering_visit": suppress_count(int(cov.sum())),
+                "eeg_date_in_visit_date_range": pass_cell(int(inr.sum()), int(cov.sum()))["proportion"],
+                "eeg_date_before_visit_start_date": pass_cell(int((cov & (off < 0)).sum()), int(cov.sum()))["proportion"],
+                "eeg_date_after_visit_end_date": pass_cell(int((cov & (off > ln)).sum()), int(cov.sum()))["proportion"],
+                "eeg_date_minus_visit_start_date_days": safe_quantiles(off[cov])},
+            "site_gate": "PASS" if site_pass else ("FAIL" if has_clinical else "not evaluated (no clinical data)"),
+        }
+    flags = pd.Series(np.isfinite(near) & (np.abs(near) <= ALIGN_WINDOW_H), index=cands.index)
+    return detail, flags, {"evaluated": evaluated, "failed": failed}
+
+
+def _ordering_secondary(tables, gaps: pd.DataFrame, order: pd.DataFrame, cands: pd.DataFrame) -> dict:
+    """SECONDARY counts (not the gate). Violations, precisely:
+
+    * ``rows_before_birth``: an ancillary row (visit start, measurement, observation, note, drug exposure, condition)
+      timed before the patient's birth (``birth_datetime``, else 1 January of ``year_of_birth``);
+    * ``rows_after_death``: a row timed more than 24 h after the death time (``death_datetime``, else the end of
+      ``death_date``); a missing death row is not survival, so it is never counted;
+    * ``eeg_before_first_visit``: candidates whose EEG start is more than 24 h BEFORE the start of their earliest visit;
+    * ``within_record_end_before_start``: end < start within one record (EEG start/end, drug start/end, imaging)."""
+    rows = {}
+    for src in al.GAP_SOURCES:
+        if src == "visit_end" or src not in order.index:
             continue
-        d = df[["person_id", col]].dropna()
-        if name == "labs" and "kind" in df:
-            d = df.loc[df["kind"] == "lab", ["person_id", col]].dropna()
-        d = d[d["person_id"].isin(t0.index)].copy()
-        d["off"] = ((d[col] - d["person_id"].map(t0)).dt.total_seconds().abs() / 86400.0)
-        med = d.groupby("person_id")["off"].median()
-        bad = med > MISALIGN_DAYS
-        per_table[name] = (int(bad.sum()), int(len(med)))
-        mis.loc[med.index[bad]] = True
-        has.loc[med.index] = True
-    return mis[has], per_table
+        n_rows, nb, nd = (int(order.loc[src, c]) for c in ("n_rows", "n_before_birth", "n_after_death"))
+        rows[src] = {"n_rows": suppress_count(n_rows), "n_before_birth": suppress_count(nb),
+                     "n_after_death_plus_24h": suppress_count(nd)}
+    fv = gaps["first_visit_gap_h"].reindex(cands["person_id"].to_numpy("int64"))
+    n_v = int(fv.notna().sum())
+    n_bad = int((fv > al.FIRST_VISIT_TOL_H).sum())
+    mono, _, mono_n, mono_bad = _monotonicity(tables)
+    return {"rows_by_source": rows,
+            "eeg_before_first_visit": {"n_candidates_with_a_visit": suppress_count(n_v),
+                                       "n_violations": suppress_count(n_bad)},
+            "within_record_end_before_start": mono,
+            "within_record_total": {"n_pairs": suppress_count(mono_n), "n_violations": suppress_count(mono_bad)}}
 
 
 def _monotonicity(tables):
@@ -674,33 +795,38 @@ def run_audit(tables: dict[str, pd.DataFrame], seed: int = 0, handcheck_n: int =
                      blk, raw >= 0.95, {"observed_text": _fmt(blk) + note1,
                                         "acute_care_filter_applied": have_class}))
 
-    # 2. Date-shift consistency (automated part + human hand-check sample)
-    mis, per_table = _alignment(cands, tables)
-    n_mis, n_has = int(mis.sum()), int(len(mis))
-    mono, mono_rate, mono_n, mono_bad = _monotonicity(tables)
-    mis_rate = n_mis / n_has if n_has else float("nan")
-    mis_blk, _ = prop_block(~mis, site_of.loc[mis.index])
-    mis_by_site = {s: suppress_proportion(int((mis & (site_of.loc[mis.index] == s)).sum()),
-                                          int((site_of.loc[mis.index] == s).sum()))
-                   for s in sorted(site_of.unique())}
-    passed = (mis_rate <= MISALIGN_MAX_RATE) and (mono_rate <= MONOTONIC_MAX_RATE)
+    # 2. Date-shift consistency (D-117): nearest-event alignment + shift detection; human hand-check sample separately.
+    gaps = tables.get("alignment_gaps")
+    order = tables.get("alignment_order")
+    if gaps is None:
+        gaps, order = al.alignment_from_frames(cands, tables)
+    if order is None:
+        order = pd.DataFrame(columns=["n_rows", "n_before_birth", "n_after_death"])
+    detail, w24_flags, gate = _site_alignment(cands, gaps)
+    blk24, _ = prop_block(w24_flags, cands["SiteID"].astype(str))
+    w72 = al.nearest_overall(gaps.reindex(cands["person_id"].to_numpy("int64"))).abs() <= ALIGN_WIDE_H
+    blk72, _ = prop_block(pd.Series(w72.to_numpy(), index=cands.index), cands["SiteID"].astype(str))
+    secondary = _ordering_secondary(tables, gaps, order, cands)
+    passed = bool(gate["evaluated"]) and not gate["failed"]
+    modes = {s_: d["nonzero_day_modes_over_5pct"] for s_, d in detail.items() if d["nonzero_day_modes_over_5pct"]}
+    site_txt = ", ".join(f"{s_} {d['nearest_event_within_24h']['proportion'] if isinstance(d['nearest_event_within_24h']['proportion'], str) else format(d['nearest_event_within_24h']['proportion'], '.1%')}"
+                         for s_, d in detail.items() if d["has_clinical_data"])
     rows.append(_row(
         "Consistent within-patient date shift", "All timing logic",
-        "Note, lab and EEG times line up on 20 hand-checked cases "
-        f"(automated proxy: <= {MISALIGN_MAX_RATE:.0%} candidates with an ancillary table "
-        f"median > {MISALIGN_DAYS:.0f} d from EEG start; <= {MONOTONIC_MAX_RATE:.0%} ordering violations)",
+        "Note, lab and EEG times line up on 20 hand-checked cases (automated: at every Study 1 site with clinical data, "
+        f">= {ALIGN_MIN_SHARE:.0%} of candidates have an ancillary event (visit start/end, measurement, observation, "
+        f"note, drug exposure, condition) within +-{ALIGN_WINDOW_H:.0f} h of EEG start AND no non-zero whole-day "
+        f"nearest-gap mode holds > {DAY_MODE_MAX_SHARE:.0%} of the site's candidates; ordering violations are "
+        "reported as a secondary count, not the gate; D-117)",
         "Stop", True,
-        {"aligned": mis_blk, "misaligned_proportion_by_site": mis_by_site,
-         "misaligned_n": suppress_count(n_mis), "evaluated_n": suppress_count(n_has),
-         "misaligned_proportion": suppress_proportion(n_mis, n_has),
-         "tables_flagged": {k: {"n_flagged": suppress_count(a), "n_evaluated": suppress_count(b)}
-                            for k, (a, b) in per_table.items()},
-         "monotonicity": mono},
+        {"within_24h": blk24, "within_72h": blk72, "by_site_detail": detail,
+         "sites_evaluated": gate["evaluated"], "sites_failed": gate["failed"],
+         "nonzero_day_modes_by_site": modes,
+         "ordering_violations_secondary": secondary},
         passed,
-        {"observed_text": (f"misaligned {suppress_proportion(n_mis, n_has)} of "
-                           f"{suppress_count(n_has)} candidates; ordering violations "
-                           f"{SUPPRESSED if mono_bad < 11 else format(mono_bad / mono_n, '.2%')} of {suppress_count(mono_n)} pairs"
-                           if mono_n else "n/a"),
+        {"observed_text": (f"nearest event within +-24 h: {site_txt or 'no site with clinical data'}; "
+                           f"non-zero day modes >5%: {modes or 'none'}; "
+                           f"sites failing: {gate['failed'] or 'none'}"),
          "human_check_pending": True,
          "human_check_note": (f"{handcheck_n}-case sampling list written to a local file only; "
                               "a human must confirm note/lab/EEG times line up. Automated checks "
@@ -924,9 +1050,10 @@ def to_markdown(report: dict) -> str:
         if isinstance(obs, dict) and "by_site" in obs:
             for s, b in obs["by_site"].items():
                 L.append(f"| {r['field']} | {s} | {b['n_pass']}/{b['n_total']} | {b['proportion']} |")
-        elif isinstance(obs, dict) and "aligned" in obs:
-            for s, b in obs["aligned"]["by_site"].items():
-                L.append(f"| {r['field']} (aligned) | {s} | {b['n_pass']}/{b['n_total']} | {b['proportion']} |")
+        elif isinstance(obs, dict) and "within_24h" in obs:
+            for key, lab in (("within_24h", "nearest event within +-24 h"), ("within_72h", "nearest event within +-72 h")):
+                for s, b in obs[key]["by_site"].items():
+                    L.append(f"| {r['field']} ({lab}) | {s} | {b['n_pass']}/{b['n_total']} | {b['proportion']} |")
         elif isinstance(obs, dict) and "candidates_per_site" in obs:
             for s, n in obs["candidates_per_site"].items():
                 L.append(f"| {r['field']} (candidates) | {s} | {n} | |")
@@ -937,10 +1064,38 @@ def to_markdown(report: dict) -> str:
             L += _detail_lines(r["details"])
             L.append("")
     ds = next(r for r in report["rows"] if r["field"].startswith("Consistent"))
-    L += ["", "## Date-shift detail", "",
-          "| Check | n pairs | violations | rate |", "|---|---|---|---|"]
-    for k, v in ds["observed"]["monotonicity"].items():
-        L.append(f"| {k} | {v['n_pairs']} | {v['n_violations']} | {v['rate']} |")
+    L += ["", "## Date-shift detail (nearest-event alignment, D-117)", "",
+          f"Sites evaluated: {', '.join(ds['observed']['sites_evaluated']) or 'none'}; failing: "
+          f"{', '.join(ds['observed']['sites_failed']) or 'none'}. Whole-day gap = trunc(hours / 24); day 0 is within "
+          "+-24 h.", "",
+          "| Site | Gate | Candidates | Any event | Within 24 h | Within 72 h | Gap h q10/q25/q50/q75/q90 (signed) | "
+          "Top-5 whole-day gaps (day: n) | Non-zero day modes > 5% |", "|---|---|---|---|---|---|---|---|---|"]
+    for s_, d in ds["observed"]["by_site_detail"].items():
+        q = d["nearest_gap_hours_signed"]
+        top = ", ".join(f"{t['day']}: {t['n']}" for t in d["whole_day_gap_top5"]) or "n/a"
+        L.append(f"| {s_} | {d['site_gate']} | {d['n_candidates']} | {d['candidates_with_any_event']['proportion']} | "
+                 f"{d['nearest_event_within_24h']['proportion']} | {d['nearest_event_within_72h']['proportion']} | "
+                 f"{'/'.join(str(q[k]) for k in sorted(q))} | {top} | "
+                 f"{d['nonzero_day_modes_over_5pct'] or 'none'} |")
+    L += ["", "### Shift detection (candidates with a covering visit: EEG date minus visit start date, days)", "",
+          "| Site | With covering visit | EEG date within [start, end] | Before start date | After end date | "
+          "q10/q25/q50/q75/q90 |", "|---|---|---|---|---|---|"]
+    for s_, d in ds["observed"]["by_site_detail"].items():
+        sd = d["shift_detection"]
+        q = sd["eeg_date_minus_visit_start_date_days"]
+        L.append(f"| {s_} | {sd['candidates_with_covering_visit']} | {sd['eeg_date_in_visit_date_range']} | "
+                 f"{sd['eeg_date_before_visit_start_date']} | {sd['eeg_date_after_visit_end_date']} | "
+                 f"{'/'.join(str(q[k]) for k in sorted(q))} |")
+    sec = ds["observed"]["ordering_violations_secondary"]
+    L += ["", "### Ordering violations (SECONDARY counts, not the gate)", "",
+          "| Check | n | violations |", "|---|---|---|"]
+    for src, v in sec["rows_by_source"].items():
+        L.append(f"| {src}: row before birth | {v['n_rows']} | {v['n_before_birth']} |")
+        L.append(f"| {src}: row more than 24 h after death | {v['n_rows']} | {v['n_after_death_plus_24h']} |")
+    e = sec["eeg_before_first_visit"]
+    L.append(f"| EEG start > 24 h before the earliest visit start | {e['n_candidates_with_a_visit']} | {e['n_violations']} |")
+    for k, v in sec["within_record_end_before_start"].items():
+        L.append(f"| {k} (end before start) | {v['n_pairs']} | {v['n_violations']} |")
     L += ["", f"Human hand-check: {ds['human_check_note']}", "",
           "## Verdict", "",
           f"- Stop rows (automated): {'all pass' if report['gate_0a_automated_stop_rows_pass'] else 'FAILED: ' + '; '.join(report['stop_rows_failed'])}",

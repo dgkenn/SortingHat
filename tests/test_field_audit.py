@@ -67,27 +67,125 @@ def test_start_time_comes_from_findings_and_pid_from_bids_folder(synth, analytic
     assert set(eeg["person_id"]) == set(synth[0]["omop_person"]["person_id"])
 
 
-def test_date_shift_check_detects_injection(synth, analytic):
-    _, truth = synth
-    report, _ = run_audit(analytic)
-    ds = next(r for r in report["rows"] if r["field"].startswith("Consistent"))
-    cands = set(build_candidates(analytic["eeg_metadata"])["person_id"])
-    injected = len(cands & set(truth["table_shift_ids"]))
-    assert injected > 30
-    rate = ds["observed"]["misaligned_proportion"]
-    assert rate != "<11"
-    assert rate == pytest.approx(injected / ds["observed"]["evaluated_n"], rel=0.25)
+SHIFT_TABLES = ("omop_visit_occurrence", "omop_measurement", "omop_observation", "omop_note", "omop_drug_exposure",
+                "omop_condition_occurrence")
 
 
-def test_monotonicity_violation_detected(analytic):
-    tables = _copy(analytic)
-    dx = tables["omop_drug_exposure"]
+def _shift_site(raw, analytic, site, days, tables=SHIFT_TABLES):
+    """Raw-table copy with every time column of ``tables`` shifted by ``days`` for the patients of ``site``."""
+    out = _copy(raw)
+    eeg = analytic["eeg_metadata"]
+    pids = set(eeg.loc[eeg["SiteID"] == site, "person_id"].dropna().astype(int))
+    for t in tables:
+        d = out[t]
+        m = d["person_id"].isin(pids)
+        for c in d.columns:
+            if pd.api.types.is_datetime64_any_dtype(d[c]):
+                d.loc[m, c] = d.loc[m, c] + pd.Timedelta(days=days)
+    return out
+
+
+def _ds(report):
+    return next(r for r in report["rows"] if r["field"].startswith("Consistent"))
+
+
+def test_date_shift_gate_passes_on_aligned_synthetic_data(synth):
+    ds = _ds(run_audit(synth[0])[0])
+    o = ds["observed"]
+    assert ds["passed"] and not o["sites_failed"] and not o["nonzero_day_modes_by_site"]
+    assert set(o["sites_evaluated"]) == {"I0002", "I0003", "S0001", "S0002"}
+    big = o["by_site_detail"]["S0001"]
+    assert big["nearest_event_within_24h"]["n_pass"] != "<11"
+    assert big["whole_day_gap_top5"][0]["day"] == 0
+    sd = big["shift_detection"]
+    assert sd["eeg_date_minus_visit_start_date_days"]["q50"] == 0          # EEG date inside the covering visit
+    assert "per_table_within_24h" in big and set(big["per_table_within_24h"]) >= {"note", "measurement", "condition"}
+
+
+def test_date_shift_gate_detects_a_site_level_constant_offset(synth, analytic):
+    report, _ = run_audit(_shift_site(synth[0], analytic, "S0001", 10))
+    ds = _ds(report)
+    o = ds["observed"]
+    assert not ds["passed"] and "Consistent within-patient date shift" in report["stop_rows_failed"]
+    assert report["gate_0a_automated_stop_rows_pass"] is False
+    assert o["sites_failed"] == ["S0001"]
+    assert o["nonzero_day_modes_by_site"]["S0001"] and set(o["nonzero_day_modes_by_site"]["S0001"]) <= {6, 7, 8, 9, 10}  # 10 d minus the +-2 d spread of the synthetic EHR
+    top = o["by_site_detail"]["S0001"]["whole_day_gap_top5"]
+    assert len(top) <= 5 and top[0]["day"] in (6, 7, 8, 9) and top[0]["n"] != "<11"
+    for other in ("I0003", "S0002"):                                        # the other sites are untouched
+        assert o["by_site_detail"][other]["site_gate"] == "PASS"
+    sd = o["by_site_detail"]["S0001"]["shift_detection"]                    # visits shifted 10 d: none covers the EEG now
+    assert sd["candidates_with_covering_visit"] == "<11"
+    assert o["by_site_detail"]["S0002"]["shift_detection"]["candidates_with_covering_visit"] != "<11"
+
+
+def test_date_shift_gate_fails_when_too_few_candidates_have_a_nearby_event(synth, analytic):
+    # a 40-day offset in EVERY ancillary table at one site: no event within +-24 h, and the gap mode is far from 0
+    report, _ = run_audit(_shift_site(synth[0], analytic, "I0003", 40))
+    o = _ds(report)["observed"]
+    assert "I0003" in o["sites_failed"] and o["by_site_detail"]["I0003"]["site_gate"] == "FAIL"
+    assert o["by_site_detail"]["I0003"]["nearest_event_within_24h"]["proportion"] in ("<11",) or \
+        float(str(o["by_site_detail"]["I0003"]["nearest_event_within_24h"]["proportion"]).lstrip(">=")) < 0.5
+
+
+def test_one_shifted_table_is_reported_per_table_but_does_not_fail_the_gate(synth, analytic):
+    # the gate asks whether SOME event is near the EEG; one table off by 100 d is visible per table, not a gate failure
+    report, _ = run_audit(_shift_site(synth[0], analytic, "S0001", 100, tables=("omop_note",)))
+    ds = _ds(report)
+    assert ds["passed"]
+    pt = ds["observed"]["by_site_detail"]["S0001"]["per_table_within_24h"]
+    assert pt["note"] == "<11" or float(str(pt["note"]).lstrip(">=")) < 0.2
+    assert pt["measurement"] != "<11" and float(str(pt["measurement"]).lstrip(">=")) > 0.9
+
+
+def test_old_median_proxy_is_gone(synth):
+    ds = _ds(run_audit(synth[0])[0])
+    assert "misaligned_proportion" not in ds["observed"] and "median" not in ds["pass_criterion"]
+    assert "+-24 h" in ds["pass_criterion"] and "80%" in ds["pass_criterion"]
+
+
+def test_day_modes_are_peaks_not_the_natural_tail():
+    from sortinghat.audit.alignment import day_peaks
+    natural = pd.Series([0] * 800 + [1] * 120 + [2] * 40 + [-1] * 40)        # 12% on day 1 beside a dominant day 0
+    assert day_peaks(natural, 1000, 0.05) == []
+    shifted = pd.Series([3] * 600 + [4] * 250 + [0] * 100 + [1] * 50)
+    assert day_peaks(shifted, 1000, 0.05) == [3]
+
+
+def test_ordering_violations_are_secondary_and_precisely_defined(synth, analytic):
+    raw = _copy(synth[0])
+    eeg = analytic["eeg_metadata"]
+    pids = sorted(set(eeg["person_id"].dropna().astype(int)))[:600]
+    note, per, death = raw["omop_note"], raw["omop_person"], raw["omop_death"]
+    # birth AFTER every event of the first 300 patients
+    sel = per["person_id"].isin(pids[:300])
+    per.loc[sel, "birth_datetime"] = pd.Timestamp("2200-01-01")
+    # death 30 days BEFORE the notes of the next 300 patients (more than 24 h => counted)
+    nxt = pids[300:600]
+    first_note = note[note["person_id"].isin(nxt)].groupby("person_id")["note_datetime"].min()
+    newd = pd.DataFrame({"person_id": first_note.index, "death_datetime": first_note.values - pd.Timedelta(days=30),
+                         "death_date": pd.NaT, "cause_source_value": None})
+    raw["omop_death"] = pd.concat([death, newd], ignore_index=True)
+    report, _ = run_audit(raw)
+    ds = _ds(report)
+    sec = ds["observed"]["ordering_violations_secondary"]
+    assert sec["rows_by_source"]["note"]["n_before_birth"] != "<11"
+    assert sec["rows_by_source"]["measurement"]["n_before_birth"] != "<11"
+    assert sec["rows_by_source"]["note"]["n_after_death_plus_24h"] != "<11"
+    assert ds["passed"]                                                       # secondary: never the gate
+    base = _ds(run_audit(synth[0])[0])["observed"]["ordering_violations_secondary"]["rows_by_source"]["note"]
+    assert base["n_before_birth"] == "<11"
+
+
+def test_monotonicity_violation_detected_as_secondary_count(synth):
+    raw = _copy(synth[0])
+    dx = raw["omop_drug_exposure"]
     idx = dx.index[dx["drug_exposure_end_datetime"].notna()][:400]
     dx.loc[idx, "drug_exposure_end_datetime"] = dx.loc[idx, "drug_exposure_start_datetime"] - pd.Timedelta(hours=1)
-    report, _ = run_audit(tables)
-    ds = next(r for r in report["rows"] if r["field"].startswith("Consistent"))
-    assert ds["observed"]["monotonicity"]["drug_start_before_end"]["n_violations"] != "<11"
-    assert not ds["passed"]
+    ds = _ds(run_audit(raw)[0])
+    v = ds["observed"]["ordering_violations_secondary"]["within_record_end_before_start"]
+    assert v["drug_start_before_end"]["n_violations"] != "<11"
+    assert ds["passed"]                                                       # ordering is reported, not the gate
 
 
 def test_lab_result_time_passes_only_with_a_result_column(analytic):
@@ -495,3 +593,75 @@ def test_loader_applies_the_patient_merge_map(synth_dir, tmp_path):
                   "BDSPLastModifiedDTS": ["2020-01-01"]}).to_csv(d / "PatientMergeHistory" / "m.csv", index=False)
     merged = field_audit.load_audit_tables(data_io.LocalStore(d))["eeg_metadata"]
     assert b not in set(merged["person_id"]) and a in set(merged["person_id"])
+
+
+# ---------------------------------------------------------------- per-site pass counts add up to the overall (bug B)
+def test_pass_cell_never_hides_a_near_perfect_site():
+    from sortinghat.audit.field_audit import pass_cell
+    c = pass_cell(50925, 50931)                      # 6 failures: used to print "<11/50931" and read as "all fail"
+    assert c["n_pass"] == ">=50921" and c["proportion"] == ">=0.9998" and c["n_total"] == 50931
+    assert pass_cell(50900, 50931)["n_pass"] == 50900                       # 31 failures: exact
+    assert pass_cell(5, 50931) == {"n_pass": "<11", "n_total": 50931, "proportion": "<11"}
+    assert pass_cell(5, 8) == {"n_pass": "<11", "n_total": "<11", "proportion": "<11"}
+    assert pass_cell(50931, 50931)["proportion"] == ">=0.9998"              # 0 failures: still bounded, never "<11"
+
+
+def _bounds(cell):
+    """(lo, hi) of the true pass count implied by a suppressed cell."""
+    v, tot = cell["n_pass"], cell["n_total"]
+    if isinstance(v, int):
+        return v, v
+    if v == "<11":
+        return 0, 10
+    return int(v[2:]), int(tot)
+
+
+def _check_rows_add_up(report):
+    checked = 0
+    for r in report["rows"]:
+        blocks = []
+        o = r["observed"]
+        if isinstance(o, dict) and "by_site" in o:
+            blocks.append(o)
+        if isinstance(o, dict) and "within_24h" in o:
+            blocks += [o["within_24h"], o["within_72h"]]
+        for blk in blocks:
+            overall = blk["overall"]
+            if overall["n_total"] == "<11":
+                continue
+            lo_o, hi_o = _bounds(overall)
+            parts = [_bounds(b) for b in blk["by_site"].values()]
+            lo, hi = sum(p[0] for p in parts), sum(p[1] for p in parts)
+            assert lo <= hi_o and lo_o <= hi, (r["field"], overall, blk["by_site"])
+            if all(p[0] == p[1] for p in parts) and lo_o == hi_o:
+                assert lo == lo_o, (r["field"], overall, blk["by_site"])       # all exact: must be equal
+            tot = [b["n_total"] for b in blk["by_site"].values()]
+            if all(isinstance(t, int) for t in tot):
+                assert sum(tot) == overall["n_total"], r["field"]
+            checked += 1
+    return checked
+
+
+def test_per_site_pass_counts_add_up_to_the_overall_pass_count_for_every_row(synth, analytic):
+    report, _ = run_audit(synth[0])
+    assert _check_rows_add_up(report) >= 7                  # start, shift x2, medication, imaging, scores, notes
+    tables = _copy(analytic)                                # and with a lab result column (the lab row has a by-site block)
+    m = tables["omop_measurement"]
+    m["measurement_result_datetime"] = m["measurement_datetime"] + pd.Timedelta(minutes=30)
+    rep2, _ = run_audit(tables)
+    assert any(r["field"].startswith("Lab result") and "by_site" in r["observed"] for r in rep2["rows"])
+    assert _check_rows_add_up(rep2) >= 8
+
+
+def test_start_time_row_per_site_matches_overall_exactly_on_a_large_synthetic_set():
+    from sortinghat.synthetic import generate
+    tables, _ = generate(12000, seed=7)
+    report, _ = run_audit(tables)
+    blk = report["rows"][0]["observed"]
+    exact = [b for b in blk["by_site"].values() if isinstance(b["n_pass"], int)]
+    assert exact, blk
+    for b in blk["by_site"].values():                       # no site with a high pass rate reads "<11"
+        assert not (b["n_pass"] == "<11" and isinstance(b["n_total"], int) and b["n_total"] > 50 and b["proportion"] == "<11"
+                    and b["n_total"] >= 200), b
+    if all(isinstance(b["n_pass"], int) for b in blk["by_site"].values()):
+        assert sum(b["n_pass"] for b in blk["by_site"].values()) == blk["overall"]["n_pass"]

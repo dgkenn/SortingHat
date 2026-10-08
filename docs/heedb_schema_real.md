@@ -299,4 +299,4 @@ Also seen: value_as_number, unit_source_value (mixed units possible), measuremen
    burst-suppression cohort), so "no death row" is not survival; temperature units mix F and C; time-shifted
    dates were consistent enough across tables for minute-level EEG-to-measurement joins in
    `heedb_command_following.py::build_worklist`, but cross-table date alignment should still be checked
-   (`field_audit`'s `MISALIGN_DAYS` check).
+   (`field_audit`'s nearest-event alignment check, D-117).
