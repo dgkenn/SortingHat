@@ -13,4 +13,8 @@ start() {  # $1 script, $2 completion marker in the log
 start overnight_finish.sh   "driver done"
 start overnight_stage2.sh   "stage2 done"
 start overnight_stage3b.sh  "stage3b done"
+# keep the in-container watchdog alive (it calls this script every 2 min)
+if ! ps -eo args | grep -qE "^(/bin/)?bash scripts/watchdog.sh\$" && ! grep -q "watchdog: all stages done" "$LOG" 2>/dev/null; then
+  (setsid nohup scripts/watchdog.sh > /dev/null 2>&1 < /dev/null &)
+fi
 exit 0
