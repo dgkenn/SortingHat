@@ -23,7 +23,10 @@ cohort / feature join uses t0 = metadata start + onset_offset_s; stdout carries 
 file-start windows.
 
 Resumable: parts (``part-*.parquet``) and ledgers (``ledger-*.csv``) in ``--out-dir`` list finished recordings;
-a rerun skips recordings that succeeded or failed permanently (``--retry-permanent`` retries those too).
+a rerun skips recordings that succeeded or failed permanently (``--retry-permanent`` retries those too;
+``--retry-reason not_found`` retries only the ledger's not_found entries).
+A key that is not found falls back to ``data_io.resolve_edf_key`` from BidsFolder/SessionID/SiteID/EEGFolder, also when
+the input supplies ``edf_key`` (keep those columns alongside it).
 Run one process per shard for parallelism. A crash between the part write and the ledger write can duplicate a
 recording's rows; readers should drop duplicates on (recording_id, window).
 """
@@ -74,8 +77,8 @@ def load_recordings(path: Path) -> list[tuple[str, str]]:
 
 def load_recordings_with_parts(path: Path) -> list[tuple[str, str, tuple | None]]:
     """(recording_id, key, bids parts) triples, de-duplicated on recording_id. ``parts`` is
-    ``(site, BidsFolder, SessionID, EEGFolder)`` when the key was BUILT from BidsFolder columns (so a missing key can
-    be re-resolved by ``data_io.resolve_edf_key``), else ``None``. Never printed."""
+    ``(site, BidsFolder, SessionID, EEGFolder)`` whenever those columns are present (also alongside a supplied
+    ``edf_key``), so a missing key can be re-resolved by ``data_io.resolve_edf_key``; else ``None``. Never printed."""
     suf = path.suffix.lower()
     if suf == ".parquet":
         df = pd.read_parquet(path)
@@ -85,18 +88,21 @@ def load_recordings_with_parts(path: Path) -> list[tuple[str, str, tuple | None]
         keys = [ln.strip() for ln in path.read_text().splitlines() if ln.strip()]
         df = pd.DataFrame({"edf_key": keys})
     kc = next((c for c in KEY_COLS if c in df.columns), None)
+    site_col = next((c for c in ("SiteID", "site", "Site") if c in df.columns), None)
+    have_parts = {"BidsFolder", "SessionID"} <= set(df.columns) and site_col is not None
     parts: list = [None] * len(df)
+    if have_parts:                       # carried even when an edf_key column is present (not_found fallback needs them)
+        eeg = df["EEGFolder"] if "EEGFolder" in df.columns else pd.Series([None] * len(df), index=df.index)
+        parts = [None if (pd.isna(s) or pd.isna(b) or pd.isna(i)) else
+                 (str(s), str(b), str(i), None if pd.isna(e) else str(e))
+                 for s, b, i, e in zip(df[site_col], df["BidsFolder"], df["SessionID"], eeg)]
     if kc is not None:
         keys = df[kc].astype(str)
-    elif {"BidsFolder", "SessionID"} <= set(df.columns):
+    elif have_parts:
         from sortinghat.data_io import bids_edf_key
-        site_col = next((c for c in ("SiteID", "site", "Site") if c in df.columns), None)
-        if site_col is None:
-            raise SystemExit("input needs a site column (SiteID / site) to build keys from BidsFolder")
-        eeg = df["EEGFolder"] if "EEGFolder" in df.columns else pd.Series([None] * len(df))
-        parts = [(str(s), str(b), str(i), None if pd.isna(e) else str(e))
-                 for s, b, i, e in zip(df[site_col], df["BidsFolder"], df["SessionID"], eeg)]
-        keys = pd.Series([bids_edf_key(*p) for p in parts])      # == data_io.edf_key_for_row on the same cells (cohort key list)
+        keys = pd.Series([bids_edf_key(*p) if p is not None else "" for p in parts])   # == data_io.edf_key_for_row
+    elif {"BidsFolder", "SessionID"} <= set(df.columns):
+        raise SystemExit("input needs a site column (SiteID / site) to build keys from BidsFolder")
     else:
         raise SystemExit("input needs an edf_key/key column, or BidsFolder + SessionID + a site column")
     ids = df["recording_id"].astype(str) if "recording_id" in df.columns else keys.map(opaque_id)
@@ -108,8 +114,19 @@ def load_recordings_with_parts(path: Path) -> list[tuple[str, str, tuple | None]
     return out
 
 
-def load_done(out_dir: Path, retry_permanent: bool) -> set[str]:
-    """Recording IDs that need no further attempt (succeeded, or failed permanently)."""
+def load_failed_with(out_dir: Path, reasons) -> set[str]:
+    """Recording IDs whose ledger holds a failure with one of ``reasons`` (``--retry-reason``)."""
+    out: set[str] = set()
+    for p in out_dir.glob("ledger-*.csv"):
+        with open(p, newline="") as fh:
+            for row in csv.DictReader(fh):
+                if row.get("status") != "ok" and row.get("reason") in reasons:
+                    out.add(row["recording_id"])
+    return out
+
+
+def load_done(out_dir: Path, retry_permanent: bool, retry_reasons=()) -> set[str]:
+    """Recording IDs that need no further attempt (succeeded, or failed permanently except ``retry_reasons``)."""
     done: set[str] = set()
     for p in out_dir.glob("part-*.parquet"):
         try:
@@ -119,7 +136,8 @@ def load_done(out_dir: Path, retry_permanent: bool) -> set[str]:
     for p in out_dir.glob("ledger-*.csv"):
         with open(p, newline="") as fh:
             for row in csv.DictReader(fh):
-                if row.get("status") == "ok" or (not retry_permanent and row.get("reason") in FailureReason.PERMANENT):
+                if row.get("status") == "ok" or (not retry_permanent and row.get("reason") in FailureReason.PERMANENT
+                                                  and row.get("reason") not in retry_reasons):
                     done.add(row["recording_id"])
     return done
 
@@ -191,6 +209,9 @@ def main(argv=None, s3=None) -> int:
     ap.add_argument("--read-timeout", type=int, default=60, help="S3 socket read timeout, seconds")
     ap.add_argument("--profile", default=None)
     ap.add_argument("--retry-permanent", action="store_true")
+    ap.add_argument("--retry-reason", action="append", default=[], metavar="REASON",
+                    help="re-attempt ONLY recordings whose ledger failure reason is REASON (e.g. not_found; repeatable); "
+                    "other permanent failures stay skipped and never-attempted recordings are not run")
     ap.add_argument("--windows", default=None, help="comma-separated subset of primary,20s,1min,2min,5min,10min "
                     "(default all; the byte range fetched is the same up to the longest window requested)")
     ap.add_argument("--no-onset", action="store_true",
@@ -207,8 +228,14 @@ def main(argv=None, s3=None) -> int:
     os.chmod(out_dir, 0o700)
 
     recs = [(r, k, p) for r, k, p in load_recordings_with_parts(inp) if shard_of(r, args.of) == args.shard]
-    done = load_done(out_dir, args.retry_permanent)
+    bad = [r for r in args.retry_reason if r not in ALL_REASONS]
+    if bad:
+        raise SystemExit("--retry-reason must be one of " + ",".join(sorted(ALL_REASONS)))
+    done = load_done(out_dir, args.retry_permanent, set(args.retry_reason))
     todo = [(r, k, p) for r, k, p in recs if r not in done]
+    if args.retry_reason:
+        only = load_failed_with(out_dir, set(args.retry_reason))
+        todo = [(r, k, p) for r, k, p in todo if r in only]
     skipped = len(recs) - len(todo)
     if args.limit is not None:
         todo = todo[: args.limit]

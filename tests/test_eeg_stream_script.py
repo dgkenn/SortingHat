@@ -157,3 +157,67 @@ def test_not_found_documented_key_falls_back_to_own_folder_listing(tmp_path, mon
     assert "failure not_found: <11" in out and "sub-" not in out and "SYN" not in out and "run-01" not in out
     df = pd.concat([pd.read_parquet(p) for p in (lo / "f").glob("part-*.parquet")])
     assert df["recording_id"].nunique() == 12
+
+
+def _supplied_key_setup(tmp_path, monkeypatch, wrong_for):
+    from test_data_io_resilient import FlakyS3
+    import sortinghat.data_io as dio
+    monkeypatch.setattr(dio, "access_point", lambda name="credentialed": BUCKET)
+    blob = write_edf(tmp_path / "a.edf", generate_eeg(120, background="normal", seed=1), 200, CANONICAL_19).read_bytes()
+    objs, rows = {}, []
+    for i in range(12):
+        bf = f"sub-SYN{i:03d}"
+        real = f"EEG/bids/SYN/{bf}/ses-1/eeg/{bf}_ses-1_task-EEG_eeg.edf"
+        alt = f"EEG/bids/SYN/{bf}/ses-1/eeg/{bf}_ses-1_acq-x_run-02_eeg.edf"
+        objs[alt if i in wrong_for else real] = blob
+        rows.append({"SiteID": "SYN", "person_id": str(i), "SessionID": "1", "BidsFolder": bf, "EEGFolder": None,
+                     "edf_key": real})                               # supplied key == the documented one
+    lo = tmp_path / "local_only"
+    lo.mkdir()
+    pd.DataFrame(rows).to_csv(lo / "cohort.csv", index=False)
+    return lo, FlakyS3(objs, p=0.0)
+
+
+def test_supplied_edf_key_wrong_falls_back_to_own_folder(tmp_path, monkeypatch, capsys):
+    lo, s3 = _supplied_key_setup(tmp_path, monkeypatch, wrong_for=set(range(12)))
+    assert all(p is not None for _, _, p in xef.load_recordings_with_parts(lo / "cohort.csv"))
+    rc = xef.main(["--input", str(lo / "cohort.csv"), "--out-dir", str(lo / "f"), "--windows", "20s"], s3=s3)
+    out = capsys.readouterr().out
+    assert rc == 0 and "key fallback resolved via folder_listing: 12" in out and "failure not_found" not in out
+    assert "sub-" not in out and "SYN" not in out and "acq-x" not in out
+    df = pd.concat([pd.read_parquet(p) for p in (lo / "f").glob("part-*.parquet")])
+    assert df["recording_id"].nunique() == 12
+
+
+def test_supplied_edf_key_right_needs_no_fallback(tmp_path, monkeypatch, capsys):
+    lo, s3 = _supplied_key_setup(tmp_path, monkeypatch, wrong_for=set())
+    rc = xef.main(["--input", str(lo / "cohort.csv"), "--out-dir", str(lo / "f"), "--windows", "20s"], s3=s3)
+    out = capsys.readouterr().out
+    assert rc == 0 and "key fallback" not in out and "failure" not in out
+    assert not s3.lists                                                                  # no folder listing issued
+    df = pd.concat([pd.read_parquet(p) for p in (lo / "f").glob("part-*.parquet")])
+    assert df["recording_id"].nunique() == 12
+
+
+def test_retry_reason_not_found_only(tmp_path, monkeypatch, capsys):
+    lo, s3 = _supplied_key_setup(tmp_path, monkeypatch, wrong_for=set())
+    inp, od = str(lo / "cohort.csv"), lo / "f"
+    # first run with the objects hidden: everything fails not_found (and the folder listing finds nothing)
+    hidden, s3.objects = dict(s3.objects), {}
+    xef.main(["--input", inp, "--out-dir", str(od), "--windows", "20s"], s3=s3)
+    capsys.readouterr()
+    s3.objects = hidden
+    # a ledger line with another permanent reason must not be retried
+    led = next(od.glob("ledger-*.csv"))
+    df = pd.read_csv(led)
+    other = df["recording_id"].iloc[0]
+    df.loc[df["recording_id"] == other, "reason"] = "edf_header_invalid"
+    df.to_csv(led, index=False)
+    xef.main(["--input", inp, "--out-dir", str(od), "--windows", "20s"], s3=s3)          # plain rerun: all skipped
+    assert not list(od.glob("part-*.parquet"))
+    rc = xef.main(["--input", inp, "--out-dir", str(od), "--windows", "20s", "--retry-reason", "not_found"], s3=s3)
+    capsys.readouterr()
+    got = pd.concat([pd.read_parquet(p) for p in od.glob("part-*.parquet")])
+    assert rc == 0 and got["recording_id"].nunique() == 11 and other not in set(got["recording_id"])
+    with pytest.raises(SystemExit):
+        xef.main(["--input", inp, "--out-dir", str(od), "--retry-reason", "bogus"], s3=s3)
