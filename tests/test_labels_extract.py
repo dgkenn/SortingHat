@@ -102,7 +102,7 @@ def test_e5_glucose_unit_conversion_mmol_to_mgdl():
 def test_e5_ammonia_ug_dl_to_umol_l():
     assert one(lambda f, p: f.lab(p, -3, "AMMONIA, PLASMA", 300, "ug/dL"), "E5")[2] == ["E5_ammonia"]    # 176 umol/L (threshold 150)
     assert not one(lambda f, p: f.lab(p, -3, "AMMONIA, PLASMA", 100, "ug/dL"), "E5")[1]                  # 58.7 umol/L
-    assert one(lambda f, p: f.lab(p, -3, "AMMONIA, PLASMA", 120, "umol/L"), "E5")[1]
+    assert one(lambda f, p: f.lab(p, -3, "AMMONIA, PLASMA", 160, "umol/L"), "E5")[1]
 
 
 def test_unrecognised_or_missing_unit_never_fires():
@@ -583,7 +583,7 @@ def many_patients_fixture(n=30):
             fx.cond(i, -5, "I61.9")
         fx.visit(i, 1000 + i, -30, None)
     fx.concept(9001, "Ammonia", "Measurement", "LOINC", "16362-6")
-    fx.lab(1, -3, "mystery", 200, "ug/dL", cid=9001)
+    fx.lab(1, -3, "mystery", 300, "ug/dL", cid=9001)
     return fx
 
 

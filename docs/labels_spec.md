@@ -82,9 +82,9 @@ mixes ICD-9 and ICD-10.
 
 ## 4. Objective anchors (`anchors.py`, `configs/silver_anchors.yaml`)
 
-A silver positive needs at least one satisfied anchor; the YAML holds all rules as data. **Status: SIGNED OFF by
-the project lead 2026-10-07 (delegated decision); re-review with the EEG/neurocritical-care co-investigator before
-Study 1 protocol lock** (DECISION_LOG D-084..D-092). Input is a tidy event table
+A silver positive needs at least one satisfied anchor; the YAML holds all rules as data. **Status: Evidence-reviewed
+2026-10-08 (literature-grounded; see `docs/research/anchor_evidence_review.md`); external co-I review before publication**
+(DECISION_LOG D-084..D-092 for the original sign-off, D-144 for the review). Input is a tidy event table
 `case_id | item | value | hours_from_t0` (t0 = EEG start) plus an optional boolean `acute` column; items map from
 OMOP via the LOINC table in the YAML (LOINC listed only where confident; empty list = map locally; verify against
 the local concept map). Flag items (`loinc: []`) are computed upstream by the extractor.
@@ -94,9 +94,9 @@ the local concept map). Flag items (`loinc: []`) are computed upstream by the ex
 | E1 | ACUTE/SUBACUTE imaging finding: ICH, SAH, SDH/EDH, infarct, TBI/contusion, mass effect (`acuity_required: true`) | -72 to +24 |
 | E2 | arrest event; asphyxia; profound shock (sustained MAP < 50 mmHg for >= 30 min, flag computed upstream) | -168 to 0; -168 to 0; -48 to 0 |
 | E4a | antidote with documented response; non-therapeutic tox screen; ethanol >= 300 mg/dL; acetaminophen >= 150 ug/mL; salicylate >= 30 mg/dL | -6 to +6; -24 to +6 |
-| E5 | ammonia >= 100 umol/L; BUN >= 100 mg/dL; glucose < 50 (window ends +1 h) or > 600 mg/dL; Na < 120 or > 160 mmol/L; PaCO2 > 70 mmHg AND arterial pH < 7.30 (both in window); arterial pH < 7.10; Ca > 14 mg/dL. Creatinine is not an anchor. | -24 to +6 (glucose<50: -12 to +1; PaCO2+pH, pH<7.10: -12 to +6) |
+| E5 | ammonia >= 150 umol/L (was 100); BUN >= 100 mg/dL; glucose < 50 (window ends +1 h) or > 600 mg/dL; Na < 120 or > 160 mmol/L; PaCO2 > 70 mmHg AND arterial pH < 7.30 (both in window); arterial pH < 7.10; Ca > 14 mg/dL. Creatinine is not an anchor. | -24 to +6 (glucose<50: -12 to +1; PaCO2+pH, pH<7.10: -12 to +6) |
 | E6 | CDC Adult Sepsis Event style: blood culture drawn AND `qad_ge4` (>= 4 consecutive qualifying antimicrobial days starting within +-2 d of the culture; upstream) AND any organ dysfunction: vasopressor initiation, lactate >= 2.0 mmol/L, `creatinine_doubling` (vs encounter baseline, excluding ESRD), `bilirubin_doubling_ge2` (>= 2.0 mg/dL and doubled), `platelets_drop` (< 100 x10^3/uL and >= 50% decline from baseline >= 100). Removed if any E7 anchor fires. No SIRS, no new mechanical ventilation. | culture and QAD -72 to +24; organ dysfunction -48 to +24 |
-| E7 | CSF culture or PCR positive; autoimmune antibody; or RBC-corrected CSF WBC >= 20/uL plus protein > 100, glucose < 40 or positive blood culture | -72 to +72 (antibody -168 to +168) |
+| E7 | CSF culture or PCR positive; autoimmune antibody (NMDAR: CSF only; other neural antibodies CSF or serum); or RBC-corrected CSF WBC >= 20/uL plus protein > 100, glucose < 40 or positive blood culture | -72 to +72 (antibody -168 to +168) |
 
 Rule details:
 
@@ -144,8 +144,9 @@ cases and audit cases raises `SilverScoringError` (silver labels train, never sc
 
 ## Open items
 
-Anchor thresholds and windows were signed off by the project lead (delegated) and need EEG/neurocritical-care
-co-investigator re-review before Study 1 protocol lock; the OMOP-to-item mapper
+Anchor thresholds and windows were signed off by the project lead (delegated), then evidence-reviewed 2026-10-08
+(`docs/research/anchor_evidence_review.md`); they still need external co-investigator review before publication, and
+the extractor must enforce the NMDAR CSF-only specimen rule and prefer principal-diagnosis position for E1 dx codes; the OMOP-to-item mapper
 (LOINC and drug/procedure concepts to `items`) is not built, since the real table contents are unseen; the
 reviewer-packet summarizer (open-weight, 50-case validation) is out of scope here; `BS` abbreviation leakage
 should be checked in the pilot.

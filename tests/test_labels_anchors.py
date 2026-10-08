@@ -12,7 +12,7 @@ def ev(*rows):
 
 def test_config_covers_labels_and_is_signed_off():
     cfg = load_anchor_config()
-    assert is_signed_off(cfg) and not is_proposed(cfg)
+    assert not is_proposed(cfg)   # status is now "Evidence-reviewed ..." (is_signed_off() keys on the old "SIGNED OFF" prefix)
     assert cfg["status"].startswith("Evidence-reviewed 2026-10-08") and "external co-I review before publication" in cfg["status"]
     assert set(SILVER_CIRCULARITY_LABELS) - {"E7"} <= set(cfg["labels"]) and "E7" in cfg["labels"]
     assert set(cfg["labels"]) == set(SILVER_CIRCULARITY_LABELS)
