@@ -844,6 +844,31 @@ def _checkpoint_parts(s3, table: str, prefix: str | None, bucket: str) -> tuple[
     return [r[0] for r in rows], {r[0]: (r[1], r[3]) for r in rows}
 
 
+def read_rowgroup(pf, rg: int, use: list[str], ids, pid_arr, outer):
+    """The table one row group contributes (``None`` for nothing): column-pruned to ``use``; with ``ids`` (sorted ints,
+    ``pid_arr`` its Arrow array) the row group is skipped from its ``person_id`` min/max statistics, else only ``person_id`` is
+    read first and the other columns only if some id matches (then filtered in Arrow). Reads go through ``with_retries``."""
+    import pyarrow as pa
+    import pyarrow.compute as pc
+    filt = pid_arr is not None and "person_id" in use
+    rest = [c for c in use if c != "person_id"]
+    if filt:
+        if not ids or not _rowgroup_may_match(pf, rg, "person_id", ids):
+            return None
+        pid = with_retries(lambda: pf.read_row_group(rg, columns=["person_id"]), outer)
+        mask = pc.fill_null(pc.is_in(pc.cast(pid.column("person_id"), pa.int64(), safe=False),
+                                     value_set=pid_arr), False)
+        if not pc.any(mask).as_py():
+            return None
+        if rest:
+            other = with_retries(lambda: pf.read_row_group(rg, columns=rest), outer)
+            tbl = pa.table({c: (pid.column(c) if c == "person_id" else other.column(c)) for c in use})
+        else:
+            tbl = pid
+        return tbl.filter(mask)
+    return with_retries(lambda: pf.read_row_group(rg, columns=use), outer)
+
+
 def ids_digest(ids) -> str | None:
     """Digest of a sorted id list (checkpoint call key); ``None`` for no id filter."""
     from . import checkpoint as ck
@@ -881,6 +906,19 @@ def iter_omop_batches(table: str, *, person_ids: Iterable[int] | None = None,
     pid_arr = pa.array(ids, type=pa.int64()) if ids is not None else None
     cp = ck.active()
     cache = None
+    shared = None
+    if cp is not None:
+        from . import omop_cache
+        shared = omop_cache.reader_for(cp, s3, bucket, table, columns=want, ids=ids, prefix=prefix, retry=retry,
+                                       max_get_bytes=max_get_bytes, buffer_size=buffer_size)
+    if shared is not None:                       # the shared cross-step cache serves this request (D-149)
+        for _key, _rg, cached in shared.iter_rowgroups(on_error):
+            tbl = shared.select_request(cached, want, ids, pid_arr)
+            if tbl is not None:
+                for batch in tbl.to_batches(max_chunksize=batch_rows):
+                    if batch.num_rows:
+                        yield batch
+        return
     if cp is not None:
         parts, pmeta = _checkpoint_parts(s3, table, prefix, bucket)
         cache = RowGroupCache(cp, f"omop_{table}" if not prefix else f"{table}", ("omop_batches", table, tuple(want), prefix,
@@ -890,24 +928,7 @@ def iter_omop_batches(table: str, *, person_ids: Iterable[int] | None = None,
     outer = _outer(retry)
 
     def read_rg(pf, rg: int, use: list[str]):
-        """The table this row group contributes (``None`` for nothing)."""
-        filt = pid_arr is not None and "person_id" in use
-        rest = [c for c in use if c != "person_id"]
-        if filt:
-            if not ids or not _rowgroup_may_match(pf, rg, "person_id", ids):
-                return None
-            pid = with_retries(lambda: pf.read_row_group(rg, columns=["person_id"]), outer)
-            mask = pc.fill_null(pc.is_in(pc.cast(pid.column("person_id"), pa.int64(), safe=False),
-                                         value_set=pid_arr), False)
-            if not pc.any(mask).as_py():
-                return None
-            if rest:
-                other = with_retries(lambda: pf.read_row_group(rg, columns=rest), outer)
-                tbl = pa.table({c: (pid.column(c) if c == "person_id" else other.column(c)) for c in use})
-            else:
-                tbl = pid
-            return tbl.filter(mask)
-        return with_retries(lambda: pf.read_row_group(rg, columns=use), outer)
+        return read_rowgroup(pf, rg, use, ids, pid_arr, outer)
 
     for key in parts:
         try:

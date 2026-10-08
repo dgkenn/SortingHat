@@ -9,7 +9,7 @@
 # Step logs are APPENDED so the progress lines ("omop_measurement: 37/120 row groups (cached 30)") survive restarts.
 #   1. streaming EEG feature extraction over the cohort key list (12 shards), then not_found retries
 #   2. Phase 0a field audit (needs the network to itself, so it runs after extraction)
-#   3. structured silver labels for the cohort
+#   3. shared OMOP cache warm-up (out/local_only/omop_cache; D-149), then structured silver labels for the cohort
 # Logs: out/logs/overnight.log (+ per-step logs). Record-level outputs stay under out/local_only/.
 set -u
 cd "$(dirname "$0")/.."
@@ -44,6 +44,10 @@ for pass in 1 2 3; do
   wait
   say "extraction pass $pass end: $(progress)"
 done
+
+say "omop cache warm-up start (shared by silver labels, audit, cohort and baselines; resumable)"
+timeout 21600 $RUN -m sortinghat.omop_cache warm --s3 >> out/logs/omop_cache_warm.log 2>&1
+say "omop cache warm-up exit=$?"
 
 say "silver labels start"
 timeout 21600 $RUN -m sortinghat.labels.extract --s3 --cohort out/local_only/cohort_study1.csv \

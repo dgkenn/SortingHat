@@ -156,6 +156,18 @@ def iter_filtered_batches(s3, table: str, person_ids, columns: list[str], *, tex
     id_list = sorted({int(i) for i in ids}) if ids else None
     id_arr = pa.array(id_list, type=pa.int64()) if ids else None
     if cp is not None:
+        from .. import omop_cache
+        needed = list(dict.fromkeys([*columns, *([text_col] if pattern and text_col else []),
+                                     *([id_col] if id_list and id_col else [])]))
+        shared = omop_cache.reader_for(cp, s3, bucket, table, columns=needed, ids=want, prefix=prefix, retry=retry,
+                                       max_get_bytes=data_io.GET_CHUNK_BYTES)
+        if shared is not None:                   # the shared cross-step cache serves this request (D-149)
+            for _key, _rg, cached in shared.iter_rowgroups(None):
+                tbl = shared.select_filtered(cached, columns, pid_arr, text_col, pattern, id_col, id_arr)
+                if tbl is not None:
+                    yield tbl
+            return
+    if cp is not None:
         parts, pmeta = data_io._checkpoint_parts(s3, table, prefix, bucket)
         cache = data_io.RowGroupCache(
             cp, table if prefix else f"omop_{table}",

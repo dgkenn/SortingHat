@@ -147,7 +147,12 @@ def candidate_ids(store) -> np.ndarray | None:
         if f.exists():
             out = np.load(f)
         else:
-            out = _compute_candidates(store, cfg)
+            cp = ck.active()
+            if cp is None:
+                out = _compute_candidates(store, cfg)
+            else:
+                with cp.kill_suspended():                       # bookkeeping: not part of the test kill budget
+                    out = _compute_candidates(store, cfg)
             _atomic_bytes(f, lambda fh: np.save(fh, out))
     except Exception as exc:  # noqa: BLE001 - never fatal: the steps read S3 directly
         ck.log(f"omop_cache: candidate set unavailable ({type(exc).__name__}); reading S3 directly")
@@ -173,11 +178,15 @@ def _compute_candidates(store, cfg) -> np.ndarray:
 
 # --------------------------------------------------------------------------------------------------- file I/O
 def _mkdir(p: Path) -> None:
-    p.mkdir(parents=True, exist_ok=True)
-    try:
-        os.chmod(p, 0o700)
-    except OSError:
-        pass
+    """Create ``p`` (and every missing level from the cache root down) with mode 0700."""
+    root = cache_root()
+    chain = [d for d in reversed([p, *p.parents]) if d == root or root in d.parents]
+    for d in chain or [p]:
+        d.mkdir(exist_ok=True, parents=True)
+        try:
+            os.chmod(d, 0o700)
+        except OSError:
+            pass
 
 
 _SEQ = iter(range(1 << 60))
@@ -221,13 +230,15 @@ class SharedReader:
         self.parts, self.meta = data_io._checkpoint_parts(s3, table, None, bucket)
         self.profile = ck.digest(table, self.columns, None if ids is None else ids, CACHE_VERSION)[:16]
         self.outer = data_io._outer(retry)
-        self.pid_arr = None
+        self.pid_arr, self.ids_list = None, None
         if ids is not None:
+            self.ids_list = [int(i) for i in ids]
             import pyarrow as pa
             self.pid_arr = pa.array(ids, type=pa.int64())
         self.max_in_flight = 0
         self._tl = threading.local()
-        self._refreshed: set[str] = set()                 # parts whose manifest was rewritten in this (--no-resume) run
+        # --no-resume refreshes every stored unit ONCE per run (not once per read of the table): units refreshed so far
+        self._fresh: set[str] = cp.__dict__.setdefault("_fresh_units", set())
         self.progress = ck.RowGroupProgress(f"omop_{table}", len(self.parts), self._known_total())
 
     # -- paths
@@ -237,10 +248,11 @@ class SharedReader:
         return cache_root() / self.table / self.profile / h
 
     def _manifest(self, key: str) -> dict | None:
-        if self.refresh and key not in self._refreshed:
+        path = self._part_dir(key) / "manifest.json"
+        if self.refresh and str(path) not in self._fresh:
             return None
         try:
-            return json.loads((self._part_dir(key) / "manifest.json").read_text())
+            return json.loads(path.read_text())
         except (OSError, ValueError):
             return None
 
@@ -289,14 +301,15 @@ class SharedReader:
         return pf
 
     def _work(self, key: str, rg: int, use: list[str]):
-        if not self.refresh:
+        unit = str(self._part_dir(key) / f"rg-{rg:06d}")
+        if not self.refresh or unit in self._fresh:
             hit, tbl = self._lookup(key, rg)
             if hit:
                 return True, tbl
         pf = self._open(key)
-        ids = None if self.pid_arr is None else self.ids
-        tbl = self.dio.read_rowgroup(pf, rg, use, ids, self.pid_arr, self.outer)
+        tbl = self.dio.read_rowgroup(pf, rg, use, self.ids_list, self.pid_arr, self.outer)
         self._store(key, rg, tbl)
+        self._fresh.add(unit)
         return False, tbl
 
     # -- ordered, bounded prefetch
@@ -311,7 +324,7 @@ class SharedReader:
                     use = [c for c in self.columns if c in have]
                     man = {"n": pf.num_row_groups if use else 0, "have": list(have), "use": use}
                     _atomic_bytes(self._part_dir(key) / "manifest.json", lambda fh: fh.write(json.dumps(man).encode()))
-                    self._refreshed.add(key)
+                    self._fresh.add(str(self._part_dir(key) / "manifest.json"))
             except Exception as exc:  # noqa: BLE001
                 if on_error is None:
                     raise
@@ -355,6 +368,55 @@ class SharedReader:
         finally:
             pool.shutdown(wait=True, cancel_futures=True)
         self.progress.emit(final=True)
+
+    # -- serving a request from a cached superset row group
+    def select_request(self, cached, want: list[str], ids, pid_arr):
+        """What ``data_io.iter_omop_batches`` would have produced for this row group: the request's own person ids (a no-op when
+        they are all the candidates), then its own columns in its own order; ``None`` for nothing."""
+        import pyarrow as pa
+        import pyarrow.compute as pc
+        if cached is None:
+            return None
+        cols = [c for c in want if c in cached.column_names]
+        if not cols:
+            return None
+        t = cached
+        if ids is not None and "person_id" in t.column_names and (self.ids is None or len(ids) != len(self.ids)):
+            mask = pc.fill_null(pc.is_in(pc.cast(t.column("person_id"), pa.int64(), safe=False), value_set=pid_arr), False)
+            t = t.filter(mask)
+        t = t.select(cols)
+        return t if t.num_rows else None
+
+    def select_filtered(self, cached, columns: list[str], pid_arr, text_col, pattern, id_col, id_arr):
+        """What ``cohort.sources.iter_filtered_batches`` would have yielded for this row group (person filter AND the row
+        predicate ``text matches pattern OR id_col in ids``), applied to the cached superset row group; ``None`` for nothing."""
+        import pyarrow as pa
+        import pyarrow.compute as pc
+        if cached is None:
+            return None
+        have = set(cached.column_names)
+        use = [c for c in columns if c in have]
+        if "person_id" not in use:
+            return None
+        pred = bool(pattern) or id_arr is not None
+        t_ok = bool(pattern) and text_col in have
+        i_ok = id_arr is not None and id_col in have
+        if pred and not (t_ok or i_ok):
+            return None
+        mask = pc.fill_null(pc.is_in(pc.cast(cached.column("person_id"), pa.int64(), safe=False), value_set=pid_arr), False)
+        if pred:
+            pm = []
+            if t_ok:
+                pm.append(pc.match_substring_regex(pc.cast(cached.column(text_col), pa.string()), pattern, ignore_case=True))
+            if i_ok:
+                pm.append(pc.is_in(pc.cast(cached.column(id_col), pa.int64(), safe=False), value_set=id_arr))
+            m2 = pm[0]
+            for x in pm[1:]:
+                m2 = pc.or_kleene(m2, x)
+            mask = pc.and_kleene(mask, pc.fill_null(m2, False))
+        if not pc.any(mask).as_py():
+            return None
+        return cached.select(use).filter(mask)
 
 
 def reader_for(cp, s3, bucket: str, table: str, *, columns: list[str], ids, prefix: str | None = None, retry=None,

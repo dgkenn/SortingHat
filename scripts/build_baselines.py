@@ -71,13 +71,7 @@ COHORT_DEFS = {"table": None, "strict": "in_strict", "strict_pm6": "in_strict_pm
 CHUNK_ROWS = 250_000
 PREFILTER_MARGIN_H = 1.0
 
-MEAS_COLS = ["person_id", "measurement_datetime", "measurement_date", "measurement_source_value", "value_as_number",
-             "unit_source_value", *schema.COLUMN_ALIASES["measurement.result_datetime"]]
-DRUG_COLS = ["person_id", "drug_exposure_start_datetime", "drug_exposure_end_datetime", "drug_source_value", "quantity",
-             "drug_concept_id"]
-COND_COLS = ["person_id", "condition_start_datetime", "condition_source_value"]
-PROC_COLS = ["person_id", "procedure_datetime", "procedure_date", "procedure_source_value"]
-OBS_COLS = ["person_id", "observation_datetime", "observation_date", "observation_source_value", "value_as_string"]
+from sortinghat.baselines.omop_columns import COND_COLS, DRUG_COLS, MEAS_COLS, OBS_COLS, PROC_COLS  # noqa: E402,F401  (shared with the OMOP cache)
 _DRUG_ANY = re.compile("|".join(rx for _n, _c, rx in lx._DRUG_RULES), re.I)          # prefilter: superset of every rule
 _DRUG_ANY_RE2 = r"\b(?:" + "|".join(rx for _n, _c, rx in lx._DRUG_RULES) + r")\b"
 

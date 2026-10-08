@@ -7,13 +7,14 @@ reference and that work already stored was not redone (counted at the pyarrow ro
 """
 import shutil
 import stat
+import threading
 
 import pandas as pd
 import pyarrow.parquet as pq
 import pytest
 
 from sortinghat import checkpoint as ck
-from sortinghat import data_io
+from sortinghat import data_io, omop_cache
 from sortinghat.checkpoint import SimulatedKill
 from sortinghat.cohort.sources import iter_filtered_batches
 
@@ -37,6 +38,7 @@ def root(tmp_path, monkeypatch):
     monkeypatch.setenv(ck.ENV_ROOT, str(r))
     monkeypatch.delenv(ck.ENV_FAIL_AFTER, raising=False)
     monkeypatch.setenv(ck.ENV_VERSION, "test-v1")
+    monkeypatch.setenv(omop_cache.ENV_SWITCH, "off")            # these tests are about the per-step row-group checkpoint
     return r
 
 
@@ -46,17 +48,20 @@ class Counter:
     def __init__(self, monkeypatch):
         self.rg = 0
         self.gets = 0
+        self._lock = threading.Lock()
         real_rg = pq.ParquetFile.read_row_group
         real_get = data_io.LocalStore.get_object
         me = self
 
         def read_row_group(pf, i, *a, **kw):
-            me.rg += 1
+            with me._lock:
+                me.rg += 1
             return real_rg(pf, i, *a, **kw)
 
         def get_object(store, Bucket=None, Key="", Range=None):
             if Key.endswith(".parquet"):
-                me.gets += 1
+                with me._lock:
+                    me.gets += 1
             return real_get(store, Bucket=Bucket, Key=Key, Range=Range)
         monkeypatch.setattr(pq.ParquetFile, "read_row_group", read_row_group)
         monkeypatch.setattr(data_io.LocalStore, "get_object", get_object)

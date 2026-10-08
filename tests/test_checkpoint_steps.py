@@ -12,6 +12,7 @@ import pyarrow.parquet as pq
 import pytest
 
 from sortinghat import checkpoint as ck
+from sortinghat import omop_cache
 from sortinghat.checkpoint import SimulatedKill
 from test_checkpoint import RG, Counter  # noqa: F401  (tests/ on sys.path)
 from test_silver_feasibility_inputs import argv_for, load_script, make_inputs, rsf
@@ -37,6 +38,7 @@ def env(tmp_path, monkeypatch):
     def use_root(name: str) -> Path:
         r = tmp_path / name
         monkeypatch.setenv(ck.ENV_ROOT, str(r))
+        monkeypatch.setenv(omop_cache.ENV_ROOT, str(r / "omop"))      # each run owns its OMOP cache (cold start)
         return r
     return SimpleNamespace(use_root=use_root, mp=monkeypatch, tmp=tmp_path)
 
@@ -92,10 +94,14 @@ def test_cohort_build_resumes_to_identical_outputs(store_dir, env, counter, caps
     assert counter.rg == full                                           # --no-resume: from nothing
     same_files(ref, run, files)
 
-    env.mp.setenv(ck.ENV_VERSION, "steps-v2")                           # other code version: stale checkpoint not reused
+    env.mp.setenv(ck.ENV_VERSION, "steps-v2")                           # other code version: the step's checkpoint is not reused
+    capsys.readouterr()
     counter.reset()
     assert bc.main(["--data", str(store_dir), "--out", str(run)]) == 0
-    assert counter.rg == full
+    out = capsys.readouterr().out
+    assert "fresh run" in out and "sessions-S0001 done" in out and "loaded from checkpoint" not in out
+    assert counter.rg == 0                                              # ... but the shared OMOP cache (source data only) is
+    same_files(ref, run, files)
 
 
 @pytest.fixture(scope="module")
@@ -104,6 +110,7 @@ def cohort_csv(store_dir, tmp_path_factory):
     out = tmp_path_factory.mktemp("cohort_for_steps")
     with pytest.MonkeyPatch.context() as mp:
         mp.setenv(ck.ENV_ROOT, str(out / "ck"))
+        mp.setenv(omop_cache.ENV_ROOT, str(out / "omop"))
         assert bc.main(["--data", str(store_dir), "--out", str(out), "--all-sites"]) == 0
     return out / "local_only" / "cohort_study1.csv"
 
@@ -152,7 +159,7 @@ def test_baselines_resume_to_identical_outputs(store_dir, cohort_csv, env, count
 
     env.use_root("ck_run")
     counter.reset()
-    assert kill_then_resume(bb.main, argv(run), env.mp, kill_after=11, counter=counter) == 0
+    assert kill_then_resume(bb.main, argv(run), env.mp, kill_after=25, counter=counter) == 0
     pd.testing.assert_frame_equal(pd.read_parquet(run / "bl.parquet"), pd.read_parquet(ref / "bl.parquet"))
     assert json.loads((run / "bl.columns.json").read_text()) == json.loads((ref / "bl.columns.json").read_text())
     assert 0 < counter.killed and 0 < counter.rg < full
@@ -180,7 +187,7 @@ def test_field_audit_resumes_to_identical_outputs(store_dir, env, counter):
 
     env.use_root("ck_run")
     counter.reset()
-    assert kill_then_resume(field_audit.main, ["--data", str(store_dir), "--out", str(run)], env.mp, kill_after=12, counter=counter) == 0
+    assert kill_then_resume(field_audit.main, ["--data", str(store_dir), "--out", str(run)], env.mp, kill_after=30, counter=counter) == 0
     same_files(ref, run, files)
     assert 0 < counter.killed and 0 < counter.rg < full
     assert counter.killed + counter.rg == full                          # every row group was read exactly once overall
