@@ -203,12 +203,13 @@ def test_absolute_evidence_path_rejected(tmp_path):
 
 
 def test_bad_enum_and_missing_key_rejected(tmp_path):
-    bad = _entry(lineage="green_ish")
-    del bad["licence"]
-    path = _write_ledger(tmp_path, {"broken": bad})
+    no_licence = _entry()
+    del no_licence["licence"]
+    path = _write_ledger(tmp_path, {"no_licence": no_licence, "bad_lineage": _entry(lineage="green_ish")})
     with pytest.raises(LedgerError) as exc:
         load_ledger(path)
-    assert "lineage" in str(exc.value) and "licence" in str(exc.value)
+    assert "missing keys" in str(exc.value) and "licence" in str(exc.value)
+    assert "lineage 'green_ish'" in str(exc.value)
 
 
 def test_unknown_use_value_rejected(tmp_path):
@@ -263,7 +264,9 @@ def test_log_is_dated_and_append_only(ledger, log_file):
 def test_log_holds_ids_and_verdicts_only(ledger, log_file):
     check(["heedb_v4_1"], "production_build", ledger=ledger)
     line = log_file.read_text().splitlines()[0]
-    assert set(line.split("\t")[1:2]) <= {"source=api"} or "source=api" in line
+    fields = line.split("\t")
+    assert fields[1] == "source=api" and fields[2] == "purpose=production_build"
+    assert fields[3] == "verdict=REFUSED"
     assert "/" not in line  # no paths or data locations
 
 

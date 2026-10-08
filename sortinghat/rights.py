@@ -59,7 +59,7 @@ PURPOSE_USES: dict[str, tuple[str, ...]] = {
 }
 GATED_PURPOSES = frozenset(p for p in PURPOSE_USES if p != "research")
 
-_SAFE_ID = re.compile(r"[^A-Za-z0-9_.:\-]")
+_CONTROL = re.compile(r"[\x00-\x1f\x7f]")  # tabs and newlines would break the one-line-per-check log
 
 
 class RightsError(Exception):
@@ -249,7 +249,7 @@ def _now() -> str:
 
 
 def _safe(token: str) -> str:
-    return _SAFE_ID.sub("?", token)[:200]
+    return _CONTROL.sub("?", str(token))[:300]
 
 
 def _append_log(decision: Decision | None, *, purpose: str, source: str, error: str | None,
