@@ -261,8 +261,10 @@ def test_csf_pcr_and_autoimmune_antibody():
     assert one(lambda f, p: f.lab(p, 1, "HSV 1/2 PCR, CSF", np.nan, None, vtext="Detected"), "E7")[2] == ["E7_csf_pcr"]
     assert not one(lambda f, p: f.lab(p, 1, "HSV 1/2 PCR, CSF", np.nan, None, vtext="Not detected"), "E7")[1]
     assert not one(lambda f, p: f.lab(p, 1, "HSV PCR", np.nan, None, vtext="Detected"), "E7")[1]     # specimen not CSF
-    assert one(lambda f, p: f.lab(p, 100, "NMDA receptor antibody, serum", np.nan, None, vtext="Positive"),
+    assert one(lambda f, p: f.lab(p, 100, "NMDA receptor antibody, CSF", np.nan, None, vtext="Positive"),
                "E7")[2] == ["E7_autoimmune_ab"]
+    # D-144: NMDAR counts only from CSF (serum sensitivity/specificity insufficient for a silver positive)
+    assert not one(lambda f, p: f.lab(p, 100, "NMDA receptor antibody, serum", np.nan, None, vtext="Positive"), "E7")[1]
 
 
 # ---------------------------------------------------------------------------- baseline-relative flags

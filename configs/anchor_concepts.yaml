@@ -306,9 +306,9 @@ qualitative_items:
     name_exclude: 'antibody|\bigg\b|\bigm\b|titer|index'
     result: positive
     numeric_positive: true
-  csf_autoimmune_ab_pos:    # NMDAR etc. in CSF OR serum (silver_anchors.yaml); GAD65 deliberately excluded (diabetes)
+  csf_autoimmune_ab_pos:    # NMDAR only from CSF (D-144: CSF sensitivity 100% vs serum 85.6%, PMID 24360484); LGI1/CASPR2 etc. CSF or serum; GAD65 excluded (diabetes)
     codes: []
-    name_regex: 'nmda|lgi-?1|caspr-?2|\bampa\b|gaba-?b|\bdppx\b|iglon5|autoimmune enceph|paraneoplastic|anti-?neuronal'
+    name_regex: 'nmda.*(csf|cerebro|spinal)|(csf|cerebro|spinal).*nmda|lgi-?1|caspr-?2|\bampa\b|gaba-?b|\bdppx\b|iglon5|autoimmune enceph|paraneoplastic|anti-?neuronal'
     name_exclude: 'ampa(?!r)\b.*(urine|drug)|amphet'
     result: positive
     numeric_positive: true
