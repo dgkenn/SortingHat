@@ -109,14 +109,6 @@ MERGE_NOTICE = {
     "unrecognised": "patient merge history present but its old/new id columns were not recognised: NOT applied (D-106)"}
 
 
-def _remap(df: pd.DataFrame, mm: dict[int, int]) -> pd.DataFrame:
-    if not mm or not len(df):
-        return df
-    pid = df["person_id"].astype("int64")
-    mapped = pid.map(mm)
-    return df.assign(person_id=mapped.where(mapped.notna(), pid).astype("int64"))
-
-
 def build_cohort(src, cfg: CohortConfig | None = None) -> CohortResult:
     cfg = cfg or CohortConfig()
     S0 = src.sessions().reset_index(drop=True)
@@ -131,11 +123,12 @@ def build_cohort(src, cfg: CohortConfig | None = None) -> CohortResult:
     for old, new in mm.items():
         rev.setdefault(new, []).append(old)
 
-    def fetch(fn, pids):
-        """Fetch OMOP rows for the surviving ids AND the ids merged into them, re-keyed to the surviving id."""
+    def fetch(fn, pids, **kw):
+        """Fetch OMOP rows for the surviving ids AND the ids merged into them; the source re-keys them to the
+        surviving id (per chunk when streaming)."""
         ids = {int(p) for p in pids}
         ids |= {o for p in list(ids) for o in rev.get(p, [])}
-        return _remap(fn(sorted(ids)), mm)
+        return fn(sorted(ids), remap=mm or None, **kw)
 
     sites = sorted(S0["SiteID"].astype(str).unique())
     flow = FlowRecorder(sites)
@@ -154,7 +147,8 @@ def build_cohort(src, cfg: CohortConfig | None = None) -> CohortResult:
 
     S = run.S.copy()
     S["person_id"] = S["person_id"].astype("int64")
-    visits = fetch(src.visits, S["person_id"].unique())
+    bounds = S.groupby("person_id")["t0"].agg(lo="min", hi="max").astype("datetime64[s]")
+    visits = fetch(src.visits, S["person_id"].unique(), bounds=bounds, slack_h=cfg.visit_slack_h)
     run.S = S.join(rules.match_visits(S, visits, cfg.acute_classes, cfg.visit_chain_gap_h, cfg.visit_slack_h,
                                       cfg.open_visit_days, cfg.date_only_end_of_day))
     run.S["ServiceName"] = run.S["ServiceName"].astype("string").str.strip().str.upper()
@@ -183,7 +177,12 @@ def build_cohort(src, cfg: CohortConfig | None = None) -> CohortResult:
 
     # ------------------------------------------------------------------ ACI onset proxy and time since onset
     run.S = run.S.reset_index(drop=True)          # unique, positional index for the row-level joins below
-    scores = rules.extract_scores(fetch(src.scores, run.S["person_id"].unique()))
+    pad_b, pad_a = (max(cfg.score_before_h, cfg.pm6_window_h), max(cfg.score_after_h, cfg.pm6_window_h))
+    t0s, enc = run.S["t0"], run.S["encounter_start"]
+    swin = pd.DataFrame({"lo": np.minimum(enc.to_numpy(), (t0s - pd.Timedelta(hours=pad_b)).to_numpy()),
+                         "hi": (t0s + pd.Timedelta(hours=pad_a)).to_numpy()}, index=run.S["person_id"].to_numpy()
+                        ).astype("datetime64[s]")
+    scores = rules.extract_scores(fetch(src.scores, run.S["person_id"].unique(), window=swin))
     on = rules.onset_times(run.S, scores, cfg.onset_rule, cfg.abnormal_gcs_max, cfg.abnormal_four_max)
     run.S = run.S.assign(onset=on["onset"], onset_basis=on["onset_basis"])
     run.S["hours_since_onset"] = _hours(run.S["t0"], run.S["onset"])
@@ -201,7 +200,10 @@ def build_cohort(src, cfg: CohortConfig | None = None) -> CohortResult:
                                            "gcs_nearest": "gcs_nearest_window", "four_nearest": "four_nearest_window",
                                            "n_score_obs": "n_score_obs_window", "strict": "severity_strict"}))
     run.S["severity_strict_pm6"] = pm6["strict"]
-    cond = fetch(src.conditions, run.S["person_id"].unique())
+    cwin = pd.DataFrame({"lo": run.S["encounter_start"].to_numpy(),
+                         "hi": (run.S["t0"] + pd.Timedelta(hours=cfg.phenotype_after_h)).to_numpy()},
+                        index=run.S["person_id"].to_numpy()).astype("datetime64[s]")
+    cond = fetch(src.conditions, run.S["person_id"].unique(), window=cwin)
     run.S["phenotype"] = rules.phenotype(run.S, cond, cfg.phenotype_after_h)
     run.drop("Neither strict severity (GCS/FOUR, primary or +-6 h) nor EHR phenotype",
              run.S["severity_strict"] | run.S["severity_strict_pm6"] | run.S["phenotype"], PAT)

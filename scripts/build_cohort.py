@@ -22,6 +22,7 @@ from sortinghat import agent_safety, data_io                       # noqa: E402
 from sortinghat.cohort import CohortConfig, StoreSources, build_cohort, write_outputs   # noqa: E402
 from sortinghat.cohort.config import ONSET_RULES, SCORE_RULES        # noqa: E402
 from sortinghat.cohort.build import MERGE_NOTICE                      # noqa: E402
+from sortinghat.cohort.memguard import peak_rss_gb, run_guarded     # noqa: E402
 from sortinghat.cohort.output import known_ids                       # noqa: E402
 from sortinghat.safe_output import safe_print, suppress_count         # noqa: E402
 
@@ -48,10 +49,17 @@ def main(argv=None) -> int:
                     help="a visit with no end is treated as open this many days after its start (C-19)")
     ap.add_argument("--merge-cols", nargs=2, metavar=("OLD", "NEW"),
                     help="column names of the retired and surviving id in PatientMergeHistory/ (see diag_cohort.py)")
+    ap.add_argument("--max-memory-gb", type=float, default=None,
+                    help="guard: set RLIMIT_AS to this many GB (address space, an upper bound on RSS; pick generously) "
+                         "and print a clear aggregate error instead of a traceback if exceeded")
     ap.add_argument("--duration-scale", nargs="*", default=[], metavar="SITE=FACTOR",
                     help="unit fix for DurationInSeconds / RecordingDuration after reading the flow's unit check, "
                          "e.g. I0008=60")
     a = ap.parse_args(argv)
+    return run_guarded(lambda: _run(a), a.max_memory_gb, "cohort build")
+
+
+def _run(a) -> int:
 
     if a.data:
         agent_safety.assert_not_restricted_in_agent(a.data)
@@ -78,6 +86,7 @@ def main(argv=None) -> int:
         for r in result.debug["sites"]["ALL"].get("rows", []):
             safe_print(f"  {r['step']} | excluded {r['n_excluded']} | remaining {r['n_remaining']}", known_ids=ids)
     safe_print(f"  notice: {MERGE_NOTICE[result.merge_status]}", known_ids=ids)
+    safe_print(f"  peak RSS: {peak_rss_gb():.2f} GB", known_ids=ids)
     safe_print(f"Flow report: {paths['flow_md']}", known_ids=ids)
     safe_print(f"Record-level files (mode 0600, not printed): {paths['cohort'].parent}/", known_ids=ids)
     return 0

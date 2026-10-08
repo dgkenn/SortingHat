@@ -16,6 +16,7 @@ selection rule, not a feature; baselines never see these rows because every feat
 from __future__ import annotations
 
 import re
+from functools import lru_cache
 
 import numpy as np
 import pandas as pd
@@ -36,8 +37,11 @@ PHENOTYPE_CODES = re.compile(r"^(?:R40[0-4]|R410|R4182|78001|78002|78009|78097)"
 
 
 # ---------------------------------------------------------------------------------------------- visits
-ACUITY_RANK = {"ICU": 0, "ED": 1, "Inpatient": 2, "Outpatient": 3}      # unknown class ranks last
+CLASS_CATS = ["ICU", "ED", "Inpatient", "Outpatient"]                    # category order = acuity priority
+ACUITY_RANK = {c: i for i, c in enumerate(CLASS_CATS)}                  # unclassified ranks last (4)
 FAR_FUTURE_DAYS = 365.25 * 100
+_S_OFFSET = 1 << 33                                                      # seconds offset so start fits 34 bits
+PRUNE_BEFORE_DAYS = 400.0                                                # see ``prune_visits``
 
 
 def _dt(df: pd.DataFrame, col: str) -> pd.Series:
@@ -46,20 +50,19 @@ def _dt(df: pd.DataFrame, col: str) -> pd.Series:
     return pd.Series(pd.NaT, index=df.index, dtype="datetime64[us]")
 
 
-def prepare_visits(visits: pd.DataFrame, open_days: float | None = 30.0, date_only_end_of_day: bool = True
-                   ) -> pd.DataFrame:
-    """Visits with a usable closed interval and a care-setting class (``_cls``). Explicit rules, in order:
+def compact_visits(visits: pd.DataFrame, date_only_end_of_day: bool = True) -> pd.DataFrame:
+    """Raw ``omop_visit_occurrence`` rows -> a COMPACT frame ``person_id`` int64, ``_start`` / ``_end``
+    datetime64[s] (``_end`` NaT = unknown) and ``_cls`` (category: ICU / ED / Inpatient / Outpatient, NaN =
+    unclassified). Roughly 25 bytes per visit, so tens of millions of visits fit in memory. Explicit rules:
 
     1. **Start**: ``visit_start_datetime``; if null, ``visit_start_date`` (start of that day). No start -> dropped.
     2. **End**: ``visit_end_datetime``; if null, ``visit_end_date``. A date-only end (a date column, or a datetime
-       at exactly 00:00:00) is the END of that day when ``date_only_end_of_day`` (a visit ending "2020-03-02" covers
-       the whole of 2 March).
+       at exactly 00:00:00) is the END of that day when ``date_only_end_of_day``.
     3. **End before start** is a charting error: the visit is zero-length at its start.
-    4. **Null end** (``end_known`` False): the visit is treated as open for ``open_days`` days after its start
-       (``None`` = unbounded).
-    5. ``person_id`` is cast to int64 (OMOP ``person_id`` may arrive as text, with or without leading zeros)."""
-    v = visits.copy()
-    v["person_id"] = pd.to_numeric(v["person_id"], errors="coerce")
+    4. ``person_id`` is cast to int64 (OMOP ``person_id`` may arrive as text, with or without leading zeros).
+    The null-end horizon (``open_days``) is applied at matching time (``with_horizon``)."""
+    v = visits
+    pid = pd.to_numeric(v["person_id"], errors="coerce")
     start = _dt(v, "visit_start_datetime")
     start = start.where(start.notna(), _dt(v, "visit_start_date").dt.normalize())
     end = _dt(v, "visit_end_datetime")
@@ -70,34 +73,80 @@ def prepare_visits(visits: pd.DataFrame, open_days: float | None = 30.0, date_on
     if date_only_end_of_day:
         d_end = d_end.dt.normalize() + pd.Timedelta(days=1) - pd.Timedelta(microseconds=1)
     end = end.where(end.notna(), d_end)
-    v = v.assign(_start=start, _end=end)
-    v = v[v["person_id"].notna() & v["_start"].notna()].copy()
-    v["person_id"] = v["person_id"].astype("int64")
-    v["_end"] = v["_end"].where(v["_end"] >= v["_start"], v["_start"]).where(v["_end"].notna(), pd.NaT)
-    v["end_known"] = v["_end"].notna()
-    horizon = pd.Timedelta(days=open_days if open_days is not None else FAR_FUTURE_DAYS)
-    v["_end"] = v["_end"].where(v["end_known"], v["_start"] + horizon)
+    end = end.where(~(end < start), start)
+    ok = (pid.notna() & start.notna()).to_numpy(bool)
+    cls = pd.Series(pd.Categorical([None] * int(ok.sum()), categories=CLASS_CATS), dtype="category")
     cols = [c for c in ("visit_concept_id", "visit_source_value") if c in v]
-    if cols:
-        pairs = v[cols].drop_duplicates().copy()
+    if cols and ok.any():
+        sub = v.loc[ok, cols]
+        pairs = sub.drop_duplicates().copy()
         for c in ("visit_concept_id", "visit_source_value"):
             if c not in pairs:
                 pairs[c] = pd.NA
         pairs["_cls"] = [fa.visit_class(a, b) for a, b in zip(pairs["visit_concept_id"], pairs["visit_source_value"])]
-        v = v.merge(pairs[cols + ["_cls"]], on=cols, how="left")
-    else:
-        v["_cls"] = None
-    return v
+        cls = pd.Series(pd.Categorical(sub.merge(pairs[cols + ["_cls"]], on=cols, how="left")["_cls"].to_numpy(),
+                                       categories=CLASS_CATS))
+    return pd.DataFrame({"person_id": pid[ok].astype("int64").to_numpy(),
+                         "_start": start[ok].astype("datetime64[s]").to_numpy(),
+                         "_end": end[ok].astype("datetime64[s]").to_numpy(),
+                         "_cls": pd.Categorical(cls.to_numpy(object), categories=CLASS_CATS)})
+
+
+def with_horizon(v: pd.DataFrame, open_days: float | None = 30.0) -> pd.DataFrame:
+    """Add ``end_known`` and the closed ``_endf``: a visit with no end is open for ``open_days`` days (None = 100 y)."""
+    horizon = pd.Timedelta(days=open_days if open_days is not None else FAR_FUTURE_DAYS)
+    known = v["_end"].notna()
+    return v.assign(end_known=known, _endf=v["_end"].where(known, v["_start"] + horizon))
+
+
+def prepare_visits(visits: pd.DataFrame, open_days: float | None = 30.0, date_only_end_of_day: bool = True
+                   ) -> pd.DataFrame:
+    """``compact_visits`` (unless already compact) plus the open-end horizon (``with_horizon``)."""
+    v = visits if "_start" in visits else compact_visits(visits, date_only_end_of_day)
+    return with_horizon(v, open_days)
+
+
+def prune_visits(v: pd.DataFrame, bounds: pd.DataFrame, slack_h: float = 0.0) -> pd.DataFrame:
+    """Drop visits that cannot matter to any of the person's EEGs. ``bounds`` is indexed by person_id with the
+    person's earliest (``lo``) and latest (``hi``) EEG start. A visit is kept unless
+    * it starts after ``hi`` + slack (it cannot cover an EEG and cannot be part of an earlier encounter), or
+    * its KNOWN end is more than ``PRUNE_BEFORE_DAYS`` before ``lo`` (it cannot cover an EEG; it could only extend
+      an encounter that began over a year earlier, which fails the 48 h onset window either way).
+    Persons without bounds are dropped."""
+    if bounds is None or not len(v):
+        return v
+    hi = v["person_id"].map(bounds["hi"])
+    lo = v["person_id"].map(bounds["lo"])
+    keep = hi.notna() & (v["_start"] <= hi + pd.Timedelta(hours=slack_h)) & ~(
+        v["_end"].notna() & (v["_end"] < lo - pd.Timedelta(days=PRUNE_BEFORE_DAYS)))
+    return v[keep.to_numpy(bool)]
+
+
+def visit_keys(j: pd.DataFrame, slack_h: float) -> tuple[pd.Series, pd.Series, pd.Series]:
+    """For joined (session, visit) rows with columns ``t0``, ``_start``, ``_endf``, ``_cls``: ``(covered, key, exact)``;
+    ``covered`` is start - slack <= t0 <= end + slack, ``exact`` is the same without slack, and ``key`` is an integer
+    where LOWER is better: exact cover before slack-only
+    cover, then care-setting priority (ICU < ED < Inpatient < Outpatient < unclassified), then the LATEST start."""
+    slack = pd.Timedelta(hours=slack_h)
+    exact = (j["_start"] <= j["t0"]) & (j["t0"] <= j["_endf"])
+    covered = (j["_start"] - slack <= j["t0"]) & (j["t0"] <= j["_endf"] + slack)
+    codes = pd.Series(pd.Categorical(j["_cls"], categories=CLASS_CATS).codes, index=j.index).astype("int64")
+    rank = codes.where(codes >= 0, 4)
+    start_s = j["_start"].astype("datetime64[s]").astype("int64") + _S_OFFSET
+    key = ((~exact).astype("int64") * 8 + rank) * (1 << 35) + ((1 << 34) - 1 - start_s)
+    return covered, key, exact
 
 
 def match_visits(sessions: pd.DataFrame, visits: pd.DataFrame, acute: tuple[str, ...], gap_h: float,
-                 slack_h: float = 0.0, open_days: float | None = 30.0, date_only_end_of_day: bool = True
-                 ) -> pd.DataFrame:
-    """Care-setting visit of each session (index = ``sessions`` index).
+                 slack_h: float = 0.0, open_days: float | None = 30.0, date_only_end_of_day: bool = True,
+                 chunk: int = 20000) -> pd.DataFrame:
+    """Care-setting visit of each session (index = ``sessions`` index). ``visits`` is raw ``omop_visit_occurrence``
+    or already compact (``compact_visits``). Sessions are processed ``chunk`` at a time, so memory is bounded by
+    ``chunk`` x visits-per-person, not by the whole visit table.
 
     **Any-overlap rule** (replaces "the visit with the latest start", which loses a session whenever a short visit
-    nested inside the real admission started later): among ALL of the person's prepared visits (see
-    ``prepare_visits``) whose interval covers t0 (start <= t0 <= end), the visit is chosen by
+    nested inside the real admission started later): among ALL of the person's visits whose interval covers t0
+    (``visit_keys``; null ends per ``with_horizon``), the visit is chosen by
       1. covered exactly before covered only through ``slack_h`` (the interval widened by ``slack_h`` hours both
          sides; 0 = off),
       2. then care-setting priority ICU > ED > Inpatient > Outpatient > unclassified,
@@ -106,53 +155,64 @@ def match_visits(sessions: pd.DataFrame, visits: pd.DataFrame, acute: tuple[str,
     ``encounter_start``, ``visit_match`` ('exact' | 'slack'). ``encounter_start`` is the earliest start among the same
     person's ACUTE visits with a KNOWN end that overlap the matched visit or end within ``gap_h`` before it begins
     (one hop), so an ED visit followed by an admission counts from ED arrival; it is never later than t0 (a visit
-    matched only through ``slack_h`` that starts after the EEG gives an encounter start of t0). NaT / None when unmatched."""
+    matched only through ``slack_h`` that starts after the EEG gives an encounter start of t0). NaT / None when
+    unmatched."""
     out = pd.DataFrame({"visit_class": pd.Series(None, index=sessions.index, dtype=object),
                         "visit_start": pd.Series(pd.NaT, index=sessions.index, dtype="datetime64[us]"),
                         "encounter_start": pd.Series(pd.NaT, index=sessions.index, dtype="datetime64[us]"),
                         "visit_match": pd.Series(None, index=sessions.index, dtype=object)})
-    if not len(sessions) or not len(visits) or not {"person_id", "visit_start_datetime"} & set(visits):
+    if not len(sessions) or not len(visits) or not ({"person_id"} <= set(visits)) or not (
+            {"visit_start_datetime", "visit_start_date", "_start"} & set(visits)):
         return out
     v = prepare_visits(visits, open_days, date_only_end_of_day)
     e = pd.DataFrame({"person_id": sessions["person_id"].astype("int64"),
-                      "t0": sessions["t0"].astype("datetime64[us]"), "_i": sessions.index}).dropna()
+                      "t0": sessions["t0"].astype("datetime64[s]"), "_i": sessions.index}).dropna()
     if not len(e) or not len(v):
         return out
-    slack = pd.Timedelta(hours=slack_h)
-    j = e.merge(v[["person_id", "_start", "_end", "_cls", "end_known"]], on="person_id")
-    exact = (j["_start"] <= j["t0"]) & (j["t0"] <= j["_end"])
-    wide = (j["_start"] - slack <= j["t0"]) & (j["t0"] <= j["_end"] + slack)
-    j = j.assign(_exact=exact)[wide]
-    if not len(j):
-        return out
-    j["_rank"] = j["_cls"].map(ACUITY_RANK).fillna(4)
-    m = j.sort_values(["_i", "_exact", "_rank", "_start"], ascending=[True, False, True, False]
-                      ).drop_duplicates("_i", keep="first")
-    ix = m["_i"].to_numpy()
-    out.loc[ix, "visit_class"] = m["_cls"].to_numpy()
-    out.loc[ix, "visit_start"] = m["_start"].to_numpy()
-    out.loc[ix, "visit_match"] = np.where(m["_exact"], "exact", "slack")
-    # encounter start: one hop back over acute visits (known end) that touch the matched one
+    e = e.sort_values("person_id", kind="stable")
     av = v[v["_cls"].isin(acute) & v["end_known"]][["person_id", "_start", "_end"]]
     gap = pd.Timedelta(hours=gap_h)
-    k = m[["_i", "person_id", "_start"]].merge(av, on="person_id", suffixes=("", "_w"))
-    k = k[(k["_start_w"] <= k["_start"]) & (k["_end"] >= k["_start"] - gap)]
-    chain = k.groupby("_i")["_start_w"].min()
-    enc = m.set_index("_i")["_start"]
-    enc = pd.concat([enc, chain]).groupby(level=0).min()
-    enc = enc.where(enc <= e.set_index("_i")["t0"].reindex(enc.index), e.set_index("_i")["t0"].reindex(enc.index))
-    out.loc[enc.index.to_numpy(), "encounter_start"] = enc.to_numpy()
+    vv = v[["person_id", "_start", "_endf", "_cls"]]
+    for a in range(0, len(e), chunk):
+        ec = e.iloc[a:a + chunk]
+        pids = ec["person_id"].unique()
+        j = ec.merge(vv[vv["person_id"].isin(pids)], on="person_id")
+        if not len(j):
+            continue
+        covered, key, exact = visit_keys(j, slack_h)
+        j = j.assign(_key=key, _exact=exact)[covered.to_numpy(bool)]
+        if not len(j):
+            continue
+        m = j.sort_values(["_i", "_key"]).drop_duplicates("_i", keep="first")
+        ix = m["_i"].to_numpy()
+        out.loc[ix, "visit_class"] = m["_cls"].astype(object).where(m["_cls"].notna(), None).to_numpy()
+        out.loc[ix, "visit_start"] = m["_start"].astype("datetime64[us]").to_numpy()
+        out.loc[ix, "visit_match"] = np.where(m["_exact"], "exact", "slack")
+        k = m[["_i", "person_id", "_start", "t0"]].merge(av[av["person_id"].isin(m["person_id"].unique())],
+                                                         on="person_id", suffixes=("", "_w"))
+        k = k[(k["_start_w"] <= k["_start"]) & (k["_end"] >= k["_start"] - gap)]
+        chain = k.groupby("_i")["_start_w"].min()
+        enc = m.set_index("_i")["_start"]
+        enc = pd.concat([enc, chain]).groupby(level=0).min()
+        t0 = m.set_index("_i")["t0"].reindex(enc.index)
+        enc = enc.where(enc <= t0, t0)
+        out.loc[enc.index.to_numpy(), "encounter_start"] = enc.astype("datetime64[us]").to_numpy()
     return out
 
 
 # ---------------------------------------------------------------------------------------------- scores
+@lru_cache(maxsize=200_000)
+def _score_key(name: str) -> str | None:
+    r = lx.classify_measurement(name)
+    return r.key if r is not None and r.domain == "score" else None
+
+
 def filter_score_rows(meas: pd.DataFrame) -> pd.DataFrame:
     """Keep ``omop_measurement`` rows that are a GCS / FOUR item (total or component); add ``key``."""
     if not len(meas) or "measurement_source_value" not in meas:
         return meas.iloc[0:0].assign(key=pd.Series(dtype=object))
     names = meas["measurement_source_value"].astype("string")
-    cls = {n: (r.key if (r := lx.classify_measurement(n)) is not None and r.domain == "score" else None)
-           for n in names.dropna().unique()}
+    cls = {n: _score_key(n) for n in names.dropna().unique()}
     key = names.map(cls)
     keep = key.isin(SCORE_KEYS).fillna(False).to_numpy(bool)
     return meas.loc[keep].assign(key=key[keep].astype(object))
@@ -169,29 +229,45 @@ def _times(m: pd.DataFrame) -> pd.Series:
     return t
 
 
-def extract_scores(meas: pd.DataFrame) -> pd.DataFrame:
-    """Long frame ``person_id, t, instrument ('gcs'|'four'), value`` from raw GCS / FOUR rows.
-
-    Implausible values (``lexicon.PLAUSIBLE``) are dropped, never clipped. A GCS total is taken as charted; when
-    the eye, motor and verbal components are all charted at the SAME timestamp and no total is, the total is their
-    sum (verbal 'T'/intubated text values are non-numeric and simply absent)."""
-    cols = ["person_id", "t", "instrument", "value"]
-    if not len(meas):
-        return pd.DataFrame({c: pd.Series(dtype=object) for c in cols})
+def compact_scores(meas: pd.DataFrame) -> pd.DataFrame:
+    """Raw GCS / FOUR measurement rows -> COMPACT frame ``person_id`` int64, ``t`` datetime64[s], ``key`` category
+    (``SCORE_KEYS``), ``value`` float32. Rows without a time or with an implausible value (``lexicon.PLAUSIBLE``;
+    dropped, never clipped) are removed; non-score rows are removed. Safe to call per batch."""
+    cols = {"person_id": np.zeros(0, "int64"), "t": np.zeros(0, "datetime64[s]"),
+            "key": pd.Categorical([], categories=list(SCORE_KEYS)), "value": np.zeros(0, "float32")}
+    if not len(meas) or "measurement_source_value" not in meas:
+        return pd.DataFrame(cols)
     m = meas if "key" in meas else filter_score_rows(meas)
-    m = pd.DataFrame({"person_id": m["person_id"].astype("int64").to_numpy(), "t": _times(m).to_numpy(),
-                      "key": m["key"].to_numpy(),
-                      "value": pd.to_numeric(m["value_as_number"], errors="coerce").to_numpy()})
-    lo_hi = m["key"].map(lx.PLAUSIBLE)
-    in_range = np.array([lh is not None and lh[0] <= v <= lh[1] for lh, v in zip(lo_hi, m["value"])], dtype=bool)
-    m = m[(m["t"].notna() & m["value"].notna()).to_numpy(bool) & in_range]
+    if not len(m):
+        return pd.DataFrame(cols)
+    t = _times(m)
+    val = pd.to_numeric(m["value_as_number"], errors="coerce")
+    key = pd.Series(m["key"].to_numpy(object), index=m.index)
+    lo = key.map({k: v[0] for k, v in lx.PLAUSIBLE.items()}).astype(float)
+    hi = key.map({k: v[1] for k, v in lx.PLAUSIBLE.items()}).astype(float)
+    ok = (t.notna() & val.notna() & (val >= lo) & (val <= hi)).to_numpy(bool)
+    return pd.DataFrame({"person_id": pd.to_numeric(m["person_id"]).to_numpy()[ok].astype("int64"),
+                         "t": t[ok].astype("datetime64[s]").to_numpy(),
+                         "key": pd.Categorical(key[ok].to_numpy(object), categories=list(SCORE_KEYS)),
+                         "value": val[ok].to_numpy("float32")})
+
+
+def finish_scores(c: pd.DataFrame) -> pd.DataFrame:
+    """Compact scores -> long frame ``person_id, t, instrument ('gcs'|'four'), value``. A GCS total is taken as
+    charted; when eye, motor and verbal are all charted at the SAME timestamp and no total is, the total is their sum
+    (verbal 'T'/intubated text values are non-numeric and simply absent)."""
+    cols = ["person_id", "t", "instrument", "value"]
+    if not len(c):
+        return pd.DataFrame({k: pd.Series(dtype=object) for k in cols})
+    m = pd.DataFrame({"person_id": c["person_id"].to_numpy(), "t": c["t"].to_numpy(),
+                      "key": c["key"].astype(object).to_numpy(), "value": c["value"].to_numpy("float64")})
     comp = m[m["key"].isin(_COMPONENTS)]
     wide = comp.pivot_table(index=["person_id", "t"], columns="key", values="value", aggfunc="min")
     if len(wide) and set(_COMPONENTS) <= set(wide.columns):
         wide = wide.dropna(subset=list(_COMPONENTS))
         summed = wide[list(_COMPONENTS)].sum(axis=1).rename("value").reset_index().assign(key="gcs")
     else:
-        summed = pd.DataFrame({"person_id": pd.Series(dtype="int64"), "t": pd.Series(dtype="datetime64[us]"),
+        summed = pd.DataFrame({"person_id": pd.Series(dtype="int64"), "t": pd.Series(dtype="datetime64[s]"),
                                "value": pd.Series(dtype=float), "key": pd.Series(dtype=object)})
     tot = m[m["key"].isin(("gcs", "four"))][["person_id", "t", "key", "value"]]
     if len(summed):
@@ -202,6 +278,13 @@ def extract_scores(meas: pd.DataFrame) -> pd.DataFrame:
     both = both.rename(columns={"key": "instrument"})
     both["t"] = both["t"].astype("datetime64[us]")
     return both[cols].reset_index(drop=True)
+
+
+def extract_scores(meas: pd.DataFrame) -> pd.DataFrame:
+    """Long frame ``person_id, t, instrument, value`` from raw GCS / FOUR rows OR from ``compact_scores`` output."""
+    if {"person_id", "t", "key", "value"} <= set(meas.columns) and "measurement_source_value" not in meas:
+        return finish_scores(meas)
+    return finish_scores(compact_scores(meas))
 
 
 # ------------------------------------------------------------------------------------------------ onset

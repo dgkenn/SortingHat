@@ -31,7 +31,7 @@ from .. import data_io, schema
 from ..audit import field_audit as fa
 from ..safe_output import SUPPRESS_BELOW, SUPPRESSED, assert_aggregate_only, safe_quantiles, suppress_count
 from . import rules
-from .sources import MERGE_PREFIX, StoreSources
+from .sources import MERGE_PREFIX, StoreSources, _VISIT_COLS
 
 QS = (0.05, 0.1, 0.25, 0.5, 0.75, 0.9, 0.95)
 _DIGITS = re.compile(r"\d{3,}")
@@ -71,53 +71,155 @@ def _hours_q(x: pd.Series) -> dict:
 
 
 # ------------------------------------------------------------------------------------------ visit geometry
-def _closed_variants(e: pd.DataFrame, v: pd.DataFrame, chunk: int = CHUNK) -> pd.DataFrame:
-    """Per session (index of ``e``): covered by a visit interval under four variants (see module doc)."""
-    cols = {k: np.zeros(len(e), bool) for k in ("closed", "widened_24h", "null_end_30d", "widened_and_null_end_30d")}
-    vv = v[["person_id", "_s", "_e"]]
-    d24, d30 = pd.Timedelta(hours=24), pd.Timedelta(days=30)
-    for a in range(0, len(e), chunk):
-        ec = e.iloc[a:a + chunk]
-        j = ec[["person_id", "t0"]].reset_index().merge(vv, on="person_id")
-        if not len(j):
-            continue
-        t, s, en = j["t0"], j["_s"], j["_e"]
-        en30 = en.where(en.notna(), s + d30)
-        variants = {"closed": en.notna() & (s <= t) & (t <= en),
-                    "widened_24h": en.notna() & (s - d24 <= t) & (t <= en + d24),
-                    "null_end_30d": (s <= t) & (t <= en30),
-                    "widened_and_null_end_30d": (s - d24 <= t) & (t <= en30 + d24)}
-        key = j.columns[0]
-        for name, m in variants.items():
-            hit = e.index.get_indexer(j.loc[m.to_numpy(), key].unique())
-            cols[name][hit[hit >= 0]] = True
-    return pd.DataFrame(cols, index=e.index)
-
-
 def _visit_frame(visits: pd.DataFrame) -> pd.DataFrame:
-    """Visits with raw (unrepaired) start/end: ``_s`` (datetime, else the date), ``_e`` (NaT if none)."""
-    v = visits.copy()
-    v["person_id"] = pd.to_numeric(v["person_id"], errors="coerce")
-    s = rules._dt(v, "visit_start_datetime")
-    v["_s"] = s.where(s.notna(), rules._dt(v, "visit_start_date"))
-    en = rules._dt(v, "visit_end_datetime")
-    v["_e"] = en.where(en.notna(), rules._dt(v, "visit_end_date"))
-    v["_s_date_only"] = v["_s"].notna() & (v["_s"] == v["_s"].dt.normalize())
-    v["_e_date_only"] = v["_e"].notna() & (v["_e"] == v["_e"].dt.normalize())
-    v = v[v["person_id"].notna() & v["_s"].notna()].copy()
-    v["person_id"] = v["person_id"].astype("int64")
-    return v
+    """Visits with raw (unrepaired) start/end as datetime64[s]: ``_s`` (datetime, else the date), ``_e`` (NaT if
+    none), and date-only flags. Only the columns the diagnostic needs are kept."""
+    pid = pd.to_numeric(visits["person_id"], errors="coerce")
+    s_ = rules._dt(visits, "visit_start_datetime")
+    s_ = s_.where(s_.notna(), rules._dt(visits, "visit_start_date"))
+    e_ = rules._dt(visits, "visit_end_datetime")
+    e_ = e_.where(e_.notna(), rules._dt(visits, "visit_end_date"))
+    ok = (pid.notna() & s_.notna()).to_numpy(bool)
+    return pd.DataFrame({"person_id": pid[ok].astype("int64").to_numpy(),
+                         "_s": s_[ok].astype("datetime64[s]").to_numpy(), "_e": e_[ok].astype("datetime64[s]").to_numpy(),
+                         "_s_date_only": (s_[ok] == s_[ok].dt.normalize()).to_numpy(),
+                         "_e_date_only": (e_[ok].notna() & (e_[ok] == e_[ok].dt.normalize())).to_numpy()})
 
 
-def _nearest_diff(e: pd.DataFrame, v: pd.DataFrame, col: str) -> pd.Series:
-    """EEG start minus the person's nearest visit ``col`` (hours, signed; positive = EEG after the visit time)."""
-    vv = v[["person_id", col]].dropna().sort_values(col)
-    ee = e[["person_id", "t0"]].assign(_i=e.index).sort_values("t0")
-    if not len(vv) or not len(ee):
-        return pd.Series(dtype=float)
-    m = pd.merge_asof(ee, vv.rename(columns={col: "_k"}), left_on="t0", right_on="_k", by="person_id",
-                      direction="nearest")
-    return pd.Series(((m["t0"] - m["_k"]).dt.total_seconds() / 3600.0).to_numpy(), index=m["_i"].to_numpy())
+class _Counts:
+    """Capped value counter: at most ``cap`` distinct values are tracked; the rest are pooled."""
+
+    def __init__(self, cap: int = 20000):
+        self.c: dict[str, int] = {}
+        self.cap, self.pooled, self.nulls = cap, 0, 0
+
+    def add(self, s: pd.Series) -> None:
+        self.nulls += int(s.isna().sum())
+        for k, n in s.dropna().astype(str).value_counts().items():
+            if k in self.c or len(self.c) < self.cap:
+                self.c[k] = self.c.get(k, 0) + int(n)
+            else:
+                self.pooled += int(n)
+
+    def report(self, top: int | None = None, numeric: bool = False) -> dict:
+        vc = pd.Series(self.c, dtype="int64").sort_values(ascending=False)
+        shown = vc[vc >= SUPPRESS_BELOW]
+        if top is not None:
+            shown = shown.iloc[:top]
+        other = int(vc.sum() - shown.sum()) + self.pooled
+        return {"n_distinct": suppress_count(len(vc)),
+                "values": [{"value": str(v) if numeric else _safe_text(v), "n": int(n)} for v, n in shown.items()],
+                "other_values_n": suppress_count(other), "null_n": suppress_count(self.nulls)}
+
+
+class _Acc:
+    """Per-session and per-site accumulators, updated one visit chunk at a time (nothing else is kept)."""
+
+    def __init__(self, a: pd.DataFrame, site_list: list[str]):
+        self.pid = a["person_id"].to_numpy("int64")
+        self.t0 = a["t0"].astype("datetime64[s]").to_numpy()
+        self.site_ix = pd.Categorical(a["SiteID"], categories=site_list).codes.astype("int64")
+        self.nsite = len(site_list)
+        n = len(a)
+        self.best_key = np.full(n, np.iinfo("int64").max, "int64")
+        self.d_s_abs, self.d_s = np.full(n, np.inf), np.full(n, np.nan)
+        self.d_e_abs, self.d_e = np.full(n, np.inf), np.full(n, np.nan)
+        self.cover = {k: np.zeros(n, bool) for k in ("closed", "widened_24h", "null_end_30d",
+                                                    "widened_and_null_end_30d")}
+        self.latest = np.full(n, np.iinfo("int64").min, "int64")
+        self.latest_end_known = np.zeros(n, bool)
+        self.upids = np.unique(self.pid)
+        self.p_site = np.zeros(len(self.upids), "int64")
+        self.p_site[np.searchsorted(self.upids, self.pid)] = self.site_ix
+        self.pmin = np.full(len(self.upids), np.iinfo("int64").max, "int64")
+        self.pmax = np.full(len(self.upids), np.iinfo("int64").min, "int64")
+        self.seen: list[np.ndarray] = []
+        z = lambda: np.zeros(self.nsite, "int64")          # noqa: E731
+        self.rows, self.null_end, self.mid_start, self.known_end, self.mid_end = z(), z(), z(), z(), z()
+        self.concept, self.source = _Counts(), _Counts()
+        self.site_concept = [_Counts() for _ in range(self.nsite)]
+        self.n_rows = self.n_start_null = 0
+        self.pid_dtype = None
+
+    def add(self, raw: pd.DataFrame) -> None:
+        self.n_rows += len(raw)
+        self.pid_dtype = self.pid_dtype or str(raw["person_id"].dtype)
+        self.n_start_null += int(rules._dt(raw, "visit_start_datetime").isna().sum()) if "visit_start_datetime" in raw else 0
+        v = _visit_frame(raw)
+        if not len(v):
+            return
+        d24, d30 = pd.Timedelta(hours=24), pd.Timedelta(days=30)
+        self.seen.append(np.unique(v["person_id"].to_numpy()))
+        # ---- per-site visit-row statistics, concept / source counts, person date ranges (adult-session persons only)
+        pi = np.searchsorted(self.upids, v["person_id"].to_numpy())
+        pi_c = np.minimum(pi, len(self.upids) - 1)
+        valid = self.upids[pi_c] == v["person_id"].to_numpy()
+        if valid.any():
+            si = self.p_site[pi_c[valid]]
+            vv = v[valid]
+            e_known = vv["_e"].notna().to_numpy()
+            bc = lambda m: np.bincount(si[m], minlength=self.nsite)       # noqa: E731
+            self.rows += bc(np.ones(len(vv), bool))
+            self.null_end += bc(~e_known)
+            self.mid_start += bc(vv["_s_date_only"].to_numpy())
+            self.known_end += bc(e_known)
+            self.mid_end += bc(vv["_e_date_only"].to_numpy())
+            self.concept.add(raw["visit_concept_id"] if "visit_concept_id" in raw else pd.Series(dtype=object))
+            self.source.add(raw["visit_source_value"] if "visit_source_value" in raw else pd.Series(dtype=object))
+            if "visit_concept_id" in raw:
+                rp = pd.to_numeric(raw["person_id"], errors="coerce")
+                ri = np.minimum(np.searchsorted(self.upids, rp.fillna(-1).astype("int64").to_numpy()), len(self.upids) - 1)
+                rv = self.upids[ri] == rp.fillna(-1).astype("int64").to_numpy()
+                for k in range(self.nsite):
+                    m = rv & (self.p_site[ri] == k)
+                    if m.any():
+                        self.site_concept[k].add(raw.loc[m, "visit_concept_id"])
+            hi = vv["_e"].where(vv["_e"].notna(), vv["_s"])
+            g = pd.DataFrame({"p": pi[valid], "lo": vv["_s"].astype("int64").to_numpy(),
+                              "hi": hi.astype("int64").to_numpy()}).groupby("p").agg(lo=("lo", "min"), hi=("hi", "max"))
+            self.pmin[g.index] = np.minimum(self.pmin[g.index], g["lo"].to_numpy())
+            self.pmax[g.index] = np.maximum(self.pmax[g.index], g["hi"].to_numpy())
+        # ---- per-session geometry against this chunk's visits
+        sidx = np.nonzero(np.isin(self.pid, v["person_id"].unique()))[0]
+        if not len(sidx):
+            return
+        es = pd.DataFrame({"person_id": self.pid[sidx], "t0": self.t0[sidx], "_i": sidx})
+        j = es.merge(v[["person_id", "_s", "_e"]], on="person_id")
+        t, s_, en = j["t0"], j["_s"], j["_e"]
+        en30 = en.where(en.notna(), s_ + d30)
+        variants = {"closed": en.notna() & (s_ <= t) & (t <= en),
+                    "widened_24h": en.notna() & (s_ - d24 <= t) & (t <= en + d24),
+                    "null_end_30d": (s_ <= t) & (t <= en30),
+                    "widened_and_null_end_30d": (s_ - d24 <= t) & (t <= en30 + d24)}
+        for name, m in variants.items():
+            self.cover[name][j.loc[m.to_numpy(), "_i"].unique()] = True
+        dh = (t - s_).dt.total_seconds() / 3600.0
+        self._nearest(j["_i"], dh, self.d_s_abs, self.d_s)
+        k = en.notna().to_numpy()
+        self._nearest(j.loc[k, "_i"], ((t - en).dt.total_seconds() / 3600.0)[k], self.d_e_abs, self.d_e)
+        bk = (s_ <= t).to_numpy()
+        if bk.any():
+            jb = j[bk].sort_values(["_i", "_s"]).drop_duplicates("_i", keep="last")
+            upd = jb["_s"].astype("int64").to_numpy() > self.latest[jb["_i"].to_numpy()]
+            ii = jb["_i"].to_numpy()[upd]
+            self.latest[ii] = jb["_s"].astype("int64").to_numpy()[upd]
+            self.latest_end_known[ii] = jb["_e"].notna().to_numpy()[upd]
+        # ---- the cohort's current matching rule (rules.match_visits semantics, default knobs)
+        cv = rules.with_horizon(rules.compact_visits(raw))
+        j2 = es.merge(cv[["person_id", "_start", "_endf", "_cls"]], on="person_id")
+        covered, key, _ = rules.visit_keys(j2, 0.0)
+        if covered.any():
+            kk = pd.DataFrame({"_i": j2.loc[covered, "_i"].to_numpy(), "k": key[covered].to_numpy()}).groupby("_i")["k"].min()
+            self.best_key[kk.index] = np.minimum(self.best_key[kk.index], kk.to_numpy())
+
+    @staticmethod
+    def _nearest(i: pd.Series, dh: pd.Series, best_abs: np.ndarray, best: np.ndarray) -> None:
+        d = pd.DataFrame({"i": i.to_numpy(), "dh": dh.to_numpy(), "a": np.abs(dh.to_numpy())})
+        d = d.sort_values(["i", "a"]).drop_duplicates("i")
+        ii = d["i"].to_numpy()
+        upd = d["a"].to_numpy() < best_abs[ii]
+        best_abs[ii[upd]] = d["a"].to_numpy()[upd]
+        best[ii[upd]] = d["dh"].to_numpy()[upd]
 
 
 # ------------------------------------------------------------------------------------------ id-join checks
@@ -183,16 +285,19 @@ def _duration_by_service(S: pd.DataFrame) -> dict:
 
 
 # ----------------------------------------------------------------------------------------------- main entry
-def run_diag(store, sites: list[str] | None = None) -> tuple[dict, set[str]]:
-    """Return ``(aggregate_report, known_ids)``. ``known_ids`` are the record identifiers seen (to prove none leaks)."""
+def run_diag(store, sites: list[str] | None = None, min_rows: int = 500_000) -> tuple[dict, set[str]]:
+    """Return ``(aggregate_report, known_ids)``. ``known_ids`` are the record identifiers seen (to prove none leaks).
+
+    Memory: the visit table is read one coalesced row-group chunk at a time and folded into per-session /
+    per-site accumulators (``_Acc``); no visit frame is ever kept."""
     src = StoreSources(store, sites)
     S = src.sessions().reset_index(drop=True)
     site_list = sorted(S["SiteID"].astype(str).unique())
     adult = S[S["person_id"].notna() & S["t0"].notna() & (S["age_years"] >= 18)].copy()
     adult["person_id"] = adult["person_id"].astype("int64")
     adult["SiteID"] = adult["SiteID"].astype(str)
+    adult = adult.reset_index(drop=True)
 
-    # alternative id forms, from the raw metadata, per site
     forms = []
     for site in site_list:
         try:
@@ -202,24 +307,28 @@ def run_diag(store, sites: list[str] | None = None) -> tuple[dict, set[str]]:
         f = _id_forms(meta, site)
         f["SiteID"] = site
         forms.append(f)
+        del meta
     forms = pd.concat(forms, ignore_index=True) if forms else pd.DataFrame()
-    cand_ids = set(adult["person_id"])
+    cand = set(adult["person_id"].unique())
     if len(forms):
-        cand_ids |= set(forms["bd_num"].dropna().astype("int64")) | set(forms["bids_num"].dropna().astype("int64"))
+        cand |= set(forms["bd_num"].dropna().astype("int64")) | set(forms["bids_num"].dropna().astype("int64"))
+    known = {str(i) for i in cand} | set(S["SessionID"].dropna().astype(str))
 
-    visits = src.visits(sorted(cand_ids))
-    v = _visit_frame(visits)
-    vpids = set(v["person_id"])
-    known = {str(i) for i in cand_ids} | set(S["SessionID"].dropna().astype(str))
+    acc = _Acc(adult, site_list)
+    columns_seen: set[str] = set()
+    for raw in src.iter_rows("omop_visit_occurrence", _VISIT_COLS, sorted(cand), min_rows=min_rows):
+        columns_seen |= set(raw.columns)
+        acc.add(raw)
+        del raw
+    vp = np.unique(np.concatenate(acc.seen)) if acc.seen else np.zeros(0, "int64")
 
     report: dict = {"note": "aggregates only; counts < 11 shown as \"<11\"; quantiles need n >= 11; hours are signed "
                             "(EEG start minus visit time: positive = EEG after the visit time)",
                     "sites": {}, "visit_concept_id": {}, "visit_source_value": {}}
     report["visit_table"] = {
-        "n_visit_rows_for_adult_candidates": suppress_count(len(visits)),
-        "pid_dtype_after_read": str(visits["person_id"].dtype) if len(visits) else "n/a",
-        "columns_read": sorted(c for c in visits.columns),
-        "share_start_datetime_null": _share(rules._dt(visits, "visit_start_datetime").isna()) if len(visits) else SUPPRESSED}
+        "n_visit_rows_for_adult_candidates": suppress_count(acc.n_rows),
+        "pid_dtype_after_read": acc.pid_dtype or "n/a", "columns_read": sorted(columns_seen),
+        "share_start_datetime_null": _count_share(acc.n_start_null, acc.n_rows)}
     parts = data_io.omop_parts(store, "visit_occurrence")
     if parts:
         try:
@@ -229,26 +338,21 @@ def run_diag(store, sites: list[str] | None = None) -> tuple[dict, set[str]]:
         except Exception:                                                  # noqa: BLE001
             report["visit_table"]["pid_arrow_type"] = "unreadable"
 
-    cur = rules.match_visits(adult, visits, ("ICU", "Inpatient", "ED"), 6.0)
-    cover = _closed_variants(adult[["person_id", "t0"]], v)
-    d_start, d_end = _nearest_diff(adult, v, "_s"), _nearest_diff(adult, v, "_e")
-    pmin = v.groupby("person_id")["_s"].min()
-    pmax = v.assign(_hi=v["_e"].where(v["_e"].notna(), v["_s"])).groupby("person_id")["_hi"].max()
-    back = pd.merge_asof(adult[["person_id", "t0"]].assign(_i=adult.index).sort_values("t0"),
-                         v[["person_id", "_s", "_e"]].sort_values("_s"), left_on="t0", right_on="_s",
-                         by="person_id", direction="backward").set_index("_i")
-
-    for site in site_list:
-        a = adult[adult["SiteID"] == site]
-        if a.empty:
+    has_all = np.isin(acc.pid, vp)
+    matched = acc.best_key < np.iinfo("int64").max
+    rank = (acc.best_key // (1 << 35)) % 8
+    names = np.array(rules.CLASS_CATS + ["unclassified"], dtype=object)
+    cls_name = np.where(matched, names[np.minimum(rank, 4)], "no_visit")
+    pidx = np.searchsorted(acc.upids, acc.pid)
+    for k, site in enumerate(site_list):
+        m = acc.site_ix == k
+        if not m.any():
             continue
-        ix = a.index
-        has = a["person_id"].isin(vpids)
-        blk = {"n_adult_sessions_with_start": suppress_count(len(a)),
-               "share_pid_has_any_visit_row": _share(has)}
+        has = has_all & m
+        blk = {"n_adult_sessions_with_start": suppress_count(int(m.sum())),
+               "share_pid_has_any_visit_row": _share(pd.Series(has_all[m]))}
         f = forms[forms["SiteID"] == site] if len(forms) else forms
         if len(f):
-            keyed = f["bd_num"].dropna().astype("int64"), f["bids_num"].dropna().astype("int64")
             blk["id_join"] = {
                 "n_metadata_sessions": suppress_count(len(f)),
                 "share_bdsp_id_blank": _share(f["bd_blank"]),
@@ -256,45 +360,39 @@ def run_diag(store, sites: list[str] | None = None) -> tuple[dict, set[str]]:
                 "share_bdsp_id_leading_zero": _share(f["bd_leading_zero"]),
                 "share_bdsp_and_folder_ids_differ": _share(
                     f["bd_num"].notna() & f["bids_num"].notna() & (f["bd_num"] != f["bids_num"])),
-                "share_with_visit_via_bdsp_id_number": _share(f["bd_num"].isin(vpids)[f["bd_num"].notna()]),
-                "share_with_visit_via_folder_tail": _share(f["bids_num"].isin(vpids)[f["bids_num"].notna()])}
-        hv = a[has]
-        blk["share_without_visit_row_by_pid"] = _share(~has)
-        if len(hv):
-            hix = hv.index
-            blk["visit_end_null_share_of_visit_rows"] = _share(
-                v[v["person_id"].isin(set(a["person_id"]))]["_e"].isna())
-            vs = v[v["person_id"].isin(set(a["person_id"]))]
-            blk["visit_start_midnight_share"] = _share(vs["_s_date_only"])
-            blk["visit_end_midnight_share_of_known_ends"] = _share(vs.loc[vs["_e"].notna(), "_e_date_only"])
-            blk["share_latest_start_visit_has_null_end"] = _share(back.loc[hix, "_e"].isna() & back.loc[hix, "_s"].notna())
-            blk["hours_eeg_minus_nearest_visit_start"] = _hours_q(d_start.reindex(hix))
-            blk["hours_eeg_minus_nearest_visit_end"] = _hours_q(d_end.reindex(hix))
-            blk["share_eeg_date_outside_visit_date_range"] = _share(
-                (a.loc[hix, "t0"].dt.normalize() < a.loc[hix, "person_id"].map(pmin).dt.normalize())
-                | (a.loc[hix, "t0"].dt.normalize() > a.loc[hix, "person_id"].map(pmax).dt.normalize()))
-        blk["share_covered_of_all_adult_eegs"] = {k: _share(cover.loc[ix, k]) for k in cover.columns}
+                "share_with_visit_via_bdsp_id_number": _share(f["bd_num"].isin(vp)[f["bd_num"].notna()]),
+                "share_with_visit_via_folder_tail": _share(f["bids_num"].isin(vp)[f["bids_num"].notna()])}
+        blk["share_without_visit_row_by_pid"] = _share(pd.Series(~has_all[m]))
         if has.any():
-            blk["share_covered_of_eegs_with_a_visit_row"] = {k: _share(cover.loc[hv.index, k]) for k in cover.columns}
-        blk["share_matched_by_current_rule"] = _share(cur.loc[ix, "visit_start"].notna())
-        blk["share_matched_acute_by_current_rule"] = _share(cur.loc[ix, "visit_class"].isin(["ICU", "Inpatient", "ED"]))
-        blk["current_rule_visit_class_counts"] = _counts(cur.loc[ix, "visit_class"].fillna("unclassified").where(
-            cur.loc[ix, "visit_start"].notna(), "no_visit"))
+            blk["visit_end_null_share_of_visit_rows"] = _count_share(acc.null_end[k], acc.rows[k])
+            blk["visit_start_midnight_share"] = _count_share(acc.mid_start[k], acc.rows[k])
+            blk["visit_end_midnight_share_of_known_ends"] = _count_share(acc.mid_end[k], acc.known_end[k])
+            lat = has & (acc.latest > np.iinfo("int64").min)
+            blk["share_latest_start_visit_has_null_end"] = _share(pd.Series(~acc.latest_end_known[lat]))
+            blk["hours_eeg_minus_nearest_visit_start"] = _hours_q(pd.Series(acc.d_s[has]))
+            blk["hours_eeg_minus_nearest_visit_end"] = _hours_q(pd.Series(acc.d_e[has]))
+            t0d = acc.t0[has].astype("datetime64[D]")
+            lo = acc.pmin[pidx[has]].astype("datetime64[s]").astype("datetime64[D]")
+            hi = acc.pmax[pidx[has]].astype("datetime64[s]").astype("datetime64[D]")
+            blk["share_eeg_date_outside_visit_date_range"] = _share(pd.Series((t0d < lo) | (t0d > hi)))
+        blk["share_covered_of_all_adult_eegs"] = {n: _share(pd.Series(c[m])) for n, c in acc.cover.items()}
+        if has.any():
+            blk["share_covered_of_eegs_with_a_visit_row"] = {n: _share(pd.Series(c[has])) for n, c in acc.cover.items()}
+        blk["share_matched_by_current_rule"] = _share(pd.Series(matched[m]))
+        blk["share_matched_acute_by_current_rule"] = _share(pd.Series(matched[m] & (rank[m] <= 2)))
+        blk["current_rule_visit_class_counts"] = _counts(pd.Series(cls_name[m]))
         report["sites"][site] = blk
 
-    vc = v[v["person_id"].isin(cand_ids)]
-    report["visit_concept_id"] = _counts(vc["visit_concept_id"] if "visit_concept_id" in vc else pd.Series(dtype=str),
-                                         numeric=True)
-    report["visit_source_value"] = _counts(vc["visit_source_value"] if "visit_source_value" in vc else pd.Series(
-        dtype=str), top=20)
-    report["visit_concept_id_by_site"] = {}
-    if "visit_concept_id" in vc:
-        site_of = adult.drop_duplicates("person_id").set_index("person_id")["SiteID"]
-        for site in site_list:
-            m = vc["person_id"].map(site_of) == site
-            if m.any():
-                report["visit_concept_id_by_site"][site] = _counts(vc.loc[m, "visit_concept_id"], numeric=True)
+    report["visit_concept_id"] = acc.concept.report(numeric=True)
+    report["visit_source_value"] = acc.source.report(top=20)
+    report["visit_concept_id_by_site"] = {site: acc.site_concept[k].report(numeric=True)
+                                          for k, site in enumerate(site_list) if acc.site_concept[k].c}
     report["merge_history_table"] = _merge_history_names(store)
     report["duration_by_service"] = _duration_by_service(S)
     assert_aggregate_only(report, known)
     return report, known
+
+
+def _count_share(n: int, den: int) -> dict:
+    return {"n": suppress_count(int(n)), "of": suppress_count(int(den)),
+            "share": round(n / den, 4) if n >= SUPPRESS_BELOW and den >= SUPPRESS_BELOW else SUPPRESSED}

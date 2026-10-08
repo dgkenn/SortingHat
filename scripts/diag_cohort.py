@@ -15,6 +15,7 @@ from pathlib import Path
 sys.path.insert(0, str(Path(__file__).resolve().parents[1]))     # repo root, so `sortinghat` imports
 
 from sortinghat import agent_safety, data_io                       # noqa: E402
+from sortinghat.cohort.memguard import peak_rss_gb, run_guarded     # noqa: E402
 from sortinghat.cohort.diag import run_diag                         # noqa: E402
 from sortinghat.safe_output import safe_write_json                  # noqa: E402
 
@@ -27,7 +28,14 @@ def main(argv=None) -> int:
     ap.add_argument("--profile", help="AWS profile for --s3")
     ap.add_argument("--sites", nargs="+", help="site codes (default: every site with an eeg-metadata CSV)")
     ap.add_argument("--out", help="also write the JSON here (aggregate only)")
+    ap.add_argument("--max-memory-gb", type=float, default=None,
+                    help="guard: set RLIMIT_AS to this many GB (address space, an upper bound on RSS; pick generously) "
+                         "and print a clear aggregate error instead of a traceback if exceeded")
     a = ap.parse_args(argv)
+    return run_guarded(lambda: _run(a), a.max_memory_gb, "cohort diagnostic")
+
+
+def _run(a) -> int:
     if a.data:
         agent_safety.assert_not_restricted_in_agent(a.data)
     store = data_io.open_store(a.data, profile=a.profile)            # make_client refuses inside an agent session
@@ -35,6 +43,7 @@ def main(argv=None) -> int:
     if a.out:
         safe_write_json(a.out, report, known)
     print(json.dumps(report, indent=1))
+    print(f"peak RSS: {peak_rss_gb():.2f} GB", file=sys.stderr)
     return 0
 
 

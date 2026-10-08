@@ -77,6 +77,44 @@ def resolve_merges(m: dict[int, int], max_hops: int = 20) -> dict[int, int]:
 
 
 
+def remap_ids(df: pd.DataFrame, mm: dict[int, int] | None) -> pd.DataFrame:
+    """Re-key ``person_id`` through the merge map (retired -> surviving id)."""
+    if not mm or not len(df):
+        return df
+    pid = pd.to_numeric(df["person_id"], errors="coerce")
+    mapped = pid.map(mm)
+    return df.assign(person_id=mapped.where(mapped.notna(), pid).astype("int64"))
+
+
+def concat_frames(chunks: list[pd.DataFrame], like: pd.DataFrame) -> pd.DataFrame:
+    """Concatenate compact chunks COLUMN BY COLUMN, releasing each chunk's column as soon as it is copied, so the peak
+    is about the result plus one column (``pd.concat`` would hold the chunks and a full copy together)."""
+    if not chunks:
+        return like.iloc[0:0]
+    out: dict = {}
+    for col in like.columns:
+        if isinstance(like[col].dtype, pd.CategoricalDtype):
+            cats = list(like[col].cat.categories)
+            codes = np.concatenate([c[col].cat.codes.to_numpy() for c in chunks])
+            out[col] = pd.Categorical.from_codes(codes, categories=cats)
+        else:
+            out[col] = np.concatenate([c[col].to_numpy() for c in chunks])
+        for c in chunks:
+            del c[col]
+    chunks.clear()
+    return pd.DataFrame(out)
+
+
+def prune_window(df: pd.DataFrame, tcol: str, window: pd.DataFrame | None) -> pd.DataFrame:
+    """Keep rows whose time is within the person's [lo, hi] (``window`` indexed by person_id)."""
+    if window is None or not len(df):
+        return df
+    lo, hi = df["person_id"].map(window["lo"]), df["person_id"].map(window["hi"])
+    t = df[tcol]
+    return df[(lo.notna() & (t >= lo) & (t <= hi)).to_numpy(bool)]
+
+
+
 def _text(df: pd.DataFrame, col: str) -> pd.Series:
     return df[col].astype("string") if col in df else pd.Series(pd.NA, index=df.index, dtype="string")
 
@@ -150,14 +188,14 @@ class FrameSources:
             return _empty(table)
         return d[d["person_id"].isin(set(int(p) for p in person_ids))]
 
-    def visits(self, person_ids) -> pd.DataFrame:
-        return self._rows("omop_visit_occurrence", person_ids)
+    def visits(self, person_ids, bounds=None, remap=None, slack_h: float = 0.0) -> pd.DataFrame:
+        return remap_ids(self._rows("omop_visit_occurrence", person_ids), remap)
 
-    def scores(self, person_ids) -> pd.DataFrame:
-        return rules.filter_score_rows(self._rows("omop_measurement", person_ids))
+    def scores(self, person_ids, window=None, remap=None) -> pd.DataFrame:
+        return remap_ids(rules.filter_score_rows(self._rows("omop_measurement", person_ids)), remap)
 
-    def conditions(self, person_ids) -> pd.DataFrame:
-        return rules.filter_phenotype_rows(self._rows("omop_condition_occurrence", person_ids))
+    def conditions(self, person_ids, window=None, remap=None) -> pd.DataFrame:
+        return remap_ids(rules.filter_phenotype_rows(self._rows("omop_condition_occurrence", person_ids)), remap)
 
 
 class StoreSources:
@@ -208,23 +246,60 @@ class StoreSources:
             return {}, "absent"
         return (resolve_merges(pairs), "applied") if found else ({}, "unrecognised")
 
-    def _stream(self, table: str, columns: list[str], person_ids, keep=None) -> pd.DataFrame:
+    def iter_rows(self, table: str, columns: list[str], person_ids, min_rows: int = 0):
+        """Yield coerced pandas chunks of ``table`` for ``person_ids`` (filtered inside Arrow, row group by row group),
+        coalesced to at least ``min_rows`` rows. Nothing is accumulated here."""
         pids = sorted({int(p) for p in person_ids})
         spec = table[len("omop_"):]
-        frames = []
-        for batch in data_io.iter_omop_batches(spec, person_ids=pids, columns=columns, s3=self.s3):
+        buf, n = [], 0
+        for batch in data_io.iter_omop_batches(spec, person_ids=pids, columns=columns, s3=self.s3,
+                                               batch_rows=max(65536, min_rows)):
             d = schema.coerce_types(table, batch.to_pandas())
-            if keep is not None:
-                d = keep(d)
-            if len(d):
-                frames.append(d)
-        return pd.concat(frames, ignore_index=True) if frames else _empty(table)
+            del batch
+            buf.append(d)
+            n += len(d)
+            if n >= min_rows:
+                yield buf[0] if len(buf) == 1 else pd.concat(buf, ignore_index=True)
+                buf, n = [], 0
+        if buf:
+            yield buf[0] if len(buf) == 1 else pd.concat(buf, ignore_index=True)
 
-    def visits(self, person_ids) -> pd.DataFrame:
-        return self._stream("omop_visit_occurrence", _VISIT_COLS, person_ids)
+    def visits(self, person_ids, bounds=None, remap=None, slack_h: float = 0.0) -> pd.DataFrame:
+        """COMPACT visits (``rules.compact_visits``), compacted, re-keyed and pruned PER CHUNK as they stream in."""
+        chunks = []
+        for raw in self.iter_rows("omop_visit_occurrence", _VISIT_COLS, person_ids, min_rows=250_000):
+            c = rules.compact_visits(raw)
+            del raw
+            c = rules.prune_visits(remap_ids(c, remap), bounds, slack_h)
+            if len(c):
+                chunks.append(c)
+        return concat_frames(chunks, rules.compact_visits(pd.DataFrame({
+            "person_id": [1], "visit_start_datetime": [pd.Timestamp("2000-01-01")]})).iloc[0:0])
 
-    def scores(self, person_ids) -> pd.DataFrame:
-        return self._stream("omop_measurement", _MEAS_COLS, person_ids, keep=rules.filter_score_rows)
+    def scores(self, person_ids, window=None, remap=None) -> pd.DataFrame:
+        """COMPACT GCS / FOUR rows (``rules.compact_scores``), re-keyed and pruned to ``window`` per chunk."""
+        chunks = []
+        for raw in self.iter_rows("omop_measurement", _MEAS_COLS, person_ids, min_rows=250_000):
+            c = rules.compact_scores(rules.filter_score_rows(raw))
+            del raw
+            c = prune_window(remap_ids(c, remap), "t", window)
+            if len(c):
+                chunks.append(c)
+        return concat_frames(chunks, rules.compact_scores(pd.DataFrame()))
 
-    def conditions(self, person_ids) -> pd.DataFrame:
-        return self._stream("omop_condition_occurrence", _COND_COLS, person_ids, keep=rules.filter_phenotype_rows)
+    def conditions(self, person_ids, window=None, remap=None) -> pd.DataFrame:
+        chunks = []
+        for raw in self.iter_rows("omop_condition_occurrence", _COND_COLS, person_ids, min_rows=250_000):
+            f = rules.filter_phenotype_rows(raw)
+            del raw
+            if not len(f):
+                continue
+            c = pd.DataFrame({"person_id": pd.to_numeric(f["person_id"]).to_numpy().astype("int64"),
+                              "condition_start_datetime": pd.to_datetime(f["condition_start_datetime"], errors="coerce"
+                                                                         ).astype("datetime64[s]").to_numpy()})
+            c = prune_window(remap_ids(c, remap), "condition_start_datetime", window)
+            if len(c):
+                chunks.append(c)
+        like = pd.DataFrame({"person_id": np.zeros(0, "int64"),
+                             "condition_start_datetime": np.zeros(0, "datetime64[s]")})
+        return concat_frames(chunks, like)
