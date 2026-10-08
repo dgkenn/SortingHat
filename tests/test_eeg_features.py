@@ -169,7 +169,7 @@ def test_deterministic():
 
 def test_end_to_end_from_edf_with_failed_window_skipped(tmp_path):
     x = generate_eeg(700, fs=250.0, background="slowing", seed=8)
-    apply_artifact(x, 250.0, Artifact("line_noise", tuple(CANONICAL_19), 60.0, 400.0), CANONICAL_19)  # 4 of 10 min... >40%
+    apply_artifact(x, 250.0, Artifact("line_noise", tuple(CANONICAL_19), 60.0, 400.0, 600.0), CANONICAL_19)  # 400 s of 600
     p = write_edf(tmp_path / "long.edf", x, 250.0, CANONICAL_19, label_fmt="EEG {}-REF")
     res = process_recording(p, windows={"primary": WindowSpec("primary", 60.0, 600.0),
                                         "20s": WindowSpec("20s", 60.0, 20.0)})
@@ -201,3 +201,15 @@ def test_batch_cli_writes_local_rows_and_only_aggregates(tmp_path, capsys):
     printed = capsys.readouterr().out
     assert "recA" not in printed and "recB" not in printed and str(tmp_path) not in printed
     assert json.loads(qc.read_text())["n_recordings"] == "<11"
+
+
+def test_features_use_only_clean_channels_and_pairs_with_an_unclean_channel_are_nan():
+    """D-110: one dead channel of 10 still gives a usable window; its features exclude that channel."""
+    x = generate_eeg(90, background="normal", seed=3, artifacts=[Artifact("flat", ("Fp1",), 0.0, 80.0)])   # flat 0-80 s, live after: disconnected, not dead
+    rec = Recording(x, 200.0, list(CANONICAL_19), 0.0, {"edf_duration_s": 90.0})
+    res = process_recording(rec, WIN, compute_failed=False)
+    row, q = res.rows[0], res.qc["w"]
+    assert q.passes and q.usable_fraction == 1.0 and row["qc_pass"]
+    assert np.isnan(row["conn.coh.Fp1_Fp2.alpha"]) and np.isnan(row["conn.wpli.Fp1_O1.alpha"])    # pairs with Fp1
+    assert np.isfinite(row["conn.coh.F7_F8.alpha"]) and np.isfinite(row["conn.coh.mean_all.alpha"])  # nan-aware means
+    assert np.isfinite(row["qeeg.global.alpha_abs_log10"]) and np.isfinite(row["qeeg.frontal.delta_abs_log10"])

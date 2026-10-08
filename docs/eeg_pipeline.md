@@ -43,20 +43,23 @@ Primary window = minutes 1-11 (60-660 s). Nested windows start at the primary st
 |---|---|
 | flat | peak-to-peak < 0.5 uV (or NaN) |
 | clipping | >= 5 % of samples sit exactly on the epoch max or min |
-| extreme | max abs deviation from epoch median > 500 uV |
-| line_noise | power at 60 +/- 1 Hz > 1.0 x power 1-40 Hz |
-| disconnected | epoch std < 2 % of the cross-channel median, **or** channel is flat/clipped/line-dominated in >= 50 % of epochs over the QC span (then flagged for the whole span) |
+| extreme | max abs deviation from epoch median > 1000 uV (D-110; was 500) |
+| line_noise | power at 60 +/- 1 Hz > 10 x power 1-40 Hz (D-110; was 1.0) |
+| disconnected | epoch std < 2 % of the cross-channel median, **or** channel is flat or clipped (NOT line noise, D-110) in >= 50 % of epochs over the QC span (then flagged for the whole span) |
 
-An epoch is usable when >= 90 % of the minimum set (ceil, so 9 of 10 channels) is clean in it; one bad channel
-does not sink an epoch, two do. Missing minimum channels fail the window. `window_clean_mask` exports the
-per-channel clean mask used by the features.
+An epoch is usable when >= 80 % of the minimum set (ceil, so 8 of 10 channels) is clean in it (D-110; was 90 %); two bad
+channels do not sink an epoch, three do. Missing minimum channels (including exactly-constant ones) still fail the window.
+`window_clean_mask` exports the per-channel clean mask used by the features, which use only the clean channels of each epoch:
+segments containing an unclean epoch of a channel are dropped for that channel, a connectivity pair needs both channels clean in
+a segment (else NaN), and region, global and pair-mean summaries are NaN-aware. Line noise is not a reason to drop a channel's
+whole span; the 60 Hz notch removes it before the features.
 
 **Decisions to confirm in the SAP** (all are constructor/config fields):
 1. *Minimum channel set* (D-096): the 10 Ceribell-headband hairline electrodes Fp1, Fp2, F7, F8, T3, T4, T5, T6,
    O1, O2 (`DEFAULT_MINIMUM_CHANNELS`, defined in `sortinghat/eeg/io.py` and imported by `window.py`); the other nine
    10-20 channels are optional for QC. CBraMod uses all 19.
-2. Epoch rule: 90 % of the minimum set clean (`epoch_channel_frac`).
-3. Thresholds above, especially line-noise ratio and the 0.5 uV flat limit, are untuned. Calibrate on a pilot
+2. Epoch rule: 80 % of the minimum set clean (`epoch_channel_frac`, D-110).
+3. Thresholds above are partly calibrated on aggregate real-data flag shares (D-110: line ratio 10, extreme 1000 uV, 80 % rule); the 0.5 uV flat limit is still untuned. Calibrate on a pilot
    with counts only, then freeze (D-097; the 5 uV burst-suppression threshold below is in the same category).
 
 **Aggregate QC output**: `summarize_window_qc` / `write_qc_summary` produce, per window, suppressed n, pass
@@ -71,7 +74,7 @@ checked with `assert_aggregate_only`, written via `safe_write_json`. No per-reco
 and a different `band`). Derivations: `common_average_masked` (time-varying reference over channels clean in each
 epoch, so a one-channel transient cannot leak into the rest) and `bipolar_double_banana` (18 longitudinal
 channels, defined locally; it does not import `sortinghat.montage`). Note CBraMod's 100 uV bad-sample rule
-differs from the 500 uV QC rule here; the embedding step must apply its own.
+differs from the 1000 uV QC rule here; the embedding step must apply its own.
 
 ## Features (`features.extract_features`)
 
@@ -155,7 +158,7 @@ HEEDB_AWS_PROFILE=<profile> python3 scripts/diag_eeg_signals.py --site S0001 --n
 
 `diag_eeg_signals.py` reports both the file-start window and the window after t0: t0-offset quantiles (minutes), the number with
 no sustained segment within 120 min, the post-fix usable-fraction quantiles and pass count, the exactly-constant epoch share per electrode after onset, and for recordings whose
-usable fraction is still below 0.6 a breakdown by QC rule (flat / clipping / extreme > 500 uV / line noise / disconnected, as the
+usable fraction is still below 0.6 a breakdown by QC rule (flat / clipping / extreme > 1000 uV / line noise / disconnected, as the
 mean share of minimum-set cells), required-channel amplitude (std, 99th percentile of |x - median|, uV) and line-noise-ratio
 quantiles. Everything is aggregate-only.
 

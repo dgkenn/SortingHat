@@ -60,19 +60,66 @@ def test_each_artifact_flagged_only_where_injected(clean, kind):
     assert other.sum() == 0                                 # other channels untouched
 
 
-def test_disconnected_channel_flagged_whole_record(clean):
+def test_flat_channel_flagged_disconnected_for_the_whole_record(clean):
     y = clean.copy()
     from sortinghat.eeg.synthetic import apply_artifact
-    apply_artifact(y, FS, Artifact("disconnected", ("T4",)), CANONICAL_19, np.random.default_rng(0))
+    apply_artifact(y, FS, Artifact("flat", ("T4",), 5.0, 60.0), CANONICAL_19, np.random.default_rng(0))   # 60 of 90 s
     ef = epoch_artifact_flags(y, FS, CANONICAL_19, 0.0)
     r = CANONICAL_19.index("T4")
-    assert ef.flags["disconnected"][r].all() and ef.flags["line_noise"][r].all()
+    assert ef.flags["disconnected"][r].all()                 # >= 50% flat epochs -> persistently disconnected
     assert ef.flags["disconnected"].sum() == ef.flags["disconnected"].shape[1]
 
 
-def test_extreme_threshold_is_500uv(clean):
-    assert _flag_cells(clean, "extreme", ["Cz"], amp=400.0).flags["extreme"].sum() == 0
-    assert _flag_cells(clean, "extreme", ["Cz"], amp=700.0).flags["extreme"].sum() > 0
+def test_line_noise_alone_never_makes_a_channel_disconnected(clean):
+    """D-110: a mains-contaminated channel is still connected; only flat / clipping feed the persistent rule."""
+    y = clean.copy()
+    from sortinghat.eeg.synthetic import apply_artifact
+    apply_artifact(y, FS, Artifact("line_noise", ("T4",), amp=600.0), CANONICAL_19, np.random.default_rng(0))
+    ef = epoch_artifact_flags(y, FS, CANONICAL_19, 0.0)
+    r = CANONICAL_19.index("T4")
+    assert ef.flags["line_noise"][r].all() and not ef.flags["disconnected"][r].any()
+    assert ef.flags["line_noise"].sum() == ef.flags["line_noise"].shape[1]       # nothing else flagged
+
+
+def test_d110_thresholds():
+    c = QCConfig()
+    assert (c.line_ratio, c.extreme_uv, c.epoch_channel_frac, c.disconnected_epoch_frac) == (10.0, 1000.0, 0.8, 0.5)
+
+
+def test_moderate_line_noise_is_not_flagged_but_strong_is(clean):
+    from sortinghat.eeg.synthetic import apply_artifact
+    for amp, expect in ((20.0, False), (600.0, True)):
+        y = clean.copy()
+        apply_artifact(y, FS, Artifact("line_noise", ("F7",), amp=amp), CANONICAL_19, np.random.default_rng(0))
+        f = epoch_artifact_flags(y, FS, CANONICAL_19, 0.0).flags["line_noise"][CANONICAL_19.index("F7")]
+        assert bool(f.all()) is expect and bool(f.any()) is expect
+
+
+def test_extreme_threshold_is_1000uv(clean):
+    assert _flag_cells(clean, "extreme", ["Cz"], amp=700.0).flags["extreme"].sum() == 0
+    assert _flag_cells(clean, "extreme", ["Cz"], amp=1500.0).flags["extreme"].sum() > 0
+
+
+def test_line_noisy_but_otherwise_clean_channel_leaves_epochs_usable(clean):
+    from sortinghat.eeg.synthetic import apply_artifact
+    y = clean.copy()
+    apply_artifact(y, FS, Artifact("line_noise", ("O1",), amp=600.0), CANONICAL_19, np.random.default_rng(0))
+    q = _qc(y)[0]["w"]
+    assert q.passes and q.usable_fraction == 1.0 and q.disconnected_channels == 0
+    assert q.flag_fraction["line_noise"] == pytest.approx(0.1) and q.flag_fraction["disconnected"] == 0.0
+
+
+def test_eight_of_ten_clean_channels_make_an_epoch_usable(clean):
+    from sortinghat.eeg.synthetic import apply_artifact
+    two = clean.copy()
+    for ch in ("F7", "O2"):
+        apply_artifact(two, FS, Artifact("flat", (ch,)), CANONICAL_19)
+    q2 = _qc(two)[0]["w"]
+    assert q2.passes and q2.usable_fraction == 1.0           # 8 of 10 clean = 0.8
+    three = two.copy()
+    apply_artifact(three, FS, Artifact("flat", ("T3",)), CANONICAL_19)
+    q3 = _qc(three)[0]["w"]
+    assert not q3.passes and q3.usable_fraction == 0.0       # 7 of 10 clean
 
 
 def test_single_bad_channel_still_usable_but_many_are_not(clean):

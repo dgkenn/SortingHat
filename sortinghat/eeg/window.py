@@ -2,7 +2,7 @@
 
 * t0 = recording start. Primary window = minutes 1-11 (60-660 s).
 * Nested windows start at the primary window start: 20 s, 1, 2, 5, 10 min.
-* QC runs on a grid of 2-s epochs. Per channel x epoch flags: flat, clipping, extreme amplitude (>500 uV),
+* QC runs on a grid of 2-s epochs. Per channel x epoch flags: flat, clipping, extreme amplitude (>1000 uV),
   high line noise, disconnected. An epoch is *usable* when enough of the minimum channel set is clean.
   The window passes when >= 60% of its (intended) duration is usable. Epochs outside the recording count as
   unusable, and masks are never compressed (a compressed mask glues time together; docs/heedb_access.md rule 27).
@@ -62,12 +62,12 @@ class QCConfig:
     flat_ptp_uv: float = 0.5            # peak-to-peak below this: flat
     clip_fraction: float = 0.05         # >= this share of samples sitting on the epoch max or min: clipping
     clip_tol_uv: float = 1e-6
-    extreme_uv: float = 500.0           # max |x - median| above this: extreme amplitude
+    extreme_uv: float = 1000.0          # max |x - median| above this: extreme amplitude (D-110; was 500)
     line_hz: float = 60.0
-    line_ratio: float = 1.0             # power(line +-1 Hz) / power(1-40 Hz) above this: high line noise
+    line_ratio: float = 10.0            # power(line +-1 Hz) / power(1-40 Hz) above this: high line noise (D-110; was 1.0)
     disconnected_rel_std: float = 0.02  # epoch std < this x median across channels: disconnected
-    disconnected_epoch_frac: float = 0.5  # share of a channel's epochs (in the span) with flat/clip/line flags
-    epoch_channel_frac: float = 0.9     # share of minimum-set channels that must be clean for a usable epoch
+    disconnected_epoch_frac: float = 0.5  # share of a channel's epochs (in the span) with flat/clipping flags (D-110)
+    epoch_channel_frac: float = 0.8     # share of minimum-set channels that must be clean for a usable epoch (D-110; was 0.9)
     usable_threshold: float = USABLE_THRESHOLD
     minimum_channels: tuple[str, ...] = DEFAULT_MINIMUM_CHANNELS
 
@@ -137,9 +137,10 @@ def epoch_artifact_flags(data: np.ndarray, fs: float, ch_names: Sequence[str], s
         flags["extreme"][:, :nh] = extreme
         flags["line_noise"][:, :nh] = line
         flags["disconnected"][:, :nh] = low
-    # persistent disconnection: a channel mostly flat / clipped / line-dominated over the whole span
+    # persistent disconnection: a channel mostly flat or clipped over the whole span. Line noise does NOT count (D-110):
+    # a mains-contaminated channel is still connected, and the notch filter removes the line before the features.
     if nh:
-        persistent = (flags["flat"] | flags["clipping"] | flags["line_noise"])[:, :nh].mean(axis=1) \
+        persistent = (flags["flat"] | flags["clipping"])[:, :nh].mean(axis=1) \
             >= cfg.disconnected_epoch_frac
         flags["disconnected"][persistent, :] = True
     # epochs past the end of the recording: every channel bad (counted as 'flat' = no signal)
