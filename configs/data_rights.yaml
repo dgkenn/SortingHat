@@ -1,0 +1,499 @@
+# Data-rights ledger (Phase 0, commercial track). Owner: sortinghat/rights.py.
+#
+# Every dataset or model artefact the project may touch needs one entry here.
+# An artefact missing from this file is refused for every purpose (fail closed).
+#
+# Use values (permitted_uses):
+#   permitted      the licence or access grant, as recorded in evidence_file, allows the use
+#   not_permitted  excluded by the licence, or no grant is held (no DUA, no agreement)
+#   unknown        the licence text has not been read, or the sources conflict
+#
+# status is derived, and rights.py rejects any mismatch:
+#   red     any use is not_permitted, or lineage is research_only
+#   green   all five uses are permitted and open_questions is empty
+#   yellow  everything else (an open question or an unknown use)
+#
+# lineage:
+#   research_only        research terms only (DUA or NC licence); commercial uses are not_permitted
+#   commercial_candidate may be cleared for commercial use, pending counsel and written terms
+#   yellow               share-alike or conflicting licence statements; hold until clarified
+#
+# Commercial gates (see rights.PURPOSE_USES): an artefact counts as green for a commercial
+# purpose only when its status is green and the required uses are permitted. Nothing is
+# green yet: no counsel review has been recorded (DECISION_LOG D-072).
+#
+# Quoted facts come from the evidence_file named on each entry. Items marked "not read" were
+# not checked against the primary licence text in this repo.
+
+schema_version: 1
+ledger_as_of: "2026-10-08"
+
+artefacts:
+
+  # ---- Research-only: BDSP credentialed / restricted -------------------------------------
+
+  heedb_v4_1:
+    kind: dataset
+    name: "Harvard Electroencephalography Database (HEEDB)"
+    version: "v4.1 (BDSP, published 2025-02-10)"
+    version_hash: null
+    lineage: research_only
+    licence: "BDSP Database Credentialed DUA. Licence text not in repo. Plan: research-only under a DUA (DECISION_LOG, regulatory section)."
+    source_url: "https://bdsp.io/"
+    access: "credentialed (bdsp-credentialed-access-point)"
+    permitted_uses:
+      research: permitted
+      commercial_training: not_permitted
+      derivative_weights: not_permitted
+      regulatory_submission: not_permitted
+      sublicensing: not_permitted
+    status: red
+    open_questions:
+      - "Read the BDSP credentialed DUA text. Confirm whether models trained on HEEDB are restricted."
+      - "Plan: HEEDB data cannot serve as submitted evidence (regulatory row). Counsel to confirm."
+      - "Same bucket holds a CC BY-NC 4.0 BIDS set (Neurotech). It is not in this ledger, so it is refused until added."
+    evidence_file: docs/research/citation_verification.md
+
+  bind_v1_0:
+    kind: dataset
+    name: "Brain Imaging and Neurophysiology Database (BIND)"
+    version: "v1.0 (BDSP, published 2025-09-09)"
+    version_hash: null
+    lineage: research_only
+    licence: "BDSP Database Credentialed. Licence text not read."
+    source_url: "https://bdsp.io/"
+    access: "credentialed (not verified in repo)"
+    permitted_uses:
+      research: unknown
+      commercial_training: not_permitted
+      derivative_weights: not_permitted
+      regulatory_submission: not_permitted
+      sublicensing: not_permitted
+    status: red
+    open_questions:
+      - "Access not verified (plan: 'Verify in BDSP'). Research use is unknown until a grant is confirmed."
+    evidence_file: docs/research/citation_verification.md
+
+  morgoth_1_0_0:
+    kind: model_and_dataset
+    name: "MORGOTH 1.0: A Foundation Model for Clinical EEG (data and code)"
+    version: "1.0.0 (BDSP, published 2026-06-02)"
+    version_hash: null
+    lineage: research_only
+    licence: "BDSP Database Credentialed. GitHub code CC BY-NC 4.0 per a search summary (not read). Weights release not confirmed."
+    source_url: "https://bdsp.io/content/morgoth1/1.0.0/"
+    access: "credentialed projects access point (projects AP)"
+    permitted_uses:
+      research: unknown
+      commercial_training: not_permitted
+      derivative_weights: not_permitted
+      regulatory_submission: not_permitted
+      sublicensing: not_permitted
+    status: red
+    open_questions:
+      - "Read the NC clause on the code and any weights. Confirm whether released weights are derivatives of HEEDB-trained data."
+      - "Confirm whether the release includes weights (data_access.md says the weights are documented only)."
+      - "Access not verified in repo; research use is unknown until a grant is confirmed."
+    evidence_file: docs/research/citation_verification.md
+
+  nesi_1_0_0:
+    kind: dataset_and_model
+    name: "Neurophysiologic Encephalopathy Severity Index (NESI): data and code"
+    version: "1.0.0 (BDSP, published 2026-06-14)"
+    version_hash: null
+    lineage: research_only
+    licence: "BDSP Database Credentialed. Built on MORGOTH representations, so MORGOTH terms may apply. Not read."
+    source_url: "https://bdsp.io/content/1yizvr4l41wmiljc6lou/1.0.0/"
+    access: "credentialed (not verified in repo)"
+    permitted_uses:
+      research: unknown
+      commercial_training: not_permitted
+      derivative_weights: not_permitted
+      regulatory_submission: not_permitted
+      sublicensing: not_permitted
+    status: red
+    open_questions:
+      - "Confirm whether NESI inherits the MORGOTH NC terms."
+      - "Access not verified in repo."
+    evidence_file: docs/research/citation_verification.md
+
+  gcs_from_ehr_1_0_0:
+    kind: software
+    name: "GCS-from-EHR tools (bdsp-core/nax-gcs; JMIR 2026;e81245)"
+    version: "1.0.0 (BDSP credentialed package, 2026-04-17; title not confirmed)"
+    version_hash: null
+    lineage: research_only
+    licence: "BDSP credentialed package. Code licence not read. Outputs are built from HEEDB OMOP measurement rows, so HEEDB terms apply."
+    source_url: "https://www.jmir.org/2026/1/e81245"
+    access: "credentialed (not confirmed on BDSP listing)"
+    permitted_uses:
+      research: unknown
+      commercial_training: not_permitted
+      derivative_weights: not_permitted
+      regulatory_submission: not_permitted
+      sublicensing: not_permitted
+    status: red
+    open_questions:
+      - "Confirm the BDSP project page and exact title (citation row 8e: secondary source only)."
+      - "Read the nax-gcs code licence."
+    evidence_file: docs/research/citation_verification.md
+
+  tme_cohort_1_0_0:
+    kind: dataset
+    name: "Epileptiform activity and outcomes in toxic-metabolic encephalopathy (plan: TME cohort)"
+    version: "1.0.0 (BDSP, Software Credentialed, published 2026-07-10; n=121 per listing)"
+    version_hash: null
+    lineage: research_only
+    licence: "BDSP Software Credentialed. Terms not read."
+    source_url: "https://bdsp.io/content/?page=2"
+    access: "software credentialed"
+    permitted_uses:
+      research: unknown
+      commercial_training: not_permitted
+      derivative_weights: not_permitted
+      regulatory_submission: not_permitted
+      sublicensing: not_permitted
+    status: red
+    open_questions:
+      - "Confirm the title matches the plan's 'toxic-metabolic encephalopathy cohort'."
+      - "Confirm that it ships EEG usable as a Study 2 cohort (listing is software-type)."
+    evidence_file: docs/research/citation_verification.md
+
+  icare_2_0_bdsp:
+    kind: dataset
+    name: "I-CARE 2.0, BDSP restricted copy (comatose after cardiac arrest)"
+    version: "2.0 (BDSP, Database Restricted, published 2026-07-29)"
+    version_hash: null
+    lineage: research_only
+    licence: "BDSP Restricted Health Data License 1.0.0. Limits use to non-commercial research and bars re-identification and sharing."
+    source_url: "https://bdsp.io/"
+    access: "restricted (signed DUA per dataset)"
+    permitted_uses:
+      research: unknown
+      commercial_training: not_permitted
+      derivative_weights: not_permitted
+      regulatory_submission: not_permitted
+      sublicensing: not_permitted
+    status: red
+    open_questions:
+      - "Confirm an active signed restricted DUA for this dataset (no single DUA covers all restricted sets; citation row 4)."
+      - "Hospital count (plan: 7) not confirmed."
+    evidence_file: docs/research/citation_verification.md
+
+  icare_2_1_physionet:
+    kind: dataset
+    name: "I-CARE 2.1, PhysioNet open copy"
+    version: "2.1 (PhysioNet)"
+    version_hash: null
+    lineage: research_only
+    licence: "CC BY-NC-SA 4.0 (per data_access.md; the source recorded it on 2026-07-29). Re-check the PhysioNet licence page."
+    source_url: "https://physionet.org/content/i-care/2.1/"
+    access: "open, no credentialing"
+    permitted_uses:
+      research: permitted
+      commercial_training: not_permitted
+      derivative_weights: not_permitted
+      regulatory_submission: not_permitted
+      sublicensing: not_permitted
+    status: red
+    open_questions:
+      - "Counsel: whether weights trained on this set are adapted material under share-alike."
+      - "Re-check the licence page; the source's recording is not an independent read."
+    evidence_file: docs/data_access.md
+
+  sparcnet_1_1:
+    kind: dataset
+    name: "SPaRCNet (IIIC dataset), DUA v1.1"
+    version: "DOI 10.60508/cw6j-s785 (dataset version not shown; '1.1' is the DUA/licence version)"
+    version_hash: null
+    lineage: research_only
+    licence: "BDSP Restricted Health Data License 1.0.0. Non-commercial research only; bars re-identification and sharing."
+    source_url: "https://registry.opendata.aws/bdsp-sparcnet"
+    access: "restricted (bdsp-sparcnet-access-point)"
+    permitted_uses:
+      research: unknown
+      commercial_training: not_permitted
+      derivative_weights: not_permitted
+      regulatory_submission: not_permitted
+      sublicensing: not_permitted
+    status: red
+    open_questions:
+      - "Confirm an active signed DUA v1.1 for SPaRCNet."
+    evidence_file: docs/research/citation_verification.md
+
+  prophet_1_0:
+    kind: dataset
+    name: "PRediction Of Disease PHEnoTypes (PROPHET)"
+    version: "1.0 (DOI 10.60508/zkvt-gt36)"
+    version_hash: null
+    lineage: research_only
+    licence: "Not verified. Plan: research-only."
+    source_url: "https://bdsp.io/content/480zbyvqxlq0agc6myih/1.0/"
+    access: "not verified"
+    permitted_uses:
+      research: unknown
+      commercial_training: not_permitted
+      derivative_weights: not_permitted
+      regulatory_submission: not_permitted
+      sublicensing: not_permitted
+    status: red
+    open_questions:
+      - "Access level and licence not verified. Plan status: Hold (optional silver-label aid)."
+    evidence_file: docs/research/citation_verification.md
+
+  # ---- TUH family: commercial candidate pending counsel (TUEG counted once, D-037) -------
+
+  tuh_tueg:
+    kind: dataset
+    name: "Temple University Hospital EEG Corpus (TUEG)"
+    version: "not recorded (plan: pull and hash the manifest)"
+    version_hash: null
+    lineage: commercial_candidate
+    licence: "TUH EEG Corpus access terms via NEDC registration. Terms text not read in repo."
+    source_url: "https://www.isip.piconepress.com/"
+    access: "have access (NEDC-registered SSH key)"
+    permitted_uses:
+      research: permitted
+      commercial_training: unknown
+      derivative_weights: unknown
+      regulatory_submission: unknown
+      sublicensing: unknown
+    status: yellow
+    open_questions:
+      - "Counsel (plan line 263): do the TUH terms cover derivative weights used in a regulated commercial product?"
+      - "Do the TUH terms restrict redistribution of weights, and does that conflict with the CBraMod grants?"
+      - "Record the TUEG version and the manifest hash before any build (plan line 262)."
+    evidence_file: docs/data_access.md
+
+  tuh_tuab:
+    kind: dataset
+    name: "TUH Abnormal EEG (TUAB), subset of TUEG"
+    version: "not recorded (subset of TUEG)"
+    version_hash: null
+    lineage: commercial_candidate
+    licence: "Assumed to inherit TUH terms. Subcorpus terms not read."
+    source_url: "https://www.isip.piconepress.com/"
+    access: "have access (plan manifest)"
+    permitted_uses:
+      research: permitted
+      commercial_training: unknown
+      derivative_weights: unknown
+      regulatory_submission: unknown
+      sublicensing: unknown
+    status: yellow
+    open_questions:
+      - "Confirm that the TUAB subcorpus terms match TUEG. Benchmark contamination: CBraMod paper says TUAB is a subset of TUEG."
+    evidence_file: docs/research/cbramod_provenance.md
+
+  tuh_tusz:
+    kind: dataset
+    name: "TUH Seizure Corpus (TUSZ)"
+    version: "not recorded"
+    version_hash: null
+    lineage: commercial_candidate
+    licence: "Assumed to inherit TUH terms. Subcorpus terms not read."
+    source_url: "https://www.isip.piconepress.com/"
+    access: "have access (plan manifest)"
+    permitted_uses:
+      research: permitted
+      commercial_training: unknown
+      derivative_weights: unknown
+      regulatory_submission: unknown
+      sublicensing: unknown
+    status: yellow
+    open_questions:
+      - "Confirm the TUSZ subcorpus terms match TUEG. The CBraMod paper does not mention TUSZ overlap."
+    evidence_file: docs/research/cbramod_provenance.md
+
+  tuh_tuev:
+    kind: dataset
+    name: "TUH Events Corpus (TUEV), subset of TUEG"
+    version: "not recorded (subset of TUEG)"
+    version_hash: null
+    lineage: commercial_candidate
+    licence: "Assumed to inherit TUH terms. Subcorpus terms not read."
+    source_url: "https://www.isip.piconepress.com/"
+    access: "have access (plan manifest)"
+    permitted_uses:
+      research: permitted
+      commercial_training: unknown
+      derivative_weights: unknown
+      regulatory_submission: unknown
+      sublicensing: unknown
+    status: yellow
+    open_questions:
+      - "Confirm the TUEV subcorpus terms match TUEG. The CBraMod paper says TUEV is a subset of TUEG."
+    evidence_file: docs/research/cbramod_provenance.md
+
+  tuh_tuar:
+    kind: dataset
+    name: "TUH Artifact Corpus (TUAR)"
+    version: "not recorded"
+    version_hash: null
+    lineage: commercial_candidate
+    licence: "Assumed to inherit TUH terms. Not read."
+    source_url: "https://www.isip.piconepress.com/"
+    access: "not verified (not mentioned in the source tree; data_access.md)"
+    permitted_uses:
+      research: unknown
+      commercial_training: unknown
+      derivative_weights: unknown
+      regulatory_submission: unknown
+      sublicensing: unknown
+    status: yellow
+    open_questions:
+      - "Access not verified. Research use is unknown until the subset is confirmed."
+    evidence_file: docs/data_access.md
+
+  # ---- Commercial candidates: other ----------------------------------------------------
+
+  tdbrain_v3:
+    kind: dataset
+    name: "TDBRAIN (Brainclinics Foundation; Sci Data 2022)"
+    version: "V3 (Brainclinics DUA label). The 'V3.1' label was not found."
+    version_hash: null
+    lineage: commercial_candidate
+    licence: "CC BY 4.0 per the Brainclinics dataset page (secondary). The Brainclinics DUA 'V3' text was not read."
+    source_url: "https://brainclinics.com/resources/tdbrain-dataset/introduction"
+    access: "have access (plan manifest); not a BDSP dataset"
+    permitted_uses:
+      research: permitted
+      commercial_training: unknown
+      derivative_weights: unknown
+      regulatory_submission: unknown
+      sublicensing: unknown
+    status: yellow
+    open_questions:
+      - "Read the Brainclinics DUA V3 text. Confirm that it matches CC BY 4.0 and check its attribution and any NC terms."
+      - "Cite the DUA, not BDSP. The plan's 'V3.1' label is unverified."
+    evidence_file: docs/research/citation_verification.md
+
+  cbramod_checkpoint:
+    kind: model
+    name: "CBraMod public pretrained checkpoint (pretrained_weights.pth)"
+    version: "HF weighting666/CBraMod rev 500543c7e30bda1b22bfd51a49301b238dee21fd; GitHub wjq-learning/CBraMod HEAD b9e961003214326972c567eff390e75b0287e32a"
+    version_hash: "sha256:0792cb808c14e6b7a2bb2ce1dff379bc47bc54c49a779825bdfeb33bf8157178"
+    lineage: yellow
+    licence: "Conflicting statements. GitHub code: MIT. HF model card (weights): Apache-2.0. braindecode mirror: bsd-3-clause. Pretraining data (TUEG) is under TUH terms."
+    source_url: "https://huggingface.co/weighting666/CBraMod"
+    access: "public download; HF owner (weighting666) differs from the GitHub owner"
+    permitted_uses:
+      research: permitted
+      commercial_training: unknown
+      derivative_weights: unknown
+      regulatory_submission: unknown
+      sublicensing: unknown
+    status: yellow
+    open_questions:
+      - "Counsel: do the TUH terms cover derivative weights in a regulated product? (cbramod_provenance.md section 6, Q1)"
+      - "Which licence governs the weights: Apache-2.0 (HF), MIT (GitHub) or the TUH terms? (Q2)"
+      - "Is the HF owner the authors' official release? (Q3)"
+      - "Does the released checkpoint include TUEV/TUAB in pretraining? (Q4)"
+      - "Is the braindecode copy the same weights? (Q6)"
+    evidence_file: docs/research/cbramod_provenance.md
+
+  nmt:
+    kind: dataset
+    name: "NMT (NEMAR release; acronym not expanded in repo)"
+    version: "not recorded"
+    version_hash: null
+    lineage: yellow
+    licence: "Share-alike. Licence text not read. Plan: hold until written clarification."
+    source_url: "not recorded in repo (NEMAR release)"
+    access: "NEMAR release (public)"
+    permitted_uses:
+      research: unknown
+      commercial_training: unknown
+      derivative_weights: unknown
+      regulatory_submission: unknown
+      sublicensing: unknown
+    status: yellow
+    open_questions:
+      - "Record the full name, version and licence text. Plan line 264: keep yellow until written clarification arrives."
+      - "Share-alike terms would apply to derived weights. Counsel to confirm."
+    evidence_file: DECISION_LOG.md
+
+  vitaldb_physionet_1_0_0:
+    kind: dataset
+    name: "VitalDB, PhysioNet mirror v1.0.0"
+    version: "1.0.0 (2022-09-21)"
+    version_hash: null
+    lineage: yellow
+    licence: "CC BY 4.0 per the PhysioNet page. The plan's 'conflicting terms' flag is not supported by PhysioNet; any conflict comes from the VitalDB site (not checked)."
+    source_url: "https://physionet.org/content/vitaldb/"
+    access: "open"
+    permitted_uses:
+      research: permitted
+      commercial_training: unknown
+      derivative_weights: unknown
+      regulatory_submission: unknown
+      sublicensing: unknown
+    status: yellow
+    open_questions:
+      - "Resolve the conflict between the PhysioNet CC BY 4.0 statement and the VitalDB site terms in writing."
+      - "Plan: not needed for this project. Hold."
+    evidence_file: docs/research/citation_verification.md
+
+  vitaldb_api:
+    kind: dataset
+    name: "VitalDB, api.vitaldb.net (waveforms and tracks used by the source code)"
+    version: "API (unversioned)"
+    version_hash: null
+    lineage: research_only
+    licence: "CC BY-NC-SA 4.0, R&D only, per data_access.md (not verified against the VitalDB site)."
+    source_url: "https://api.vitaldb.net"
+    access: "public HTTPS API, no credentials"
+    permitted_uses:
+      research: permitted
+      commercial_training: not_permitted
+      derivative_weights: not_permitted
+      regulatory_submission: not_permitted
+      sublicensing: not_permitted
+    status: red
+    open_questions:
+      - "Confirm the API licence statement against the VitalDB site (not checked)."
+    evidence_file: docs/data_access.md
+
+  # ---- External datasets with no licence held -----------------------------------------
+
+  certa_eeg:
+    kind: dataset
+    name: "CERTA EEG and adjudicated etiology labels (Swiss RCT, NCT03129438)"
+    version: "not released (no public release identified)"
+    version_hash: null
+    lineage: commercial_candidate
+    licence: "No data licence held. A DUA with the investigators is required. Terms to negotiate."
+    source_url: "https://clinicaltrials.gov/study/NCT03129438"
+    access: "none held (outreach only)"
+    permitted_uses:
+      research: unknown
+      commercial_training: not_permitted
+      derivative_weights: not_permitted
+      regulatory_submission: not_permitted
+      sublicensing: not_permitted
+    status: red
+    open_questions:
+      - "The '14 etiologies' detail is unverified (published groups: 4 and 7). Ask the investigators."
+      - "Outreach package (handoff s23.3) is missing from the repo."
+      - "Negotiate the full grant list (D-071) before any commercial use."
+    evidence_file: docs/outreach_drafts.md
+
+  korean_ncse_cohort_2024:
+    kind: dataset
+    name: "2024 Korean NCSE / metabolic / benzodiazepine EEG cohort"
+    version: "not released (no public release identified)"
+    version_hash: null
+    lineage: commercial_candidate
+    licence: "No data licence held. Terms to negotiate with the corresponding author."
+    source_url: "none (no public release identified)"
+    access: "none held (outreach only)"
+    permitted_uses:
+      research: unknown
+      commercial_training: not_permitted
+      derivative_weights: not_permitted
+      regulatory_submission: not_permitted
+      sublicensing: not_permitted
+    status: red
+    open_questions:
+      - "Negotiate the full grant list (D-071) and a replication or external-test DUA before any use."
+    evidence_file: docs/outreach_drafts.md
