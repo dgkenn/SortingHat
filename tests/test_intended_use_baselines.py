@@ -22,7 +22,8 @@ from test_silver_feasibility_inputs import rsf
 bb = rsf.bb
 CFG = BaselineConfig()
 HIST = BaselineConfig(encounter_scope="with_history")
-ENC = pd.Timestamp("2020-01-01 00:00:00")                 # the cohort's date-only encounter start for the current visit below
+PLUS1H = BaselineConfig(presentation_score_after_h=1.0)   # the opt-in +1 h presentation window (D-146; the default is strictly t0-masked)
+ENC =pd.Timestamp("2020-01-01 00:00:00")                 # the cohort's date-only encounter start for the current visit below
 T4 = pd.Timestamp("2020-01-01 04:00:00")                  # an EEG 4 h into the encounter: the prior encounter's charts fall in every window
 P_GROUPS = {"demographics", "pres_score", "pres_first_vital", "pres_first_glucose"}
 
@@ -138,7 +139,7 @@ def test_config_validation():
         BaselineConfig(encounter_scope="everything")
     with pytest.raises(ValueError):
         BaselineConfig(presentation_score_after_h=-1.0)
-    assert BaselineConfig().encounter_scope == "current" and BaselineConfig().presentation_score_after_h == 1.0
+    assert BaselineConfig().encounter_scope == "current" and BaselineConfig().presentation_score_after_h == 0.0
 
 
 # ---------------------------------------------------------------------------------------------------- Baseline P
@@ -150,14 +151,14 @@ def test_p_score_window_is_nearest_in_minus6h_to_plus1h_and_nothing_else_sees_th
     with_post = add_rows(t, "omop_measurement", [meas(1, n, T0 + H(h), v) for n, h, v in scores]
                          + [meas(1, "Heart rate", T0 + H(0.5), 777), meas(1, "POC glucose (fingerstick)", T0 + H(0.5), 9999),
                             meas(1, "SODIUM", T0 + H(0.5), 9999)])
-    fs = build_feature_set(with_post)
+    fs = build_feature_set(with_post, PLUS1H)
     e, r = fs.X_extra.loc[1], fs.X.loc[1]
     assert e["pres_score__gcs__value"] == 5                      # +0.5 h is nearer than -1 h; +1.5 h and -7 h are outside the window
     assert e["pres_score__four__value"] == 8                     # a tie goes to the earlier chart (the cohort's rule)
     assert e["pres_score__rass__miss"] == 1                      # +2 h is outside
     # no other column sees any post-t0 event: Baselines A-D equal the build WITHOUT the post-t0 rows except for pre-t0 scores
     pre_only = add_rows(t, "omop_measurement", [meas(1, n, T0 + H(h), v) for n, h, v in scores if h < 0])
-    ref = build_feature_set(pre_only)
+    ref = build_feature_set(pre_only, PLUS1H)
     same(fs.X, ref.X)
     assert r["score__gcs__value"] == 7 and r["vital__hr__miss"] == 1 and r["poc_glucose__poc_glucose__miss"] == 1
     other = [c for c in fs.X_extra.columns if not c.startswith("pres_score__")]
@@ -168,7 +169,9 @@ def test_p_strict_mode_is_t0_masked():
     t = add_rows(two_visits(), "omop_measurement", [meas(1, "Glasgow Coma Scale Score", T0 - H(1), 7),
                                                     meas(1, "Glasgow Coma Scale Score", T0 + H(0.1), 5)])
     assert build_feature_set(t, BaselineConfig(presentation_score_after_h=0.0)).X_extra.loc[1, "pres_score__gcs__value"] == 7
-    assert build_feature_set(t).X_extra.loc[1, "pres_score__gcs__value"] == 5
+    assert build_feature_set(t, PLUS1H).X_extra.loc[1, "pres_score__gcs__value"] == 5          # opt-in: the +0.1 h chart is nearer
+    # DEFAULT config: a score charted after t0 is never used by Baseline P (only the -1 h chart is seen, the +0.1 h one is not)
+    assert build_feature_set(t).X_extra.loc[1, "pres_score__gcs__value"] == 7
 
 
 def test_p_has_no_history_or_diagnosis_columns():
@@ -284,9 +287,9 @@ def test_streamed_build_equals_in_memory_build_with_first_vitals_and_the_present
                  meas(int(pid), "POC glucose (fingerstick)", t0 - H(1), 99.0, "mg/dL"),
                  meas(int(pid), "Glasgow Coma Scale Score", t0 + H(0.5), 5), meas(int(pid), "Glasgow Coma Scale Score", t0 + H(2), 3)]
     aug = {**tables, "omop_measurement": add_rows(tables, "omop_measurement", rows)["omop_measurement"]}
-    ref = build_feature_set(aug, CFG, index)
-    fs, n_pref = bb.build_matrices(FrameStream(aug, store), index, CFG, None, True, chunk_rows=700)
-    fs0, n_all = bb.build_matrices(FrameStream(aug, store), index, CFG, None, False, chunk_rows=700)
+    ref = build_feature_set(aug, PLUS1H, index)
+    fs, n_pref = bb.build_matrices(FrameStream(aug, store), index, PLUS1H, None, True, chunk_rows=700)
+    fs0, n_all = bb.build_matrices(FrameStream(aug, store), index, PLUS1H, None, False, chunk_rows=700)
     same(fs.all_x(), ref.all_x())
     same(fs0.all_x(), ref.all_x())                                # with and without the memory prefilter
     assert n_pref < n_all
@@ -330,13 +333,13 @@ def test_prune_events_keeps_the_first_of_the_encounter_and_the_presentation_grac
     ev = pd.DataFrame({"person_id": 1, "domain": dom, "key": ["hr", "hr", "hr", "hr", "hr", "gcs", "gcs", "hr"], "value": 1.0,
                        "quantity": np.nan, "t_event": ts, "t_avail": ts, "t_end_raw": pd.NaT, "time_basis": "x", "approx": False,
                        "unit": "u", "raw_name": "n"})
-    out = bb.prune_events(ev, t0, CFG, True, enc)
+    out = bb.prune_events(ev, t0, PLUS1H, True, enc)
     kept = sorted(out["t_event"].tolist())
     # prior-encounter chart (04-28) dropped; of the old charts only the EARLIEST (04-29 02:00) survives; 11:00 is in the window;
     # the score at +0.5 h passes (grace), at +1.5 h and the vital at +0.5 h do not
     assert kept == sorted(pd.to_datetime(["2024-04-29 02:00", "2024-05-01 11:00", "2024-05-01 12:30"], format="%Y-%m-%d %H:%M").tolist())
     assert out[out["t_event"] == pd.Timestamp("2024-05-01 12:30")]["domain"].tolist() == ["score"]
-    plain = bb.prune_events(ev, t0, CFG, True)                          # without an encounter start: the old behaviour
+    plain = bb.prune_events(ev, t0, PLUS1H, True)                       # without an encounter start: the old behaviour
     assert pd.Timestamp("2024-04-29 02:00") not in plain["t_event"].tolist()
     rows = pd.DataFrame({"person_id": [1, 1], "measurement_datetime": pd.to_datetime(["2024-05-01 12:30", "2024-05-01 13:30"],
                                                                                        format="%Y-%m-%d %H:%M"),
