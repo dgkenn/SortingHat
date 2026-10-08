@@ -10,6 +10,10 @@ RUN="env -u CLAUDECODE -u SORTINGHAT_AGENT_SESSION scripts/heedb_run.sh python3"
 say "waiting for overnight.sh"
 while pgrep -f "scripts/overnight.sh" > /dev/null; do sleep 120; done
 
+say "cohort rebuild start (adds encounter_start for the D-145 undifferentiated subgroup)"
+timeout 7200 $RUN scripts/build_cohort.py --s3 --out out --debug-flow --max-memory-gb 5 > out/logs/build_cohort.log 2>&1
+say "cohort rebuild exit=$?"
+
 say "baselines start"
 timeout 21600 $RUN scripts/build_baselines.py --s3 --cohort out/local_only/cohort_study1.csv \
   --out out/local_only/baselines_AC.parquet > out/logs/baselines.log 2>&1

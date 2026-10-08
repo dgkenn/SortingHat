@@ -25,7 +25,7 @@ class BaselineConfig:
     encounter_scope: str = "current"     # current | with_history
     encounter_fallback_days: float = 3.0 # encounter start when no visit covers t0: t0 minus this (= the longest bounded window)
     # --- Baseline P "Presentation" (D-145)
-    presentation_score_after_h: float = 1.0   # P only: GCS / FOUR / RASS nearest to t0 in [t0-score_window_h, t0+this] (the cohort's
+    presentation_score_after_h: float = 0.0   # P only: GCS / FOUR / RASS nearest to t0 in [t0-score_window_h, t0+this] (the cohort's
                                               # strict-severity window, D-105). 0 = strictly t0-masked. THE one bounded exception to the t0 gate.
     # --- vocabulary frozen in training (human-run discovery, see baselines.vocab.discover_lab_vocabulary)
     extra_labs: tuple[str, ...] = field(default_factory=tuple)   # normalized extra lab names to include in Baseline C
