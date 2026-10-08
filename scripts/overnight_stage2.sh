@@ -8,7 +8,8 @@ say() { echo "$(date -u +%FT%TZ) stage2: $*" >> "$LOG"; }
 RUN="env -u CLAUDECODE -u SORTINGHAT_AGENT_SESSION scripts/heedb_run.sh python3"
 
 say "waiting for overnight.sh"
-while pgrep -f "scripts/overnight.sh" > /dev/null; do sleep 120; done
+until grep -q "silver labels exit=" out/logs/overnight.log 2>/dev/null && [ "$(grep -c "silver labels exit=" out/logs/overnight.log)" -gt "$(grep -c "stage2: silver gate passed" out/logs/overnight.log)" ]; do sleep 120; done
+say "silver gate passed"
 
 say "cohort rebuild start (adds encounter_start for the D-145 undifferentiated subgroup)"
 timeout 7200 $RUN scripts/build_cohort.py --s3 --out out --debug-flow --max-memory-gb 5 > out/logs/build_cohort.log 2>&1

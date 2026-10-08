@@ -39,12 +39,12 @@ for pass in 1 2 3; do
   say "extraction pass $pass end: $(progress)"
 done
 
-say "field audit start"
-timeout 21600 $RUN -m sortinghat.audit.field_audit --s3 --out out/audit --workers 3 > out/logs/field_audit.log 2>&1
-say "field audit exit=$?"
-
 say "silver labels start"
 timeout 21600 $RUN -m sortinghat.labels.extract --s3 --cohort out/local_only/cohort_study1.csv \
   --out out/silver --labels-out out/local_only/silver/silver_labels.csv > out/logs/silver.log 2>&1
 say "silver labels exit=$?"
+say "field audit start"
+timeout 21600 $RUN -m sortinghat.audit.field_audit --s3 --out out/audit --workers 3 > out/logs/field_audit.log 2>&1
+say "field audit exit=$?"
+
 say "driver done"
