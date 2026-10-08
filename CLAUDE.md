@@ -12,6 +12,7 @@ agent session as a hosted-model context.
    file under a restricted path.
 2. **Restricted jobs run from a plain terminal or scheduler**, never from inside an
    agent session. Agents write and review the scripts; a human runs them.
+   Exception (D-118): the project lead has authorised streaming, aggregate-only real-data jobs launched from agent sessions via scripts/heedb_run.sh and scripts/overnight.sh; all other rules still apply.
 3. **Aggregate-only output.** Scripts that may touch restricted data print/write only
    aggregates with small-cell suppression (n < 11 shown as "<11"). Use
    `sortinghat.safe_output` (`suppress_count`, `suppress_proportion`, `safe_quantiles`,

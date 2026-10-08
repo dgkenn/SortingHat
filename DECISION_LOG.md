@@ -794,13 +794,13 @@ Entries below follow `docs/research/plan_compliance_2026-10-08.md`. Dates are 20
 - **Source:** `out/cohort/flow.md`; `docs/research/plan_compliance_2026-10-08.md` s1 (0a site row) and s5 item 3; D-024; D-025; D-113.
 
 ### D-121 Medication administration row denominator = candidates with a sedation-class exposure
-- **Date:** 2026-10-08 · **Area:** data · **Outcome data seen?** No
+- **Date:** 2026-10-08 · **Area:** data · **Outcome data seen?** No · **Data-quality aggregates seen?** Yes
 - **Decision:** The medication administration row denominator is candidates with a sedation-class `drug_exposure` in the 48 h before t0, as implemented in `field_audit.py`.
 - **Rationale:** The plan states the row over candidates. Baseline A uses t0 sedative exposure (D-014), so administration timing matters for the candidates with that exposure. D-034 logs only the fallback, not this denominator.
 - **Source:** `sortinghat/audit/field_audit.py`; `docs/research/plan_compliance_2026-10-08.md` s1 (0a medication row) and s2 item 4; D-014; D-034.
 
 ### D-122 Baseline C has no imaging inputs; Baseline A has no NESI input
-- **Date:** 2026-10-08 · **Area:** baselines · **Outcome data seen?** No
+- **Date:** 2026-10-08 · **Area:** baselines · **Outcome data seen?** No · **Data-quality aggregates seen?** Yes
 - **Decision:** Baseline C has no imaging inputs (no imaging at Study 1 sites). Baseline A has no NESI input (no NESI source found). Both are reported as limitations.
 - **Rationale:** Imaging exists only at I0001 and I0004, which have no EEG (D-102) and are not Study 1 sites (D-113). `docs/data_access.md` marks NESI "not found".
 - **Source:** `docs/research/heedb_schema_dryrun_2026-10-07.md`; `docs/data_access.md`; `docs/baselines_spec.md` s2.3; D-014; D-102; D-103; D-113; `docs/research/plan_compliance_2026-10-08.md` s2 item 5.
@@ -812,13 +812,13 @@ Entries below follow `docs/research/plan_compliance_2026-10-08.md`. Dates are 20
 - **Source:** CLAUDE.md hard rule 4; D-083; `docs/silver_extraction.md`; `docs/research/plan_compliance_2026-10-08.md` s2 item 6.
 
 ### D-124 Feature windows use t0 = sustained EEG signal onset; cohort, baselines and silver use metadata start
-- **Date:** 2026-10-08 · **Area:** data · **Outcome data seen?** No
+- **Date:** 2026-10-08 · **Area:** data · **Outcome data seen?** No · **Data-quality aggregates seen?** Yes
 - **Decision:** Feature windows use t0 = sustained EEG signal onset (D-109). Cohort, baselines and silver windows are anchored at the metadata EEG start, which is never later than the signal onset, so baselines are conservative with respect to leakage.
 - **Rationale:** Baseline inputs all precede the signal onset, so they cannot contain information from the EEG-derived window. The join that applies the onset offset to the cohort is not yet implemented.
 - **Source:** D-108; D-109; `docs/eeg_pipeline.md`; `docs/research/plan_compliance_2026-10-08.md` s2 item 7.
 
 ### D-125 Feature and structured-label extraction before Gate 0 is data preparation, not training
-- **Date:** 2026-10-08 · **Area:** data · **Outcome data seen?** No
+- **Date:** 2026-10-08 · **Area:** data · **Outcome data seen?** No · **Data-quality aggregates seen?** Yes
 - **Decision:** Feature and structured-label extraction before Gate 0 is data preparation, not training. No model is fitted, and no label-by-feature summaries are computed, until Gate 0 passes.
 - **Rationale:** D-039 bars model training before Phase 0 passes and does not name extraction. The plan's sequence ("no modeling yet"; nothing trained until the field audit and pilot pass) puts extraction after Gate 0; the order used is recorded here as a departure from that sequence.
 - **Source:** D-039; D-051; `docs/research_plan_v1.txt` (Phase 0 introduction); `docs/research/plan_compliance_2026-10-08.md` s3 item 1.
@@ -924,3 +924,9 @@ Entries below follow `docs/research/plan_compliance_2026-10-08.md`. Dates are 20
 - **Decision:** G0 kappa is the unweighted binary kappa (probable or definite positive) on the 200-case pilot. Prevalence is taken from pilot gold labels.
 - **Rationale:** The plan says "kappa" without a type. The binary positive definition follows `docs/labels_spec.md` section 6.
 - **Source:** SAP s11 (G0 row) and s16 item 15; `docs/labels_spec.md` s6; D-051.
+
+### D-143 Pre-Gate-0 silver-label feasibility analysis (exploratory)
+- **Date:** 2026-10-08 · **Area:** hypotheses · **Outcome data seen?** No · **Data-quality aggregates seen?** Yes
+- **Decision:** At the project lead's direction, before Gate 0 and before any gold labels, run an exploratory silver-label feasibility analysis: models trained AND evaluated on structured, EEG-blind silver labels, with both D-120 validation schemes and the plan's mandatory controls. Gold-label adjudication (Phase 0b pilot, kappa) is deferred, not dropped. EEG reports and any EEG-derived text are never used as label evidence (circularity rule, D-009); they serve only as the circularity-audit comparator. Clinical notes are not read by a hosted model. All outputs are labelled exploratory and do not test the preregistered H1–H6.
+- **Rationale:** Obtain early evidence that EEG carries etiologic signal before investing adjudication labour; deviates from "silver labels train models; they never score them" and from "nothing is trained until Gate 0", both deliberately and for this exploratory purpose only.
+- **Source:** Project lead instruction (2026-10-08); `docs/silver_feasibility.md`.
