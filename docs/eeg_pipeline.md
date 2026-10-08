@@ -48,7 +48,7 @@ Primary window = minutes 1-11 (60-660 s). Nested windows start at the primary st
 | disconnected | epoch std < 2 % of the cross-channel median, **or** channel is flat or clipped (NOT line noise, D-110) in >= 50 % of epochs over the QC span (then flagged for the whole span) |
 
 An epoch is usable when >= 80 % of the minimum set (ceil, so 8 of 10 channels) is clean in it (D-110; was 90 %); two bad
-channels do not sink an epoch, three do. Missing minimum channels (including exactly-constant ones) still fail the window.
+channels do not sink an epoch, three do. The window-level channel rule (D-110) needs >= 8 of the 10 minimum-set electrodes present AND not exactly constant over the window (a dead channel counts as missing); with 1-2 missing or dead the window can still pass on the usable-fraction rule, with 3 or more it fails (`too_few_minimum_channels`). The count is a QC field (`WindowQC.n_missing_or_dead_min`, column `qc_n_missing_or_dead_min`, and a per-window distribution `n_missing_or_dead_channels` in the aggregate summary).
 `window_clean_mask` exports the per-channel clean mask used by the features, which use only the clean channels of each epoch:
 segments containing an unclean epoch of a channel are dropped for that channel, a connectivity pair needs both channels clean in
 a segment (else NaN), and region, global and pair-mean summaries are NaN-aware. Line noise is not a reason to drop a channel's

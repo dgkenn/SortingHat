@@ -102,9 +102,18 @@ def test_zero_filled_channel_is_missing_not_flat(tmp_path, eeg_uv, code):
     assert out.channel_status["dead"] == ["O2"] and out.channel_status["n_dead_min"] == 1
     assert out.channel_status["n_missing_min"] == 0 and out.channel_status["n_channels"] == 18
     prim = out.qc["w"]
-    assert prim.n_dead_min == 1 and prim.n_min_present == 9 and not prim.passes
+    assert prim.n_dead_min == 1 and prim.n_min_present == 9 and prim.n_missing_or_dead_min == 1
+    assert prim.passes and prim.usable_fraction == 1.0                  # 1-2 missing / dead: the usable rule decides
     assert "dead_minimum_channels" in prim.reasons and "missing_minimum_channels" in prim.reasons
     assert prim.flag_fraction["flat"] == 0.0                          # NOT counted as flat data
+
+
+def test_three_dead_minimum_channels_fail_the_window(tmp_path, eeg_uv):
+    dig = _with_const(eeg_uv, ["O2", "T4", "F7"])
+    p = write_edf_raw(tmp_path / "z3.edf", dig, [f"EEG {c}-Ref" for c in CANONICAL_19], FS, phys_min=-R, phys_max=R)
+    prim = process_recording(p, windows=SHORT).qc["w"]
+    assert prim.n_dead_min == 3 and prim.n_missing_or_dead_min == 3 and not prim.passes
+    assert "too_few_minimum_channels" in prim.reasons
 
 
 def test_dead_optional_channel_is_dropped_but_does_not_fail_the_minimum_set(tmp_path, eeg_uv):
@@ -123,8 +132,8 @@ def test_quarter_of_recordings_constant_minimum_set_summary(tmp_path, eeg_uv):
     for i in range(44):
         dig = dig_ok.copy()
         if i % 4 == 0:
-            dig[CANONICAL_19.index("T4")] = zero_code()
-            dig[CANONICAL_19.index("T6")] = zero_code()
+            for c in ("T4", "T6", "T5"):
+                dig[CANONICAL_19.index(c)] = zero_code()
         p = write_edf_raw(tmp_path / "q.edf", dig, [f"EEG {c}-Ref" for c in CANONICAL_19], FS, phys_min=-R, phys_max=R)
         rec = drop_dead_channels(select_channels(read_edf(p)))        # the QC front half of process_recording
         notes = {"dead": rec.meta["dead_channels"], "invalid_scaling": rec.meta["invalid_scaling_channels"]}
@@ -155,7 +164,7 @@ def test_zero_physical_range_is_invalid_scaling_not_flat(tmp_path, eeg_uv):
     out = process_recording(p, windows=SHORT)
     prim = out.qc["w"]
     assert out.channel_status["n_invalid_min"] == 1 and out.channel_status["n_missing_min"] == 0
-    assert "invalid_scaling_minimum_channels" in prim.reasons and not prim.passes
+    assert "invalid_scaling_minimum_channels" in prim.reasons and prim.n_missing_or_dead_min == 1 and prim.passes
     assert prim.flag_fraction["flat"] == 0.0
 
 
@@ -204,7 +213,7 @@ def test_stream_reports_dead_and_missing_counts(tmp_path, eeg_uv):
     assert r.ok and (r.n_dead_min, r.n_missing_min, r.n_invalid_min) == (1, 1, 0)
     assert DEFAULT_MINIMUM_CHANNELS == ("Fp1", "Fp2", "F7", "F8", "T3", "T4", "T5", "T6", "O1", "O2")
     prim = next(x for x in r.rows if x["window"] == "w")
-    assert prim["qc_pass"] is False or prim["qc_pass"] == False  # noqa: E712
+    assert prim["qc_n_missing_or_dead_min"] == 2 and bool(prim["qc_pass"])         # 8 of 10 live: the usable rule decides
 
 
 class _Body:

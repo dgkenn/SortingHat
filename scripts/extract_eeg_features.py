@@ -125,7 +125,7 @@ def load_done(out_dir: Path, retry_permanent: bool) -> set[str]:
 
 
 def fixed_columns(feat_cfg: FeatureConfig) -> list[str]:
-    qc_cols = ["onset_offset_s", "qc_clean_cell_fraction", "qc_coverage_fraction", "qc_n_disconnected",
+    qc_cols = ["onset_offset_s", "qc_clean_cell_fraction", "qc_coverage_fraction", "qc_n_disconnected", "qc_n_missing_or_dead_min",
                *[f"qc_flag_{k}" for k in FLAG_NAMES]]
     return ["recording_id", "window", "qc_pass", "usable_fraction", *qc_cols, *feature_names(feat_cfg)]
 

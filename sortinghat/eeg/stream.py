@@ -594,7 +594,8 @@ def _augment_rows(rows: list[dict], qc: dict[str, WindowQC]) -> list[dict]:
         q = qc[r["window"]]
         extra = {"qc_clean_cell_fraction": float(q.clean_cell_fraction),
                  "qc_coverage_fraction": float(q.coverage_fraction),
-                 "qc_n_disconnected": int(q.disconnected_channels)}
+                 "qc_n_disconnected": int(q.disconnected_channels),
+                 "qc_n_missing_or_dead_min": int(q.n_missing_or_dead_min)}
         extra.update({f"qc_flag_{k}": float(q.flag_fraction.get(k, 0.0)) for k in FLAG_NAMES})
         out.append({**r, **extra})
     return out

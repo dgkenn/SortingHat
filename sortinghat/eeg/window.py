@@ -14,6 +14,7 @@ Only aggregate summaries leave the human-run job (``summarize_window_qc`` goes t
 from __future__ import annotations
 
 import math
+from collections import Counter
 from dataclasses import dataclass, field, replace
 from typing import Mapping, Sequence
 
@@ -180,10 +181,12 @@ class WindowQC:
     disconnected_channels: int = 0              # minimum-set channels disconnected for the whole window
     n_dead_min: int = 0                         # minimum-set channels exactly constant for the whole segment (missing)
     n_invalid_min: int = 0                      # minimum-set channels with a zero calibration range (missing)
+    n_missing_or_dead_min: int = 0              # minimum-set channels absent from the data (not found, dead or invalid)
 
     def to_row(self) -> dict:
         """Scalar summary (no per-epoch arrays); safe to aggregate."""
         d = {"window": self.window, "usable_fraction": self.usable_fraction, "passes": self.passes,
+         "n_missing_or_dead_min": self.n_missing_or_dead_min,
              "clean_cell_fraction": self.clean_cell_fraction, "coverage_fraction": self.coverage_fraction,
              "n_disconnected": self.disconnected_channels}
         d.update({f"flag_{k}": v for k, v in self.flag_fraction.items()})
@@ -210,8 +213,12 @@ def window_qc(ef: EpochFlags, spec: WindowSpec, rec_duration_s: float, cfg: QCCo
     notes = channel_notes or {}
     n_dead = len(set(cfg.minimum_channels) & set(notes.get("dead", ())))
     n_inv = len(set(cfg.minimum_channels) & set(notes.get("invalid_scaling", ())))
-    if len(present) < len(cfg.minimum_channels):
-        reasons.append("missing_minimum_channels")
+    n_absent = len(cfg.minimum_channels) - len(present)
+    need_present = math.ceil(cfg.epoch_channel_frac * len(cfg.minimum_channels) - 1e-9)       # 8 of 10 (D-110)
+    if n_absent:
+        reasons.append("missing_minimum_channels")        # informational: 1-2 missing / dead can still pass
+    if len(present) < need_present:
+        reasons.append("too_few_minimum_channels")        # fewer than 8 of 10 present and not exactly constant
     if n_dead:
         reasons.append("dead_minimum_channels")
     if n_inv:
@@ -234,11 +241,11 @@ def window_qc(ef: EpochFlags, spec: WindowSpec, rec_duration_s: float, cfg: QCCo
     uf = float(usable.mean()) if n else 0.0
     ffrac = {k: float(v.mean()) if v.size else float("nan") for k, v in cells.items()}
     disc_ch = int(cells["disconnected"].all(axis=1).sum()) if cells["disconnected"].size else 0
-    passes = uf >= cfg.usable_threshold and "missing_minimum_channels" not in reasons
+    passes = uf >= cfg.usable_threshold and "too_few_minimum_channels" not in reasons
     if uf < cfg.usable_threshold:
         reasons.append("usable_below_threshold")
     return WindowQC(spec.name, n, uf, bool(passes), usable, ffrac, float((~bad).mean()) if bad.size else 0.0,
-                    len(present), n_req, coverage, reasons, disc_ch, n_dead, n_inv)
+                    len(present), n_req, coverage, reasons, disc_ch, n_dead, n_inv, n_absent)
 
 
 def qc_recording(data: np.ndarray, fs: float, ch_names: Sequence[str], offset_s: float = 0.0,
@@ -287,6 +294,8 @@ def summarize_window_qc(qcs: Sequence[Mapping[str, WindowQC]], threshold: float 
                  "pass_proportion": suppress_proportion(npass, n),
                  "usable_fraction_quantiles": safe_quantiles([r.usable_fraction for r in rows]),
                  "flag_prevalence": {},
+                 "n_missing_or_dead_channels": {str(k): suppress_count(c) for k, c in sorted(
+                     Counter(r.n_missing_or_dead_min for r in rows).items())},
                  "reason_counts": {r: suppress_count(sum(r in x.reasons for x in rows))
                                    for r in sorted({r for x in rows for r in x.reasons})}}
         for k in FLAG_NAMES:

@@ -157,11 +157,18 @@ def test_short_recording_counts_uncovered_time_as_unusable():
     assert len(qcs["primary"].epoch_usable) == 300            # grid is not compressed
 
 
-def test_missing_minimum_channels_fails(clean):
-    keep = [i for i, c in enumerate(CANONICAL_19) if c != "O2"]
-    names = [CANONICAL_19[i] for i in keep]
-    qcs, _ = qc_recording(clean[keep], FS, names, 0.0, WIN)
-    assert not qcs["w"].passes and "missing_minimum_channels" in qcs["w"].reasons
+def test_one_or_two_missing_minimum_channels_can_still_pass_but_three_fail(clean):
+    """D-110: >= 8 of the 10 minimum-set electrodes present (and live) is enough; the count is a QC field."""
+    def run(drop):
+        keep = [i for i, c in enumerate(CANONICAL_19) if c not in drop]
+        names = [CANONICAL_19[i] for i in keep]
+        return qc_recording(clean[keep], FS, names, 0.0, WIN)[0]["w"]
+    q0, q1, q2, q3 = run([]), run(["O2"]), run(["O2", "F7"]), run(["O2", "F7", "T4"])
+    assert [q.n_missing_or_dead_min for q in (q0, q1, q2, q3)] == [0, 1, 2, 3]
+    assert q0.passes and q0.reasons == []
+    assert q1.passes and "missing_minimum_channels" in q1.reasons and "too_few_minimum_channels" not in q1.reasons
+    assert q2.passes and q2.usable_fraction == 1.0
+    assert not q3.passes and "too_few_minimum_channels" in q3.reasons and q3.n_min_present == 7
 
 
 def test_midline_channels_not_required(clean):
