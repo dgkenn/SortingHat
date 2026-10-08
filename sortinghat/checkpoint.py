@@ -281,6 +281,7 @@ class Checkpoint:
         self.fail_after = fail_after
         self.n_hits = self.n_puts = 0
         self.counts: dict[str, list[int]] = {}
+        self._kill_suspended = 0
         self._lock = threading.Lock()
         self._seq = itertools.count()
         parent = self.dir.parent
@@ -368,11 +369,28 @@ class Checkpoint:
         self._mkdir(p.parent)
         self._atomic(p, pickle.dumps((name, obj), protocol=pickle.HIGHEST_PROTOCOL))
         if count:
+            self.tick()
+
+    def tick(self) -> None:
+        """Count one stored unit for the test kill hook (units stored by the shared OMOP cache count too)."""
+        with self._lock:
+            if self._kill_suspended:
+                return
+            self.n_puts += 1
+            kill = self.fail_after is not None and self.n_puts >= self.fail_after
+        if kill:
+            raise SimulatedKill(f"simulated kill after {self.n_puts} stored units")
+
+    @contextmanager
+    def kill_suspended(self) -> Iterator[None]:
+        """Bookkeeping work (e.g. computing the shared cache's candidate set) must not consume the test kill budget."""
+        with self._lock:
+            self._kill_suspended += 1
+        try:
+            yield
+        finally:
             with self._lock:
-                self.n_puts += 1
-                kill = self.fail_after is not None and self.n_puts >= self.fail_after
-            if kill:
-                raise SimulatedKill(f"simulated kill after {self.n_puts} stored units")
+                self._kill_suspended -= 1
 
     def stage(self, name: str, key_obj: Any, fn: Callable[[], Any], *, count: bool = True) -> Any:
         """Compute-or-load one unit: ``fn()`` runs only when no result for (``name``, ``digest(key_obj)``) is stored."""

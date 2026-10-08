@@ -227,6 +227,7 @@ class SharedReader:
             self.pid_arr = pa.array(ids, type=pa.int64())
         self.max_in_flight = 0
         self._tl = threading.local()
+        self._refreshed: set[str] = set()                 # parts whose manifest was rewritten in this (--no-resume) run
         self.progress = ck.RowGroupProgress(f"omop_{table}", len(self.parts), self._known_total())
 
     # -- paths
@@ -242,8 +243,6 @@ class SharedReader:
             return json.loads((self._part_dir(key) / "manifest.json").read_text())
         except (OSError, ValueError):
             return None
-
-    _refreshed: set = set()
 
     def _known_total(self) -> int | None:
         if self.refresh:
@@ -322,8 +321,6 @@ class SharedReader:
                 yield key, rg, man["use"]
 
     def iter_rowgroups(self, on_error: Callable[[str, Exception], None] | None = None):
-        if self.refresh:
-            self._refreshed = set()
         tasks = self._tasks(on_error)
         window: deque = deque()
         failed: set[str] = set()
@@ -388,10 +385,6 @@ def reader_for(cp, s3, bucket: str, table: str, *, columns: list[str], ids, pref
         cand = cands
     return SharedReader(cp, s3, bucket, table, sup, cand, retry=retry, max_get_bytes=max_get_bytes,
                         buffer_size=buffer_size, load=load)
-
-
-def candidate_digest(table: str, ids: np.ndarray | None) -> str | None:
-    return None if ids is None else ck.digest(ids)
 
 
 # ------------------------------------------------------------------------------------------------ warm-up CLI

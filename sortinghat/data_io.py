@@ -341,11 +341,12 @@ def list_keys(s3, prefix: str, *, bucket: str | None = None, suffix: str | None 
 
 
 def list_objects(s3, prefix: str, *, bucket: str | None = None, suffix: str | None = None,
-                 policy: RetryPolicy | None = None) -> list[tuple[str, int | None, str | None]]:
-    """Like ``list_keys`` but ``(key, size, last_modified)`` per object, sorted by key. A client that does not report size /
-    time (a bare fake) gives ``None`` for them. Used to fingerprint inputs for checkpoints (``sortinghat.checkpoint``)."""
+                 policy: RetryPolicy | None = None) -> list[tuple[str, int | None, str | None, str | None]]:
+    """Like ``list_keys`` but ``(key, size, last_modified, etag)`` per object, sorted by key. A client that does not report these
+    (a bare fake) gives ``None`` for them. Used to fingerprint inputs for checkpoints (``sortinghat.checkpoint``) and to key the
+    shared OMOP cache (``sortinghat.omop_cache``) on size + ETag."""
     bucket = bucket or access_point()
-    rows: list[tuple[str, int | None, str | None]] = []
+    rows: list[tuple[str, int | None, str | None, str | None]] = []
     token = None
     while True:
         kw: dict[str, Any] = {"Bucket": bucket, "Prefix": prefix, "MaxKeys": 1000}
@@ -354,7 +355,7 @@ def list_objects(s3, prefix: str, *, bucket: str | None = None, suffix: str | No
         resp = with_retries(lambda kw=kw: s3.list_objects_v2(**kw), policy)
         for o in resp.get("Contents", []):
             lm = o.get("LastModified")
-            rows.append((o["Key"], o.get("Size"), None if lm is None else str(lm)))
+            rows.append((o["Key"], o.get("Size"), None if lm is None else str(lm), o.get("ETag")))
         if not resp.get("IsTruncated"):
             break
         token = resp.get("NextContinuationToken")
@@ -840,7 +841,7 @@ def _checkpoint_parts(s3, table: str, prefix: str | None, bucket: str) -> tuple[
     if prefix is None and table not in OMOP_COLUMNS:
         raise KeyError(f"unknown OMOP table {table!r}; known: {sorted(OMOP_COLUMNS)}")
     rows = list_objects(s3, prefix or OMOP_MERGED_PREFIX + f"{table}/", bucket=bucket, suffix=".parquet")
-    return [r[0] for r in rows], {r[0]: (r[1], r[2]) for r in rows}
+    return [r[0] for r in rows], {r[0]: (r[1], r[3]) for r in rows}
 
 
 def ids_digest(ids) -> str | None:
@@ -1002,7 +1003,8 @@ class LocalStore:
                         keys.append(k)
         def entry(k: str) -> dict:
             st = self._path(k).stat()
-            return {"Key": k, "Size": st.st_size, "LastModified": st.st_mtime_ns}
+            return {"Key": k, "Size": st.st_size, "LastModified": st.st_mtime_ns,
+                    "ETag": f'"{st.st_size:x}-{st.st_mtime_ns:x}"'}          # a local stand-in: changes when the file does
         return {"Contents": [entry(k) for k in sorted(keys)], "IsTruncated": False}
 
     def get_object(self, Bucket=None, Key: str = "", Range: str | None = None):
