@@ -755,3 +755,8 @@
 - **Rationale:** The metadata duration disagrees with the clock at I0003 (median ratio 2.35 with a heavy upper tail), so its unit or meaning is not reliable.
 - **Source:** `scripts/diag_cohort.py` aggregates; `docs/cohort_spec.md` C-07.
 
+### D-116 Sessions whose BDSPPatientID disagrees with the id in BidsFolder are excluded (ambiguous identity)
+- **Date:** 2026-10-08 · **Area:** data · **Outcome data seen?** No
+- **Decision:** A session whose `BDSPPatientID` differs from the id embedded in `BidsFolder` (`sub-<SITE><id>`) is removed from the cohort flow as its own step ("Patient id in BDSPPatientID disagrees with BidsFolder (ambiguous identity)", counted per site, counts < 11 suppressed), before the row-integrity check. The check itself accepts a start time equal to the metadata `StartTime` or to any `StartTime(EEG)` of the report rows for the same (patient id, SessionID), and its abort message breaks failures down by cause (key missing / patient-id mismatch / start-time mismatch), aggregate counts only.
+- **Rationale:** Source identity conflict (219 sessions at I0002 in the first real build): it cannot be known which id links to the EHR, so the session cannot be assigned to a patient without risking a wrong link. A genuinely misaligned row (a folder belonging to another patient) must still abort the build.
+- **Source:** `scripts/diag_cohort.py` / real build abort message (aggregate counts only); `sortinghat/cohort/integrity.py`.

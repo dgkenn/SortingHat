@@ -116,8 +116,10 @@ def build_cohort(src, cfg: CohortConfig | None = None) -> CohortResult:
     mm, merge_status = src.merge_map() if hasattr(src, "merge_map") else ({}, "absent")
     S0["person_id_source"] = S0["person_id"]
     src_index = src.source_index() if hasattr(src, "source_index") else None
+    # D-116: sessions whose source BDSPPatientID disagrees with the id in BidsFolder (ambiguous identity)
+    ambiguous = integrity.ambiguous_identity(S0, src_index) if src_index is not None else pd.Series(False, index=S0.index)
     if src_index is not None:
-        integrity.verify_rows(S0, src_index, "sessions loaded from eeg_metadata")
+        integrity.verify_rows(S0[~ambiguous.to_numpy(bool)], src_index, "sessions loaded from eeg_metadata")
     n_remapped = 0
     if mm and len(S0):
         mapped = S0["person_id"].map(mm)
@@ -148,6 +150,7 @@ def build_cohort(src, cfg: CohortConfig | None = None) -> CohortResult:
     if cfg.study_sites is not None:
         run.drop("Site is not a Study 1 site (no EHR rows; excluded from labelled analyses)",
                  run.S["SiteID"].astype(str).isin(cfg.study_sites), SESS)
+    run.drop("Patient id in BDSPPatientID disagrees with BidsFolder (ambiguous identity)", ~ambiguous, SESS)
     run.drop("Patient id not resolvable", run.S["person_id"].notna(), SESS)
     run.drop("EEG start time missing", run.S["t0"].notna(), SESS)
     run.drop("Age missing", run.S["age_years"].notna(), SESS)

@@ -101,7 +101,7 @@ def test_included(scenario, pid):
 
 def test_exact_step_counts(scenario):
     r = scenario[1]
-    assert removed_at(r, "Patient id") == 1                       # pid 42
+    assert removed_at(r, "Patient id not resolvable") == 1                       # pid 42
     assert removed_at(r, "EEG start") == 3                        # 2, 40 and 41's unstamped sibling
     assert removed_at(r, "Age missing") == 1
     assert removed_at(r, "Age <") == 2                            # 4, 39
