@@ -1115,6 +1115,7 @@ def build_parser() -> argparse.ArgumentParser:
                          "than oversubscribed defaults; 0 = library default)")
     ap.add_argument("--skip-controls", action="store_true", help="skip the mandatory controls (quick looks only; the report says so)")
     ap.add_argument("--max-memory-gb", type=float, default=None)
+    checkpoint.add_arguments(ap)
     return ap
 
 
@@ -1135,8 +1136,14 @@ def _run(a) -> int:
     elif a.s3:
         store = data_io.open_store(None, profile=a.profile)
     from threadpoolctl import threadpool_limits
+    # Restart safety: every model fit (scheme x fold x rung, the controls' refits included) is stored as it finishes under
+    # out/local_only/checkpoints/silver_feasibility/<key>/ and replayed after a container restart (ladder.fit_predict_fold).
+    # The fit keys digest the actual data, so the feature / embedding directories (whose ledgers change while extractors run)
+    # are deliberately not part of the step key; the small input files and the arguments are.
+    cp = checkpoint.open_step("silver_feasibility", a, no_resume=a.no_resume,
+                              inputs=[p for p in (a.cohort, a.silver, a.baselines, a.recording_map) if p])
     A = assemble(a)
-    with threadpool_limits(limits=a.blas_threads or None):
+    with checkpoint.use(cp), threadpool_limits(limits=a.blas_threads or None):
         R = run_analysis(A, a, store)
     J = report_json(A, a, R)
     known = {str(p) for p in A.frame["person_id"]} | set(A.frame["rid"].astype(str))

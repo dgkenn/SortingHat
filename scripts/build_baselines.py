@@ -52,7 +52,7 @@ sys.path.insert(0, str(Path(__file__).resolve().parents[1]))     # repo root, so
 import numpy as np  # noqa: E402
 import pandas as pd  # noqa: E402
 
-from sortinghat import agent_safety, data_io, schema  # noqa: E402
+from sortinghat import agent_safety, checkpoint as ck, data_io, schema  # noqa: E402
 from sortinghat.audit import field_audit as fa  # noqa: E402
 from sortinghat.baselines import BaselineConfig, features as bl_features  # noqa: E402
 from sortinghat.baselines import lexicon as lx  # noqa: E402
@@ -134,32 +134,42 @@ def sex_lookup(store, cohort: pd.DataFrame) -> pd.Series:
     """sex_male (1.0 / 0.0 / NaN) per cohort row, from ``SexDSC`` of the session's reports_findings, else eeg_metadata
     (the rule of ``baselines.events.build_index``), matched on (source BDSPPatientID, SessionID). Names/ids stay in memory."""
     out = pd.Series(np.nan, index=cohort.index, dtype=float)
+    cp = ck.active()
     for site in sorted(cohort["SiteID"].unique()):
         sel = cohort["SiteID"] == site
         sub = cohort[sel]
-        text = pd.Series(pd.NA, index=sub.index, dtype="string")
-        for table in ("reports_findings", "eeg_metadata"):
-            try:
-                df = data_io.read_site_table(table, site, s3=store)
-            except FileNotFoundError:
-                continue
-            if "SexDSC" not in df.columns or "SessionID" not in df.columns:
-                continue
-            ref = pd.DataFrame({"pid": fa.person_ids(df, site), "sid": df["SessionID"].astype(str),
-                                "sex": df["SexDSC"].astype("string")}).dropna(subset=["pid", "sex"])
-            ref = ref[ref["sex"].str.strip() != ""].drop_duplicates(["pid", "sid"])
-            lut = pd.Series(ref["sex"].to_numpy(object),
-                            index=pd.MultiIndex.from_arrays([ref["pid"].astype("int64").to_numpy(), ref["sid"].to_numpy(object)]))
-            q = pd.MultiIndex.from_arrays([sub["person_id_source"].astype("int64").to_numpy(),
-                                           sub["SessionID"].astype(str).to_numpy(object)])
-            got = pd.Series(lut.reindex(q).to_numpy(object), index=sub.index, dtype="string")
-            text = text.where(text.notna(), got)
-        s = text.str.strip().str.lower()
-        v = pd.Series(np.nan, index=sub.index, dtype=float)
-        v[s.str.startswith("m").fillna(False).to_numpy(bool)] = 1.0
-        v[s.str.startswith("f").fillna(False).to_numpy(bool)] = 0.0
-        out[sel] = v
+        if cp is None:
+            out[sel] = _sex_for_site(store, site, sub)
+        else:                                                # one restart unit per site (reads two wide per-site CSVs)
+            out[sel] = cp.stage(f"sex-{site}", sub[["person_id_source", "SessionID"]],
+                                lambda site=site, sub=sub: _sex_for_site(store, site, sub))
     return out
+
+
+def _sex_for_site(store, site: str, sub: pd.DataFrame) -> pd.Series:
+    """sex_male per row of one site's cohort rows (see ``sex_lookup``)."""
+    text = pd.Series(pd.NA, index=sub.index, dtype="string")
+    for table in ("reports_findings", "eeg_metadata"):
+        try:
+            df = data_io.read_site_table(table, site, s3=store)
+        except FileNotFoundError:
+            continue
+        if "SexDSC" not in df.columns or "SessionID" not in df.columns:
+            continue
+        ref = pd.DataFrame({"pid": fa.person_ids(df, site), "sid": df["SessionID"].astype(str),
+                            "sex": df["SexDSC"].astype("string")}).dropna(subset=["pid", "sex"])
+        ref = ref[ref["sex"].str.strip() != ""].drop_duplicates(["pid", "sid"])
+        lut = pd.Series(ref["sex"].to_numpy(object),
+                        index=pd.MultiIndex.from_arrays([ref["pid"].astype("int64").to_numpy(), ref["sid"].to_numpy(object)]))
+        q = pd.MultiIndex.from_arrays([sub["person_id_source"].astype("int64").to_numpy(),
+                                       sub["SessionID"].astype(str).to_numpy(object)])
+        got = pd.Series(lut.reindex(q).to_numpy(object), index=sub.index, dtype="string")
+        text = text.where(text.notna(), got)
+    s = text.str.strip().str.lower()
+    v = pd.Series(np.nan, index=sub.index, dtype=float)
+    v[s.str.startswith("m").fillna(False).to_numpy(bool)] = 1.0
+    v[s.str.startswith("f").fillna(False).to_numpy(bool)] = 0.0
+    return v
 
 
 def make_index(cohort: pd.DataFrame, sex_male: pd.Series) -> pd.DataFrame:
@@ -285,38 +295,60 @@ def collect_events(src: StoreSources, index: pd.DataFrame, cfg: BaselineConfig, 
     enc = index.set_index("person_id")["encounter_start"] if "encounter_start" in index else None
     diag: dict = {"n_measurement_rows_unmapped": 0, "n_events_prior_encounter_dropped": 0}
     parts: list[pd.DataFrame] = []
+    cp = ck.active()
+    unit_key = (index[["person_id", "t0"] + (["encounter_start"] if enc is not None else [])], cfg, prefilter, mm)
 
-    def add(ev: pd.DataFrame) -> None:
-        ev = prune_events(ev, t0, cfg, prefilter, enc)
-        if len(ev):
-            parts.append(ev)
+    def staged(name: str, extra, build):
+        """One table's events as a restart unit: ``build(add, d)`` appends pruned event frames through ``add`` and counts into
+        ``d``; the frames and counts are stored when the table is done (the row groups are stored anyway, this also skips the
+        event building)."""
+        def run():
+            got: list[pd.DataFrame] = []
+            d = {"n_measurement_rows_unmapped": 0}
+
+            def add(ev: pd.DataFrame) -> None:
+                ev = prune_events(ev, t0, cfg, prefilter, enc)
+                if len(ev):
+                    got.append(ev)
+            build(add, d)
+            return got, d
+        got, d = run() if cp is None else cp.stage(f"baseline_events-{name}", (unit_key, extra), run)
+        parts.extend(got)
+        diag["n_measurement_rows_unmapped"] += d["n_measurement_rows_unmapped"]
 
     def early(chunk, dt_col, date_col=None):
         chunk = remap_ids(chunk, mm)
         return prune_rows(chunk, t0, dt_col, date_col, cfg.presentation_score_after_h) if prefilter else chunk
 
-    for chunk in src.iter_rows("omop_measurement", MEAS_COLS, ids, chunk_rows):
-        d: dict = {}
-        add(measurement_events({"omop_measurement": early(chunk, "measurement_datetime", "measurement_date")}, pids, cfg, d))
-        diag["n_measurement_rows_unmapped"] += d.get("n_measurement_rows_unmapped", 0)
-        del chunk
+    def measurements(add, d):
+        for chunk in src.iter_rows("omop_measurement", MEAS_COLS, ids, chunk_rows):
+            dd: dict = {}
+            add(measurement_events({"omop_measurement": early(chunk, "measurement_datetime", "measurement_date")}, pids, cfg, dd))
+            d["n_measurement_rows_unmapped"] += dd.get("n_measurement_rows_unmapped", 0)
+            del chunk
+    staged("measurement", None, measurements)
     concept = drug_concept_names(src.s3)
     hit_ids = set(concept["concept_id"].dropna().astype("int64"))
-    for chunk in src.iter_rows("omop_drug_exposure", DRUG_COLS, ids, chunk_rows):
-        txt = chunk["drug_source_value"].astype("string").fillna("")
-        hit = txt.str.contains(_DRUG_ANY, na=False).to_numpy(bool)
-        if "drug_concept_id" in chunk and hit_ids:
-            hit |= pd.to_numeric(chunk["drug_concept_id"], errors="coerce").isin(hit_ids).to_numpy(bool)
-        chunk = early(chunk[hit], "drug_exposure_start_datetime")
-        if len(chunk):
-            add(drug_events({"omop_drug_exposure": chunk, "omop_concept": concept}, pids, cfg))
+
+    def drugs(add, d):
+        for chunk in src.iter_rows("omop_drug_exposure", DRUG_COLS, ids, chunk_rows):
+            txt = chunk["drug_source_value"].astype("string").fillna("")
+            hit = txt.str.contains(_DRUG_ANY, na=False).to_numpy(bool)
+            if "drug_concept_id" in chunk and hit_ids:
+                hit |= pd.to_numeric(chunk["drug_concept_id"], errors="coerce").isin(hit_ids).to_numpy(bool)
+            chunk = early(chunk[hit], "drug_exposure_start_datetime")
+            if len(chunk):
+                add(drug_events({"omop_drug_exposure": chunk, "omop_concept": concept}, pids, cfg))
+    staged("drug_exposure", concept, drugs)
     for table, cols in (("omop_condition_occurrence", COND_COLS), ("omop_procedure_occurrence", PROC_COLS),
                         ("omop_observation", OBS_COLS)):
-        for chunk in src.iter_rows(table, cols, ids, chunk_rows):
-            chunk = remap_ids(chunk, mm)
-            add(history_events({table: chunk}, pids))                     # small tables: events pruned, rows kept
-            if table == "omop_condition_occurrence":
-                add(label_dx_events({table: chunk}, pids))                # subgroup definition only (domain dxlab)
+        def history(add, d, table=table, cols=cols):
+            for chunk in src.iter_rows(table, cols, ids, chunk_rows):
+                chunk = remap_ids(chunk, mm)
+                add(history_events({table: chunk}, pids))                     # small tables: events pruned, rows kept
+                if table == "omop_condition_occurrence":
+                    add(label_dx_events({table: chunk}, pids))                # subgroup definition only (domain dxlab)
+        staged(table, None, history)
     ev = pd.concat(parts, ignore_index=True) if parts else empty_events()
     if cfg.encounter_scope == "current":
         if enc is None:
@@ -449,6 +481,7 @@ def main(argv=None) -> int:
     ap.add_argument("--chunk-rows", type=int, default=CHUNK_ROWS)
     ap.add_argument("--no-prefilter", action="store_true", help="skip the memory prefilter (tests; needs much more memory)")
     ap.add_argument("--max-memory-gb", type=float, default=None, help="RLIMIT_AS guard (see build_cohort.py)")
+    ck.add_arguments(ap)
     a = ap.parse_args(argv)
     return run_guarded(lambda: _run(a), a.max_memory_gb, "baseline build")
 
@@ -460,14 +493,19 @@ def _run(a) -> int:
         agent_safety.assert_not_restricted_in_agent(a.data)
     store = data_io.open_store(a.data, profile=a.profile)
     sites = None if a.sites == ["all"] else a.sites
-    cohort = load_cohort(a.cohort, sites, a.cohort_def)
-    sex = sex_lookup(store, cohort)
-    index = make_index(cohort, sex)
-    del cohort
-    cfg = BaselineConfig(encounter_scope="with_history" if a.with_history else "current")
-    sources = StoreSources(store, merge_cols=tuple(a.merge_cols) if a.merge_cols else None)
-    mm, _status = sources.merge_map()
-    fs, n_events = build_matrices(sources, index, cfg, mm or None, not a.no_prefilter, a.chunk_rows)
+    # Restart safety: per-site sex lookups, every OMOP row group read and every table's baseline events are stored under
+    # out/local_only/checkpoints/baselines/<key>/ as they finish; a relaunch with the same arguments skips them. The key covers
+    # the arguments, the cohort file and the store listing, so a rebuilt cohort or a refreshed table starts fresh.
+    cp = ck.open_step("baselines", a, inputs=[a.cohort], store=store, no_resume=a.no_resume)
+    with ck.use(cp):
+        cohort = load_cohort(a.cohort, sites, a.cohort_def)
+        sex = sex_lookup(store, cohort)
+        index = make_index(cohort, sex)
+        del cohort
+        cfg = BaselineConfig(encounter_scope="with_history" if a.with_history else "current")
+        sources = StoreSources(store, merge_cols=tuple(a.merge_cols) if a.merge_cols else None)
+        mm, _status = sources.merge_map()
+        fs, n_events = build_matrices(sources, index, cfg, mm or None, not a.no_prefilter, a.chunk_rows)
     write_outputs(fs, index, cfg, out)
     summ = missingness_summary(fs, index)
     print_summary(summ, n_events, peak_rss_gb(), encounter_notes(fs, cfg))

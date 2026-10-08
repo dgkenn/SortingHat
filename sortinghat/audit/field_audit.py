@@ -31,7 +31,7 @@ from pathlib import Path
 import numpy as np
 import pandas as pd
 
-from .. import agent_safety, data_io, schema
+from .. import agent_safety, checkpoint as ck, data_io, schema
 from ..cohort import rules as cohort_rules
 from ..cohort.config import CohortConfig
 from . import alignment as al
@@ -434,18 +434,25 @@ def load_audit_tables(s3, sites: list[str] | None = None, avail: dict | None = N
     store = StoreSources(s3, sites)
     mm, _ = store.merge_map()
     parts = []
-    for site in sites:
+
+    def site_frame(site: str):
         try:
             meta = data_io.read_site_table("eeg_metadata", site, s3=s3)         # site variant -> canonical names
         except FileNotFoundError:
-            continue
+            return None
         try:
             rf = data_io.read_site_table("reports_findings", site, s3=s3)       # absent at I0008 / I0009
         except FileNotFoundError:
             rf = None
         meta = schema.coerce_types("eeg_metadata", meta)
         rf = None if rf is None else schema.coerce_types("reports_findings", rf)
-        parts.append(merge_eeg(meta, rf, site))
+        return merge_eeg(meta, rf, site)
+
+    cp = ck.active()
+    for site in sites:
+        frame = site_frame(site) if cp is None else cp.stage(f"audit_eeg-{site}", site, lambda site=site: site_frame(site))
+        if frame is not None:
+            parts.append(frame)
     if not parts:
         raise FileNotFoundError("no eeg_metadata CSV found for any site")
     eeg = pd.concat(parts, ignore_index=True)
@@ -1271,6 +1278,7 @@ def main(argv: list[str] | None = None) -> int:
     ap.add_argument("--handcheck-n", type=int, default=HANDCHECK_N)
     ap.add_argument("--strict", action="store_true",
                     help="exit 1 if a Stop row fails (dry run: if a CONFIRMED column is missing)")
+    ck.add_arguments(ap)
     a = ap.parse_args(argv)
     if not a.dry_run_schema and not a.out:
         ap.error("--out is required unless --dry-run-schema")
@@ -1299,7 +1307,13 @@ def main(argv: list[str] | None = None) -> int:
 
     stage = "load"
     try:
-        tables = load_audit_tables(s3, a.sites, workers=a.workers)
+        # Restart safety: every OMOP row group read, each site's EEG frame and the finished table set are stored under
+        # out/local_only/checkpoints/field_audit/<key>/ as they finish; a relaunch with the same arguments skips them.
+        cp = ck.open_step("field_audit", a, store=s3, no_resume=a.no_resume,
+                          exclude=("seed", "handcheck_n", "strict", "out", "dry_run_schema", "list_unlisted",
+                                   "probe_prefixes"))
+        with ck.use(cp):
+            tables = cp.stage("audit_tables", None, lambda: load_audit_tables(s3, a.sites, workers=a.workers))
         stage = "audit"
         report, ids = run_audit(tables, a.seed, a.handcheck_n)
     except MemoryError:

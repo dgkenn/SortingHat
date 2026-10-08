@@ -35,7 +35,7 @@ from typing import Callable, Iterable, Mapping
 import numpy as np
 import pandas as pd
 
-from .. import data_io, schema
+from .. import checkpoint as ck, data_io, schema
 from ..safe_output import (SUPPRESSED, SUPPRESS_BELOW, assert_aggregate_only, safe_write_json, suppress_count,
                            suppress_proportion, write_local_only)
 from .anchors import EVENT_COLUMNS, load_anchor_config, silver_anchor_table
@@ -476,13 +476,36 @@ def classify_store(store, ctx: _Ctx, on_error: Callable | None = None) -> Classi
     """Streaming path: each table is read in column-pruned, cohort-filtered Arrow batches and classified batch by batch,
     so only matched rows are held in memory. ``store`` is a ``data_io.LocalStore`` or the S3 client (human-run only)."""
     pids = sorted(ctx.pids)
+    cp = ck.active()
 
     def stream(table: str, fn: Callable, cols: list[str], person_filter: bool = True) -> pd.DataFrame:
-        parts = []
-        for b in data_io.iter_omop_batches(table, person_ids=pids if person_filter else None, columns=cols, s3=store,
-                                           on_error=on_error):
-            parts.append(fn(b.to_pandas(), ctx))
-        return _concat(parts, [])
+        def run() -> tuple[pd.DataFrame, bool]:
+            failed = []
+            handler = on_error if on_error is None else (lambda k, e: (failed.append(k), on_error(k, e)))
+            parts = []
+            for b in data_io.iter_omop_batches(table, person_ids=pids if person_filter else None, columns=cols, s3=store,
+                                               on_error=handler):
+                parts.append(fn(b.to_pandas(), ctx))
+            return _concat(parts, []), not failed
+        if cp is None:
+            return run()[0]
+        # Whole-table unit (restart safety): the classified frame plus the diagnostic counts it added to ``ctx``. Keyed by the
+        # cohort, config, concept map, the visit starts later tables depend on and the column list. A table read with a
+        # skipped part (``on_error``) is never stored: an incomplete result must be recomputed.
+        unit = "stage:classified-%s:%s" % (table, ck.digest(cols, person_filter, ctx.cases, ctx.cfg, ctx.cm.raw,
+                                                           ctx.visit_start, ctx.index.n_ingested, fn.__name__))
+        hit = cp.get(unit)
+        if hit is not ck.MISS:
+            res, delta = hit
+            ctx.diag.update(delta)
+            ck.log(f"silver_labels: {table} classified table loaded from checkpoint")
+            return res
+        before = Counter(ctx.diag)
+        res, complete = run()
+        if complete:
+            cp.put(unit, (res, dict(Counter(ctx.diag) - before)))
+            ck.log(f"silver_labels: {table} classified table done")
+        return res
     for batch in data_io.iter_omop_batches("concept", columns=COLUMNS["concept"], s3=store, on_error=on_error):
         ctx.index.ingest(batch.to_pandas())
     visits = stream("visit_occurrence", classify_visits, COLUMNS["visit_occurrence"])
@@ -1132,6 +1155,7 @@ def main(argv: list[str] | None = None) -> int:
     ap.add_argument("--labels-out", help="record-level silver labels CSV; the path must contain a local_only/ directory")
     ap.add_argument("--no-name-fallback", action="store_true")
     ap.add_argument("--profile")
+    ck.add_arguments(ap)
     args = ap.parse_args(argv)
     if args.data:
         from ..agent_safety import assert_not_restricted_in_agent
@@ -1141,7 +1165,11 @@ def main(argv: list[str] | None = None) -> int:
     store = data_io.open_store(args.data, profile=args.profile)       # S3 client refuses inside an agent session
     p = Path(args.cohort)
     cohort = pd.read_parquet(p) if p.suffix == ".parquet" else pd.read_csv(p)
-    res = extract_silver(store, cohort, config=ExtractConfig(allow_name_fallback=not args.no_name_fallback))
+    # Restart safety: every OMOP row group read and every classified table is stored under
+    # out/local_only/checkpoints/silver_labels/<key>/ as it finishes; a relaunch with the same arguments skips them.
+    cp = ck.open_step("silver_labels", args, inputs=[p], store=store, no_resume=args.no_resume)
+    with ck.use(cp):
+        res = extract_silver(store, cohort, config=ExtractConfig(allow_name_fallback=not args.no_name_fallback))
     rep = silver_report(res)
     safe_write_json(Path(args.out) / "silver_report.json", rep)
     if args.labels_out:

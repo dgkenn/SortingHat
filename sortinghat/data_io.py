@@ -340,6 +340,29 @@ def list_keys(s3, prefix: str, *, bucket: str | None = None, suffix: str | None 
     return sorted(keys)
 
 
+def list_objects(s3, prefix: str, *, bucket: str | None = None, suffix: str | None = None,
+                 policy: RetryPolicy | None = None) -> list[tuple[str, int | None, str | None]]:
+    """Like ``list_keys`` but ``(key, size, last_modified)`` per object, sorted by key. A client that does not report size /
+    time (a bare fake) gives ``None`` for them. Used to fingerprint inputs for checkpoints (``sortinghat.checkpoint``)."""
+    bucket = bucket or access_point()
+    rows: list[tuple[str, int | None, str | None]] = []
+    token = None
+    while True:
+        kw: dict[str, Any] = {"Bucket": bucket, "Prefix": prefix, "MaxKeys": 1000}
+        if token:
+            kw["ContinuationToken"] = token
+        resp = with_retries(lambda kw=kw: s3.list_objects_v2(**kw), policy)
+        for o in resp.get("Contents", []):
+            lm = o.get("LastModified")
+            rows.append((o["Key"], o.get("Size"), None if lm is None else str(lm)))
+        if not resp.get("IsTruncated"):
+            break
+        token = resp.get("NextContinuationToken")
+    if suffix:
+        rows = [r for r in rows if r[0].endswith(suffix)]
+    return sorted(rows)
+
+
 # A name is "id-like" when it could be a patient/session/date identifier. Such names are never printed.
 _ID_LIKE_RE = re.compile(r"(^|[^A-Za-z])(sub|ses)-|\d{5,}|^\d+/?$|[0-9a-f]{12,}|\d{4}[-_]\d{2}[-_]\d{2}|\d{1,2}(st|nd|rd|th)?[A-Za-z]{3,9}\d{4}", re.I)
 ID_LIKE = "<id-like name>"
@@ -776,6 +799,57 @@ def _rowgroup_may_match(pf, rg: int, col: str, sorted_ids: list[int]) -> bool:
     return True
 
 
+class RowGroupCache:
+    """The active checkpoint (``sortinghat.checkpoint``) seen from ONE streaming read of ONE table.
+
+    A row-group unit holds the pyarrow table that the reader would have yielded for that row group (filtered and column-pruned
+    inside Arrow; ``None`` when nothing survives), keyed by the call (table, requested columns, person-id set, predicate), the
+    part (key, size, last-modified) and the row-group number. A per-part manifest remembers the row-group count, so a part
+    whose row groups are all stored is never opened: a restart re-reads nothing it already read. Progress is logged as
+    aggregate-only lines (``sortinghat.checkpoint.RowGroupProgress``)."""
+
+    def __init__(self, cp, label: str, call_key: Any, parts: list[str], meta: dict[str, tuple]):
+        from . import checkpoint as ck
+        self.ck, self.cp, self.meta = ck, cp, meta
+        self.base = ck.digest(call_key)[:24]
+        counts = [self._manifest(k) for k in parts]
+        total = sum(counts) if all(c is not None for c in counts) else None
+        self.progress = ck.RowGroupProgress(label, len(parts), total)
+
+    def _name(self, key: str, what: str) -> str:
+        return f"rg:{self.base}:{key}:{self.meta.get(key)}:{what}"
+
+    def _manifest(self, key: str) -> int | None:
+        got = self.cp.get(self._name(key, "n"))
+        return None if got is self.ck.MISS else int(got)
+
+    manifest = _manifest
+
+    def set_manifest(self, key: str, n: int) -> None:
+        self.cp.put(self._name(key, "n"), int(n), count=False)
+
+    def get(self, key: str, rg: int):
+        return self.cp.get(self._name(key, str(rg)))
+
+    def put(self, key: str, rg: int, tbl) -> None:
+        self.cp.put(self._name(key, str(rg)), tbl if tbl is not None and tbl.num_rows else None)
+
+
+def _checkpoint_parts(s3, table: str, prefix: str | None, bucket: str) -> tuple[list[str], dict[str, tuple]]:
+    """Part keys of a table and ``{key: (size, last_modified)}`` for the checkpoint keys (one listing)."""
+    if prefix is None and table not in OMOP_COLUMNS:
+        raise KeyError(f"unknown OMOP table {table!r}; known: {sorted(OMOP_COLUMNS)}")
+    rows = list_objects(s3, prefix or OMOP_MERGED_PREFIX + f"{table}/", bucket=bucket, suffix=".parquet")
+    return [r[0] for r in rows], {r[0]: (r[1], r[2]) for r in rows}
+
+
+def ids_digest(ids) -> str | None:
+    """Digest of a sorted id list (checkpoint call key); ``None`` for no id filter."""
+    from . import checkpoint as ck
+    import numpy as np
+    return None if ids is None else ck.digest(np.asarray(list(ids), dtype="int64"))
+
+
 def iter_omop_batches(table: str, *, person_ids: Iterable[int] | None = None,
                       columns: list[str] | None = None, s3=None, profile: str | None = None,
                       batch_rows: int = 65536, prefix: str | None = None,
@@ -791,52 +865,91 @@ def iter_omop_batches(table: str, *, person_ids: Iterable[int] | None = None,
     ``heedb_bs_ascertainment.py``). A row-group read that fails is retried (``retry``); a part that still fails is
     reported through ``on_error`` and skipped; the caller decides whether a partial result is acceptable (source
     catalogue rule 5: empty is not absence).
+
+    With an active checkpoint (``sortinghat.checkpoint.use``) every row group's result is stored as it is produced and a
+    relaunched read replays the stored ones without touching the store (see ``RowGroupCache``); the batches yielded are the same.
     """
     import pyarrow as pa
     import pyarrow.compute as pc
+    from . import checkpoint as ck
 
     s3 = s3 or make_client(profile)
     bucket = access_point()
     want = columns or (schema.columns(table) if table in schema.SCHEMA else OMOP_COLUMNS[table])
     ids = sorted({int(p) for p in person_ids}) if person_ids is not None else None
     pid_arr = pa.array(ids, type=pa.int64()) if ids is not None else None
-    parts = parquet_parts(s3, prefix, bucket=bucket) if prefix else omop_parts(s3, table, bucket=bucket)
+    cp = ck.active()
+    cache = None
+    if cp is not None:
+        parts, pmeta = _checkpoint_parts(s3, table, prefix, bucket)
+        cache = RowGroupCache(cp, f"omop_{table}" if not prefix else f"{table}", ("omop_batches", table, tuple(want), prefix,
+                                                                                ids_digest(ids)), parts, pmeta)
+    else:
+        parts = parquet_parts(s3, prefix, bucket=bucket) if prefix else omop_parts(s3, table, bucket=bucket)
     outer = _outer(retry)
+
+    def read_rg(pf, rg: int, use: list[str]):
+        """The table this row group contributes (``None`` for nothing)."""
+        filt = pid_arr is not None and "person_id" in use
+        rest = [c for c in use if c != "person_id"]
+        if filt:
+            if not ids or not _rowgroup_may_match(pf, rg, "person_id", ids):
+                return None
+            pid = with_retries(lambda: pf.read_row_group(rg, columns=["person_id"]), outer)
+            mask = pc.fill_null(pc.is_in(pc.cast(pid.column("person_id"), pa.int64(), safe=False),
+                                         value_set=pid_arr), False)
+            if not pc.any(mask).as_py():
+                return None
+            if rest:
+                other = with_retries(lambda: pf.read_row_group(rg, columns=rest), outer)
+                tbl = pa.table({c: (pid.column(c) if c == "person_id" else other.column(c)) for c in use})
+            else:
+                tbl = pid
+            return tbl.filter(mask)
+        return with_retries(lambda: pf.read_row_group(rg, columns=use), outer)
+
     for key in parts:
         try:
-            pf = with_retries(lambda key=key: open_parquet(s3, bucket, key, policy=retry, max_get_bytes=max_get_bytes,
-                                                     buffer_size=buffer_size),
-                              outer)
-            have = pf.schema_arrow.names
-            use = [c for c in want if c in have]
-            if not use:
-                continue
-            filt = pid_arr is not None and "person_id" in use
-            rest = [c for c in use if c != "person_id"]
-            for rg in range(pf.num_row_groups):
-                if filt:
-                    if not ids or not _rowgroup_may_match(pf, rg, "person_id", ids):
-                        continue
-                    pid = with_retries(lambda rg=rg: pf.read_row_group(rg, columns=["person_id"]), outer)
-                    mask = pc.fill_null(pc.is_in(pc.cast(pid.column("person_id"), pa.int64(), safe=False),
-                                                 value_set=pid_arr), False)
-                    if not pc.any(mask).as_py():
-                        continue
-                    if rest:
-                        other = with_retries(lambda rg=rg: pf.read_row_group(rg, columns=rest), outer)
-                        tbl = pa.table({c: (pid.column(c) if c == "person_id" else other.column(c)) for c in use})
-                    else:
-                        tbl = pid
-                    tbl = tbl.filter(mask)
-                else:
-                    tbl = with_retries(lambda rg=rg: pf.read_row_group(rg, columns=use), outer)
-                for batch in tbl.to_batches(max_chunksize=batch_rows):
-                    if batch.num_rows:
-                        yield batch
+            pf = use = None
+            n_rg = cache.manifest(key) if cache else None
+            if cache:
+                cache.progress.start_part()
+            if n_rg is None:                                    # footer not seen before: open the part
+                pf = with_retries(lambda key=key: open_parquet(s3, bucket, key, policy=retry, max_get_bytes=max_get_bytes,
+                                                         buffer_size=buffer_size), outer)
+                have = pf.schema_arrow.names
+                use = [c for c in want if c in have]
+                n_rg = pf.num_row_groups if use else 0
+                if cache:
+                    cache.set_manifest(key, n_rg)
+            for rg in range(n_rg):
+                tbl, hit = None, False
+                if cache:
+                    got = cache.get(key, rg)
+                    hit = got is not ck.MISS
+                    tbl = None if not hit else got
+                if not hit:
+                    if pf is None:                              # a stored footer count, but this row group is not stored
+                        pf = with_retries(lambda key=key: open_parquet(s3, bucket, key, policy=retry,
+                                                                 max_get_bytes=max_get_bytes, buffer_size=buffer_size), outer)
+                    if use is None:
+                        have = pf.schema_arrow.names
+                        use = [c for c in want if c in have]
+                    tbl = read_rg(pf, rg, use)
+                    if cache:
+                        cache.put(key, rg, tbl)
+                if cache:
+                    cache.progress.tick(hit)
+                if tbl is not None:
+                    for batch in tbl.to_batches(max_chunksize=batch_rows):
+                        if batch.num_rows:
+                            yield batch
         except Exception as exc:  # noqa: BLE001 - surfaced to the caller, never swallowed silently
             if on_error is None:
                 raise
             on_error(key, exc)
+    if cache:
+        cache.progress.emit(final=True)
 
 
 # ---------------------------------------------------------------------------------------------------------
@@ -887,7 +1000,10 @@ class LocalStore:
                     k = f.relative_to(self.root).as_posix()
                     if k.startswith(Prefix):
                         keys.append(k)
-        return {"Contents": [{"Key": k} for k in sorted(keys)], "IsTruncated": False}
+        def entry(k: str) -> dict:
+            st = self._path(k).stat()
+            return {"Key": k, "Size": st.st_size, "LastModified": st.st_mtime_ns}
+        return {"Contents": [entry(k) for k in sorted(keys)], "IsTruncated": False}
 
     def get_object(self, Bucket=None, Key: str = "", Range: str | None = None):
         p = self._path(Key)

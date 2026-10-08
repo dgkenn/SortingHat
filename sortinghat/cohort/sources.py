@@ -144,51 +144,102 @@ def iter_filtered_batches(s3, table: str, person_ids, columns: list[str], *, tex
     (``data_io.with_retries``)."""
     import pyarrow as pa
     import pyarrow.compute as pc
+    from .. import checkpoint as ck
     want = sorted({int(p) for p in person_ids})
     if not want:
         return
     pid_arr = pa.array(want, type=pa.int64())
     bucket = data_io.access_point()
-    parts = data_io.parquet_parts(s3, prefix, bucket=bucket) if prefix else data_io.omop_parts(s3, table, bucket=bucket)
-    outer = data_io._outer(retry)
+    cp = ck.active()
+    cache = None
     pred = bool(pattern) or bool(ids)
-    id_arr = pa.array(sorted({int(i) for i in ids}), type=pa.int64()) if ids else None
-    for key in parts:
-        pf = data_io.with_retries(lambda key=key: data_io.open_parquet(s3, bucket, key, policy=retry), outer)
+    id_list = sorted({int(i) for i in ids}) if ids else None
+    id_arr = pa.array(id_list, type=pa.int64()) if ids else None
+    if cp is not None:
+        parts, pmeta = data_io._checkpoint_parts(s3, table, prefix, bucket)
+        cache = data_io.RowGroupCache(
+            cp, table if prefix else f"omop_{table}",
+            ("filtered_batches", table, tuple(columns), prefix, text_col, pattern, id_col, data_io.ids_digest(want),
+             data_io.ids_digest(id_list)), parts, pmeta)
+    else:
+        parts = data_io.parquet_parts(s3, prefix, bucket=bucket) if prefix else data_io.omop_parts(s3, table, bucket=bucket)
+    outer = data_io._outer(retry)
+
+    def plan(pf):
+        """(columns to return, stage-1 columns, True when the part can contribute at all)"""
         have = set(pf.schema_arrow.names)
         use = [c for c in columns if c in have]
         if "person_id" not in use:
-            continue
+            return use, [], False
         t_ok = bool(pattern) and text_col in have
         i_ok = id_arr is not None and id_col in have
         if pred and not (t_ok or i_ok):
-            continue
+            return use, [], False
         stage1 = ["person_id"] + ([text_col] if t_ok else []) + ([id_col] if i_ok and id_col != "person_id" else [])
+        return use, stage1, True
+
+    def read_rg(pf, rg: int, use: list[str], stage1: list[str]):
+        if not data_io._rowgroup_may_match(pf, rg, "person_id", want):
+            return None
+        have = set(pf.schema_arrow.names)
+        t_ok = bool(pattern) and text_col in have
+        i_ok = id_arr is not None and id_col in have
+        t1 = data_io.with_retries(lambda: pf.read_row_group(rg, columns=stage1), outer)
+        mask = pc.fill_null(pc.is_in(pc.cast(t1.column("person_id"), pa.int64(), safe=False), value_set=pid_arr), False)
+        if pred:
+            pm = []
+            if t_ok:
+                pm.append(pc.match_substring_regex(pc.cast(t1.column(text_col), pa.string()), pattern, ignore_case=True))
+            if i_ok:
+                pm.append(pc.is_in(pc.cast(t1.column(id_col), pa.int64(), safe=False), value_set=id_arr))
+            m2 = pm[0]
+            for x in pm[1:]:
+                m2 = pc.or_kleene(m2, x)
+            mask = pc.and_kleene(mask, pc.fill_null(m2, False))
+        if not pc.any(mask).as_py():
+            return None
         rest = [c for c in use if c not in stage1]
-        for rg in range(pf.num_row_groups):
-            if not data_io._rowgroup_may_match(pf, rg, "person_id", want):
-                continue
-            t1 = data_io.with_retries(lambda rg=rg: pf.read_row_group(rg, columns=stage1), outer)
-            mask = pc.fill_null(pc.is_in(pc.cast(t1.column("person_id"), pa.int64(), safe=False), value_set=pid_arr), False)
-            if pred:
-                pm = []
-                if t_ok:
-                    pm.append(pc.match_substring_regex(pc.cast(t1.column(text_col), pa.string()), pattern, ignore_case=True))
-                if i_ok:
-                    pm.append(pc.is_in(pc.cast(t1.column(id_col), pa.int64(), safe=False), value_set=id_arr))
-                m2 = pm[0]
-                for x in pm[1:]:
-                    m2 = pc.or_kleene(m2, x)
-                mask = pc.and_kleene(mask, pc.fill_null(m2, False))
-            if not pc.any(mask).as_py():
-                continue
-            tbl = t1
-            if rest:
-                t2 = data_io.with_retries(lambda rg=rg: pf.read_row_group(rg, columns=rest), outer)
-                tbl = pa.table({c: (t1.column(c) if c in stage1 else t2.column(c)) for c in use})
-            else:
-                tbl = t1.select(use)
-            yield tbl.filter(mask)
+        if rest:
+            t2 = data_io.with_retries(lambda: pf.read_row_group(rg, columns=rest), outer)
+            tbl = pa.table({c: (t1.column(c) if c in stage1 else t2.column(c)) for c in use})
+        else:
+            tbl = t1.select(use)
+        return tbl.filter(mask)
+
+    for key in parts:
+        pf = use = stage1 = None
+        n_rg = cache.manifest(key) if cache else None
+        if cache:
+            cache.progress.start_part()
+
+        def open_part():
+            return data_io.with_retries(lambda: data_io.open_parquet(s3, bucket, key, policy=retry), outer)
+        if n_rg is None:
+            pf = open_part()
+            use, stage1, ok = plan(pf)
+            n_rg = pf.num_row_groups if ok else 0
+            if cache:
+                cache.set_manifest(key, n_rg)
+        for rg in range(n_rg):
+            tbl, hit = None, False
+            if cache:
+                got = cache.get(key, rg)
+                hit = got is not ck.MISS
+                tbl = got if hit else None
+            if not hit:
+                if pf is None:
+                    pf = open_part()
+                if use is None:
+                    use, stage1, _ok = plan(pf)
+                tbl = read_rg(pf, rg, use, stage1)
+                if cache:
+                    cache.put(key, rg, tbl)
+            if cache:
+                cache.progress.tick(hit)
+            if tbl is not None:
+                yield tbl
+    if cache:
+        cache.progress.emit(final=True)
 
 
 def prune_window(df: pd.DataFrame, tcol: str, window: pd.DataFrame | None) -> pd.DataFrame:
@@ -253,6 +304,25 @@ def _empty(table: str) -> pd.DataFrame:
     return schema.coerce_types(table, pd.DataFrame({c: pd.Series(dtype=object) for c in schema.columns(table)}))
 
 
+def _staged(what: str, key_obj, fn):
+    """Compute-or-load a whole extraction result (e.g. all visits of a cohort) through the active checkpoint. The key covers
+    the arguments (ids, bounds / window, merge map, ...), so a different request is a different unit."""
+    from .. import checkpoint as ck
+    cp = ck.active()
+    if cp is None:
+        return fn()
+    with ck.tag(what):
+        return cp.stage(what, key_obj, fn)
+
+
+def _per_site(what: str, site: str, fn):
+    """Compute-or-load one site's unit of a step (``what`` x ``site``) through the active checkpoint; a plain call without one.
+    The checkpoint key already covers the step's arguments, the input listing and the code version."""
+    from .. import checkpoint as ck
+    cp = ck.active()
+    return fn() if cp is None else cp.stage(f"{what}-{site}", {"what": what, "site": site}, fn)
+
+
 class FrameSources:
     """In-memory raw tables keyed by ``schema`` table name (what ``sortinghat.synthetic.generate`` returns)."""
 
@@ -313,22 +383,29 @@ class StoreSources:
         sites = self.sites or data_io.discover_sites(self.s3)
         parts, idx = [], []
         for site in sites:
-            try:
-                meta = data_io.read_site_table("eeg_metadata", site, s3=self.s3)
-            except FileNotFoundError:
+            got = _per_site("sessions", site, lambda site=site: self._site_sessions(site))
+            if got is None:
                 continue
-            try:
-                rf = data_io.read_site_table("reports_findings", site, s3=self.s3)    # absent at I0008 / I0009
-            except FileNotFoundError:
-                rf = None
-            meta = schema.coerce_types("eeg_metadata", meta)
-            rf = None if rf is None else schema.coerce_types("reports_findings", rf)
-            parts.append(site_sessions(meta, rf, site))
-            idx.append(integrity.source_index(meta, rf, site))
+            parts.append(got[0])
+            idx.append(got[1])
         if not parts:
             raise FileNotFoundError("no eeg_metadata CSV found for any requested site")
         self._index = pd.concat(idx, ignore_index=True)
         return pd.concat(parts, ignore_index=True)
+
+    def _site_sessions(self, site: str):
+        """(session frame, source index) of one site, or None when the site has no eeg_metadata CSV."""
+        try:
+            meta = data_io.read_site_table("eeg_metadata", site, s3=self.s3)
+        except FileNotFoundError:
+            return None
+        try:
+            rf = data_io.read_site_table("reports_findings", site, s3=self.s3)    # absent at I0008 / I0009
+        except FileNotFoundError:
+            rf = None
+        meta = schema.coerce_types("eeg_metadata", meta)
+        rf = None if rf is None else schema.coerce_types("reports_findings", rf)
+        return site_sessions(meta, rf, site), integrity.source_index(meta, rf, site)
 
     def source_index(self) -> pd.DataFrame:
         """Independent keys of the source eeg_metadata rows (see ``cohort.integrity``); call after ``sessions()``."""
@@ -376,6 +453,10 @@ class StoreSources:
     def visits(self, person_ids, bounds=None, remap=None, slack_h: float = 0.0, dates_only: bool = False
                ) -> pd.DataFrame:
         """COMPACT visits (``rules.compact_visits``), compacted, re-keyed and pruned PER CHUNK as they stream in."""
+        return _staged("visits", (person_ids, bounds, remap, slack_h, dates_only),
+                       lambda: self._visits(person_ids, bounds, remap, slack_h, dates_only))
+
+    def _visits(self, person_ids, bounds, remap, slack_h, dates_only) -> pd.DataFrame:
         chunks = []
         for raw in self.iter_rows("omop_visit_occurrence", _VISIT_COLS, person_ids, min_rows=250_000):
             c = rules.compact_visits(raw, dates_only=dates_only)
@@ -388,6 +469,9 @@ class StoreSources:
 
     def scores(self, person_ids, window=None, remap=None) -> pd.DataFrame:
         """COMPACT GCS / FOUR rows (``rules.compact_scores``), re-keyed and pruned to ``window`` per chunk."""
+        return _staged("scores", (person_ids, window, remap), lambda: self._scores(person_ids, window, remap))
+
+    def _scores(self, person_ids, window, remap) -> pd.DataFrame:
         chunks = []
         for raw in self.iter_rows("omop_measurement", _MEAS_COLS, person_ids, min_rows=250_000):
             c = rules.compact_scores(rules.filter_score_rows(raw))
@@ -398,6 +482,9 @@ class StoreSources:
         return concat_frames(chunks, rules.compact_scores(pd.DataFrame()))
 
     def conditions(self, person_ids, window=None, remap=None) -> pd.DataFrame:
+        return _staged("conditions", (person_ids, window, remap), lambda: self._conditions(person_ids, window, remap))
+
+    def _conditions(self, person_ids, window, remap) -> pd.DataFrame:
         chunks = []
         for raw in self.iter_rows("omop_condition_occurrence", _COND_COLS, person_ids, min_rows=250_000):
             f = rules.filter_phenotype_rows(raw)

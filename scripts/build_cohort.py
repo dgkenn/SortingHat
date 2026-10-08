@@ -9,6 +9,7 @@ Writes
     out/local_only/cohort_study1.csv     record-level cohort table      (mode 0600, never printed)
     out/local_only/recording_keys.csv    recording key list for the streaming extractor (mode 0600, never printed)
     out/cohort/flow.md, flow.json        CONSORT-style flow, aggregate only, counts < 11 suppressed
+    out/local_only/checkpoints/cohort/   resume state (record-level, mode 0700/0600, never printed); --no-resume starts over
 
 Stdout carries aggregates only (via sortinghat.safe_output). Choices are listed in docs/cohort_spec.md.
 """
@@ -18,7 +19,7 @@ from pathlib import Path
 
 sys.path.insert(0, str(Path(__file__).resolve().parents[1]))     # repo root, so `sortinghat` imports
 
-from sortinghat import agent_safety, data_io                       # noqa: E402
+from sortinghat import agent_safety, checkpoint, data_io           # noqa: E402
 from sortinghat.cohort import CohortConfig, StoreSources, build_cohort, write_outputs   # noqa: E402
 from sortinghat.cohort.config import ONSET_RULES, SCORE_RULES        # noqa: E402
 from sortinghat.cohort.build import MERGE_NOTICE                      # noqa: E402
@@ -54,6 +55,7 @@ def main(argv=None) -> int:
     ap.add_argument("--max-memory-gb", type=float, default=None,
                     help="guard: set RLIMIT_AS to this many GB (address space, an upper bound on RSS; pick generously) "
                          "and print a clear aggregate error instead of a traceback if exceeded")
+    checkpoint.add_arguments(ap)
     a = ap.parse_args(argv)
     return run_guarded(lambda: _run(a), a.max_memory_gb, "cohort build")
 
@@ -66,7 +68,11 @@ def _run(a) -> int:
     cfg = CohortConfig(onset_rule=a.onset_rule, score_rule=a.score_rule, use_service_proxy=not a.no_service_proxy,
                        study_sites=None if a.all_sites else CohortConfig().study_sites,
                        visit_slack_h=a.visit_slack_h, open_visit_days=a.open_visit_days)
-    result = build_cohort(StoreSources(store, a.sites, merge_cols=tuple(a.merge_cols) if a.merge_cols else None), cfg)
+    # Restart safety: per-site session frames, every OMOP row group read and the visit / score / condition extractions are
+    # stored under out/local_only/checkpoints/cohort/<key>/ as they finish; a relaunch with the same arguments skips them.
+    cp = checkpoint.open_step("cohort", a, store=store, no_resume=a.no_resume)
+    with checkpoint.use(cp):
+        result = build_cohort(StoreSources(store, a.sites, merge_cols=tuple(a.merge_cols) if a.merge_cols else None), cfg)
     paths = write_outputs(result, a.out, a.debug_flow)
 
     ids = known_ids(result)

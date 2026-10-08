@@ -17,6 +17,7 @@ from typing import Mapping, Sequence
 
 import numpy as np
 
+from .. import checkpoint as ck
 from ..metrics.bootstrap import delta_ci_all_modes, paired_bootstrap_delta
 from ..metrics.hypotheses import per_label_delta_ci
 from ..metrics.labels import primary_label_indices
@@ -111,7 +112,20 @@ def fit_predict_fold(data: ModelData, train_idx, test_idx, baseline_cols: Sequen
     fit_rows = np.flatnonzero(tr.gold_role != "dev")
     sel = primary_label_indices(data.label_names, cfg.include_e7)
     preds, info, models = {}, {}, {}
+    cp = None if return_models else ck.active()            # fitted models are not stored; only predictions + fit info
+    if cp is not None:
+        data_key = ck.digest(list(baseline_cols), list(data.label_names), data.baseline[list(baseline_cols)],
+                             data.y_silver, data.m_silver, data.y_gold, data.m_gold, data.gold_role,
+                             train_idx, test_idx, cfg)
     for name, eeg_cols in variants.items():
+        if cp is not None and (len(baseline_cols) or len(eeg_cols)):
+            unit = "fit:" + ck.digest(data_key, name, list(eeg_cols), data.eeg[list(eeg_cols)])
+            hit = cp.get(unit)
+            if hit is not ck.MISS:
+                preds[name], info[name] = hit
+                models[name] = None
+                _log_fit(cp, name, True)
+                continue
         if not len(baseline_cols) and not len(eeg_cols):
             # No baseline columns and no EEG columns: the model IS the smoothed prevalence prior (training silver rows). This is the
             # reference of the "EEG-only vs prevalence prior" comparison (D-145); it has no features to select or recalibrate.
@@ -129,9 +143,19 @@ def fit_predict_fold(data: ModelData, train_idx, test_idx, baseline_cols: Sequen
         preds[name] = mdl.predict(data.design(test_idx, baseline_cols, eeg_cols))   # features only
         info[name] = mdl.info
         models[name] = mdl
+        if cp is not None:
+            cp.put(unit, (preds[name], info[name]))
+            _log_fit(cp, name, False)
     preds["__prior__"] = np.tile(prevalence_prior(tr.y_silver[fit_rows], tr.m_silver[fit_rows]),
                                  (len(test_idx), 1))
     return (preds, info, models) if return_models else (preds, info)
+
+
+def _log_fit(cp, rung: str, cached: bool) -> None:
+    """Aggregate progress line of the model fits (rung names and counts only)."""
+    done, hit = cp.note("model_fit", cached)
+    ck.log(f"model fits: {done} done (cached {hit}); {ck.current_tag() or 'fold'} rung {rung} "
+           f"{'loaded from checkpoint' if cached else 'fitted and stored'}")
 
 
 def make_splits(data: ModelData, split: str, cfg: LadderConfig):
@@ -267,8 +291,9 @@ def run_ladder(data: ModelData, baseline_sets: Mapping[str, Sequence[str]] | Non
     for bname, bcols in baseline_sets.items():
         P = {k: np.full((data.n, data.K), np.nan) for k in list(variants) + ["__prior__"]}
         tested = np.zeros(data.n, bool)
-        for fname, tr, te, disjoint in splits:
-            preds, info = fit_predict_fold(data, tr, te, bcols, variants, cfg, require_site_disjoint=disjoint)
+        for i_fold, (fname, tr, te, disjoint) in enumerate(splits, 1):
+            with ck.tag(f"{split} baseline {bname} fold {i_fold}/{len(splits)}"):
+                preds, info = fit_predict_fold(data, tr, te, bcols, variants, cfg, require_site_disjoint=disjoint)
             for k, v in preds.items():
                 P[k][te] = v
             tested[te] = True
