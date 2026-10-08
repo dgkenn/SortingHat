@@ -5,11 +5,8 @@ Every step test follows the same script: run uninterrupted (reference); run agai
 ``SimulatedKill`` after N stored units (a restart); rerun with the same arguments; assert the outputs are identical to the
 reference and that work already stored was not redone (counted at the pyarrow row-group read, or at the model fit).
 """
-import os
 import shutil
 import stat
-import sys
-from pathlib import Path
 
 import pandas as pd
 import pyarrow.parquet as pq
@@ -20,7 +17,6 @@ from sortinghat import data_io
 from sortinghat.checkpoint import SimulatedKill
 from sortinghat.cohort.sources import iter_filtered_batches
 
-SCRIPTS = Path(__file__).resolve().parents[1] / "scripts"
 RG = 250                                                    # rows per row group in the rewritten synthetic store
 
 

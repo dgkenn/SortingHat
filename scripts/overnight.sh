@@ -1,6 +1,12 @@
 #!/usr/bin/env bash
 # Overnight driver for the real-data Phase 0 / Study 1 steps (HUMAN-AUTHORISED RUN; aggregate-only outputs).
-# Resumable: every step skips work already done, so the driver can be relaunched at any point.
+# Resumable: every step skips work already done, so the driver can be relaunched at any point (the cloud container
+# restarts about hourly and kills every process; just run this script again with the same arguments):
+#   * the EEG extractors resume from their ledgers and part files;
+#   * the silver labels and the field audit checkpoint every OMOP row group they read (and per-site / per-table units) under
+#     out/local_only/checkpoints/<step>/ (sortinghat/checkpoint.py), keyed by arguments + input files + code version, so a
+#     relaunch replays what was done and reads only what was not. Pass --no-resume to a step to force a fresh run.
+# Step logs are APPENDED so the progress lines ("omop_measurement: 37/120 row groups (cached 30)") survive restarts.
 #   1. streaming EEG feature extraction over the cohort key list (12 shards), then not_found retries
 #   2. Phase 0a field audit (needs the network to itself, so it runs after extraction)
 #   3. structured silver labels for the cohort
@@ -41,10 +47,10 @@ done
 
 say "silver labels start"
 timeout 21600 $RUN -m sortinghat.labels.extract --s3 --cohort out/local_only/cohort_study1.csv \
-  --out out/silver --labels-out out/local_only/silver/silver_labels.csv > out/logs/silver.log 2>&1
+  --out out/silver --labels-out out/local_only/silver/silver_labels.csv >> out/logs/silver.log 2>&1
 say "silver labels exit=$?"
 say "field audit start"
-timeout 21600 $RUN -m sortinghat.audit.field_audit --s3 --out out/audit --workers 3 > out/logs/field_audit.log 2>&1
+timeout 21600 $RUN -m sortinghat.audit.field_audit --s3 --out out/audit --workers 3 >> out/logs/field_audit.log 2>&1
 say "field audit exit=$?"
 
 say "driver done"

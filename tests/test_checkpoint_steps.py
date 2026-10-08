@@ -2,7 +2,6 @@
 arguments, and assert (1) the outputs are byte/value-identical to an uninterrupted run, (2) work stored before the kill was
 not redone (pyarrow row-group reads / model fits are counted), (3) ``--no-resume`` redoes everything, (4) a stale
 checkpoint (other code version) is not reused."""
-import filecmp
 import json
 import shutil
 from pathlib import Path
@@ -13,7 +12,6 @@ import pyarrow.parquet as pq
 import pytest
 
 from sortinghat import checkpoint as ck
-from sortinghat import data_io
 from sortinghat.checkpoint import SimulatedKill
 from test_checkpoint import RG, Counter  # noqa: F401  (tests/ on sys.path)
 from test_silver_feasibility_inputs import argv_for, load_script, make_inputs, rsf
@@ -103,13 +101,10 @@ def test_cohort_build_resumes_to_identical_outputs(store_dir, env, counter, caps
 @pytest.fixture(scope="module")
 def cohort_csv(store_dir, tmp_path_factory):
     """A cohort table (record-level, under local_only/) for the downstream steps."""
-    import os
     out = tmp_path_factory.mktemp("cohort_for_steps")
-    os.environ[ck.ENV_ROOT] = str(out / "ck")
-    try:
+    with pytest.MonkeyPatch.context() as mp:
+        mp.setenv(ck.ENV_ROOT, str(out / "ck"))
         assert bc.main(["--data", str(store_dir), "--out", str(out), "--all-sites"]) == 0
-    finally:
-        os.environ.pop(ck.ENV_ROOT)
     return out / "local_only" / "cohort_study1.csv"
 
 
@@ -223,7 +218,13 @@ def test_feasibility_fits_resume_per_scheme_fold_and_rung(tmp_path, env, monkeyp
 
     env.use_root("ck_run")
     fits["n"] = 0
-    assert kill_then_resume(rsf.main, argv(tmp_path / "run"), monkeypatch, kill_after=7) == 0
+    monkeypatch.setenv(ck.ENV_FAIL_AFTER, "7")
+    with pytest.raises(SimulatedKill):
+        rsf.main(argv(tmp_path / "run"))
+    monkeypatch.delenv(ck.ENV_FAIL_AFTER)
+    assert fits["n"] == 7
+    fits["n"] = 0
+    assert rsf.main(argv(tmp_path / "run")) == 0
     assert (tmp_path / "run" / "report.json").read_text() == ref_json
     assert (tmp_path / "run" / "report.md").read_text() == ref_md
     assert fits["n"] == full - 7                                       # 7 fits were stored before the kill, none redone

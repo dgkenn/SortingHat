@@ -55,7 +55,7 @@ import pandas as pd  # noqa: E402
 from scipy.stats import rankdata  # noqa: E402
 
 import build_baselines as bb  # noqa: E402
-from sortinghat import agent_safety, data_io  # noqa: E402
+from sortinghat import agent_safety, checkpoint, data_io  # noqa: E402
 from sortinghat.labels.circularity_audit import run_circularity_audit  # noqa: E402
 from sortinghat.labels.extract import eeg_impression_comparator, load_reports_findings  # noqa: E402
 from sortinghat.metrics.bootstrap import bootstrap_ci  # noqa: E402
@@ -1140,11 +1140,15 @@ def _run(a) -> int:
     # out/local_only/checkpoints/silver_feasibility/<key>/ and replayed after a container restart (ladder.fit_predict_fold).
     # The fit keys digest the actual data, so the feature / embedding directories (whose ledgers change while extractors run)
     # are deliberately not part of the step key; the small input files and the arguments are.
-    cp = checkpoint.open_step("silver_feasibility", a, no_resume=a.no_resume,
-                              inputs=[p for p in (a.cohort, a.silver, a.baselines, a.recording_map) if p])
-    A = assemble(a)
-    with checkpoint.use(cp), threadpool_limits(limits=a.blas_threads or None):
-        R = run_analysis(A, a, store)
+    checkpoint.log_to_stderr()          # stdout of this script is a fixed-format report that starts with the banner
+    try:
+        cp = checkpoint.open_step("silver_feasibility", a, no_resume=a.no_resume,
+                                  inputs=[p for p in (a.cohort, a.silver, a.baselines, a.recording_map) if p])
+        A = assemble(a)
+        with checkpoint.use(cp), threadpool_limits(limits=a.blas_threads or None):
+            R = run_analysis(A, a, store)
+    finally:
+        checkpoint.log_to_stderr(False)
     J = report_json(A, a, R)
     known = {str(p) for p in A.frame["person_id"]} | set(A.frame["rid"].astype(str))
     safe_write_json(out / "report.json", J, known)

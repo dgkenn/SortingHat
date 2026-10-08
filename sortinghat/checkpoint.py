@@ -222,17 +222,28 @@ def code_version() -> str:
 _LOG_LOCK = threading.Lock()
 
 
+_LOG_STDERR = False
+
+
+def log_to_stderr(on: bool = True) -> None:
+    """Send progress lines to stderr instead of stdout, for a script whose stdout is a fixed-format report (the silver-feasibility
+    report starts with its banner). A driver that runs the step with ``2>&1`` still logs both."""
+    global _LOG_STDERR
+    _LOG_STDERR = on
+
+
 def log(msg: str) -> None:
-    """One aggregate-only progress line on stdout (guarded by ``safe_print``; progress is never worth a crash)."""
-    from .safe_output import safe_print
+    """One aggregate-only progress line on stdout (stderr after ``log_to_stderr``), guarded by ``assert_aggregate_only``;
+    progress is never worth a crash."""
+    import sys
+    from .safe_output import assert_aggregate_only
     with _LOG_LOCK:
         try:
-            safe_print(msg)
+            assert_aggregate_only(msg)
         except Exception:  # noqa: BLE001
-            print("checkpoint: progress line withheld by the aggregate-only guard", flush=True)
-        else:
-            import sys
-            sys.stdout.flush()
+            msg = "checkpoint: progress line withheld by the aggregate-only guard"
+        stream = sys.stderr if _LOG_STDERR else sys.stdout
+        print(msg, file=stream, flush=True)
 
 
 class RowGroupProgress:

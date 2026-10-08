@@ -1,6 +1,16 @@
 import pytest
 
+from sortinghat import checkpoint
 from sortinghat.synthetic import generate, write_tables
+
+
+@pytest.fixture(scope="session", autouse=True)
+def _checkpoint_root(tmp_path_factory):
+    """Long steps checkpoint under out/local_only/checkpoints by default; tests (and the subprocesses they start) must not
+    write synthetic checkpoints next to real ones."""
+    with pytest.MonkeyPatch.context() as mp:
+        mp.setenv(checkpoint.ENV_ROOT, str(tmp_path_factory.mktemp("checkpoints")))
+        yield
 
 
 @pytest.fixture(scope="session")
