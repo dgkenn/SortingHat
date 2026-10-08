@@ -948,3 +948,9 @@ Entries below follow `docs/research/plan_compliance_2026-10-08.md`. Dates are 20
 - **Decision:** Baseline P (presentation) uses severity scores charted at or before t0 only (`presentation_score_after_h = 0`); the [-6, +1] h window remains a cohort-inclusion rule (D-105), never a model input.
 - **Rationale:** A model input must be knowable by the ED clinician at t0; post-t0 scores are defensible for selection but not as features.
 - **Source:** `sortinghat/baselines/config.py`.
+
+### D-147 Tech-transfer contact deferred until a positive feasibility signal; research outreach decoupled
+- **Date:** 2026-10-08 · **Area:** commercial · **Outcome data seen?** No
+- **Decision:** The incoming institution's tech-transfer question (outreach draft #4) is deferred until the silver-label feasibility analysis (D-143) shows an EEG signal worth protecting. Academic outreach (BDSP collaboration, CERTA, Korean cohort; drafts #1–3) is no longer gated on it. The project lead will read the IP clauses of the current and incoming house-staff agreements in the meantime, since ownership is set by contract terms, not disclosure timing.
+- **Rationale:** No invention to disclose yet; collaboration and scoop-risk mitigation (CLEF, BDSP) are time-sensitive.
+- **Source:** Project lead instruction (2026-10-08); `docs/outreach_drafts.md`.
