@@ -51,8 +51,7 @@ from sortinghat.baselines.events import drug_events, history_events, measurement
 from sortinghat.cohort import StoreSources  # noqa: E402
 from sortinghat.cohort.memguard import peak_rss_gb, run_guarded  # noqa: E402
 from sortinghat.cohort.sources import remap_ids  # noqa: E402
-from sortinghat.safe_output import (safe_print, safe_quantiles, safe_write_json, suppress_count,  # noqa: E402
-                                    suppress_proportion)
+from sortinghat.safe_output import safe_print, safe_write_json, suppress_count, suppress_proportion  # noqa: E402
 
 BASELINES_OUT = ("A", "B", "C")                      # D dropped (D-107)
 TEXT_COLS = ("SiteID", "SessionID", "BidsFolder", "EEGFolder")
@@ -181,6 +180,20 @@ def prune_events(ev: pd.DataFrame, t0: pd.Series, cfg: BaselineConfig, prefilter
     return ev[keep.to_numpy(bool)]
 
 
+def prune_rows(chunk: pd.DataFrame, t0: pd.Series, dt_col: str, date_col: str | None = None) -> pd.DataFrame:
+    """RAW-ROW prefilter, same contract as ``prune_events`` (removes only rows no event could survive ``as_of`` from): drops
+    rows timed after the person's t0 by their datetime, else (date-only) by a date after t0's calendar day. Rows with no
+    usable time are kept for the event builder to judge. Ids must already be the surviving ids."""
+    if chunk.empty or dt_col not in chunk:
+        return chunk
+    t = chunk["person_id"].map(t0)
+    dt = chunk[dt_col]
+    late = dt.notna() & (dt > t)
+    if date_col is not None and date_col in chunk:
+        late |= dt.isna() & chunk[date_col].notna() & (chunk[date_col] > t.dt.normalize())
+    return chunk[(~late & t.notna()).to_numpy(bool)]
+
+
 def drug_concept_names(store, on_error=None) -> pd.DataFrame:
     """``omop_concept`` rows (concept_id, concept_name) whose NAME mentions a lexicon sedative/opioid (brand names
     included): the only concept names ``drug_events`` can use. Streamed; the match runs inside Arrow."""
@@ -215,9 +228,13 @@ def collect_events(src: StoreSources, index: pd.DataFrame, cfg: BaselineConfig, 
         if len(ev):
             parts.append(ev)
 
+    def early(chunk, dt_col, date_col=None):
+        chunk = remap_ids(chunk, mm)
+        return prune_rows(chunk, t0, dt_col, date_col) if prefilter else chunk
+
     for chunk in src.iter_rows("omop_measurement", MEAS_COLS, ids, chunk_rows):
         d: dict = {}
-        add(measurement_events({"omop_measurement": remap_ids(chunk, mm)}, pids, cfg, d))
+        add(measurement_events({"omop_measurement": early(chunk, "measurement_datetime", "measurement_date")}, pids, cfg, d))
         diag["n_measurement_rows_unmapped"] += d.get("n_measurement_rows_unmapped", 0)
         del chunk
     concept = drug_concept_names(src.s3)
@@ -227,13 +244,13 @@ def collect_events(src: StoreSources, index: pd.DataFrame, cfg: BaselineConfig, 
         hit = txt.str.contains(_DRUG_ANY, na=False).to_numpy(bool)
         if "drug_concept_id" in chunk and hit_ids:
             hit |= pd.to_numeric(chunk["drug_concept_id"], errors="coerce").isin(hit_ids).to_numpy(bool)
-        chunk = chunk[hit]
+        chunk = early(chunk[hit], "drug_exposure_start_datetime")
         if len(chunk):
-            add(drug_events({"omop_drug_exposure": remap_ids(chunk, mm), "omop_concept": concept}, pids, cfg))
+            add(drug_events({"omop_drug_exposure": chunk, "omop_concept": concept}, pids, cfg))
     for table, cols in (("omop_condition_occurrence", COND_COLS), ("omop_procedure_occurrence", PROC_COLS),
                         ("omop_observation", OBS_COLS)):
         for chunk in src.iter_rows(table, cols, ids, chunk_rows):
-            add(history_events({table: remap_ids(chunk, mm)}, pids))
+            add(history_events({table: remap_ids(chunk, mm)}, pids))      # small tables: events pruned, rows kept
     ev = pd.concat(parts, ignore_index=True) if parts else empty_events()
     return ev[EVENT_COLUMNS], diag
 
