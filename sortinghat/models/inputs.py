@@ -47,6 +47,26 @@ def morgoth_findings_frame(source) -> pd.DataFrame:
     return _prefixed(source, "morgoth.")
 
 
+def load_morgoth_findings(path, recording_ids, window: str = "primary", require_qc_pass: bool = True):
+    """MORGOTH findings (``morgoth.*`` columns) for ``recording_ids`` from the extractor's local_only parquet parts
+    (``scripts/extract_morgoth.py features``), one row per id in the given order (NaN where a recording has no row or its
+    window failed QC). Returns ``None`` when ``path`` holds no parts, so the caller passes it to ``assemble_eeg_frame``
+    (which ignores ``None``) and the ladder skips the MORGOTH rungs cleanly (``available: False``)."""
+    from ..morgoth.outputs import feature_columns, read_findings
+    df = read_findings(path, window)
+    if df is None:
+        return None
+    if require_qc_pass:
+        df = df[df["qc_pass"].astype(bool)]
+    cols = feature_columns(df)
+    if not cols:
+        return None
+    out = df.set_index("recording_id")[cols].reindex(list(recording_ids)).reset_index(drop=True)
+    if out.isna().all().all():
+        return None
+    return out.astype(float)
+
+
 def embedding_frame(array, family: str = "cbramod") -> pd.DataFrame:
     """Frozen embeddings supplied as an (n x d) array (PLACEHOLDER interface for CBraMod / other encoders).
 

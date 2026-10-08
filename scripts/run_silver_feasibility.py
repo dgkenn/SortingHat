@@ -26,7 +26,10 @@ Outputs (aggregate-only, safe_output; n < 11 shown as "<11"):  <out>/report.md  
 Design
     labels      E1 E2 E4a E5 E6 primary; E7 primary only with >= 100 positives over >= 2 sites (else exploratory); E3 and E4b
                 excluded (D-002/D-003). A label with < 11 positives or negatives at any site is not analysed.
-    rungs       prior, qEEG, connectivity, qEEG+connectivity (the top available rung). MORGOTH / CBraMod / dynamics skipped.
+    rungs       prior, qEEG, connectivity, qEEG+connectivity (the headline rung). MORGOTH / dynamics skipped. When --embeddings holds
+                parquet parts from scripts/extract_embeddings.py, two more rungs are added: cbramod_frozen (frozen public CBraMod
+                embedding alone) and combined_cbramod (qEEG + connectivity + embedding); the headline rung is unchanged. No
+                embedding parts: both are skipped silently.
     comparators Baseline A (H1-style) and Baseline C (H2-style): Delta = masked log loss(baseline + EEG) - masked log loss(baseline).
     validation  (a) leave-one-site-out across the two sites, (b) late-calendar temporal holdout within site (D-120).
     labels used the SAME structured silver labels train, tune (20% development rows) and score. No gold exists.
@@ -60,8 +63,8 @@ from sortinghat.metrics.calibration import per_label_report  # noqa: E402
 from sortinghat.metrics.hypotheses import h3_severity_stratified  # noqa: E402
 from sortinghat.metrics.labels import e7_eligible  # noqa: E402
 from sortinghat.metrics.splits import late_temporal_holdout  # noqa: E402
-from sortinghat.models import (DEFAULT_RUNGS, LadderConfig, ModelData, delta_concentration_by_site,  # noqa: E402
-                               leakage_probes, negative_control, run_ladder, sedative_excluded_rerun)
+from sortinghat.models import (CBRAMOD_FROZEN_RUNG, COMMERCIAL_RUNGS, DEFAULT_RUNGS, LadderConfig, ModelData,  # noqa: E402
+                               RungSpec, delta_concentration_by_site, leakage_probes, negative_control, run_ladder, sedative_excluded_rerun)
 from sortinghat.models import ladder as ladder_mod  # noqa: E402
 from sortinghat.models.controls import control_failed  # noqa: E402
 from sortinghat.models.report import clean  # noqa: E402
@@ -74,6 +77,10 @@ EXCLUDED_BY_RULE = {"E3": "partly EEG-defined; the pipeline's positive control, 
                     "E4b": "iatrogenic sedation, known to the team at t0 (D-003); used only as a control hint"}
 RUNG_NAMES = ("prior", "qeeg", "connectivity", "combined")
 EEG_PREFIXES = ("qeeg.", "conn.")
+CBRAMOD_PREFIX = "emb.cbramod."
+EXTRA_RUNG_NAMES = ("cbramod_frozen", "combined_cbramod")
+# "combined" here is qEEG + connectivity whatever else is loaded (DEFAULT_RUNGS' combined also lists emb./morgoth./dyn. columns)
+BASE_RUNGS = [RungSpec(r.name, EEG_PREFIXES) if r.name == "combined" else r for r in DEFAULT_RUNGS if r.name in RUNG_NAMES]
 QC_COLS = ("recording_id", "window", "qc_pass", "usable_fraction", "onset_offset_s", "qc_n_missing_or_dead_min")
 MIN_SITE_CELL = 11
 N_MINIMUM_CHANNELS = 10
@@ -238,6 +245,19 @@ def load_eeg_primary(feat_dir, rec_ids: set[str], batch_rows: int = 20_000) -> t
     return df, stats
 
 
+def load_cbramod_primary(emb_dir, rec_ids: set[str]) -> tuple[pd.DataFrame, dict]:
+    """Primary-window frozen-CBraMod embeddings (``emb.cbramod.<j>``, one row per recording, indexed by recording_id) from the
+    parquet parts written by ``scripts/extract_embeddings.py``. A missing / empty directory returns an empty frame (the
+    rung is then skipped); an existing directory outside local_only/ is refused. Counts only."""
+    from sortinghat.embed.store import load_primary_embeddings
+    d = Path(emb_dir)
+    require_local_only(d, "--embeddings")
+    if not d.is_dir() or not any(d.glob("part-*.parquet")):
+        return pd.DataFrame(), {"n_parts": 0, "n_recordings": 0, "n_emb_ok": 0}
+    df, st = load_primary_embeddings(d, rec_ids, "primary", CBRAMOD_PREFIX, require_ok=True)
+    return df[[c for c in df.columns if str(c).startswith(CBRAMOD_PREFIX)]], st
+
+
 # ============================================================================================== assembly
 @dataclass
 class Assembly:
@@ -260,6 +280,7 @@ class Assembly:
     subgroup: np.ndarray | None = None                   # bool (n,): undifferentiated subgroup (RECORD-LEVEL, memory only)
     subgroup_info: dict = field(default_factory=dict)    # aggregate, suppressed
     baseline_scope: str = UNKNOWN_SCOPE
+    embedding_info: dict = field(default_factory=dict)   # aggregate, suppressed: frozen-CBraMod coverage (empty = rung skipped)
 
 
 def gcs_equivalent(gcs: pd.Series, four: pd.Series) -> pd.Series:
@@ -344,6 +365,8 @@ def assemble(a) -> Assembly:
     Y, hints = load_silver(a.silver)
     eeg, eeg_stats = load_eeg_primary(a.features, set(cohort["rid"].dropna()))
     feat_cols = [c for c in eeg.columns if str(c).startswith(EEG_PREFIXES)]
+    emb, emb_stats = load_cbramod_primary(getattr(a, "embeddings", None) or Path(a.features).parent / "embeddings", set(cohort["rid"].dropna()))
+    emb_cols = list(emb.columns)
 
     sites_s = cohort["SiteID"]
     has_bl = cohort["person_id"].isin(bl["person_id"]).to_numpy(bool)
@@ -361,6 +384,7 @@ def assemble(a) -> Assembly:
     sel_bl = bl.set_index("person_id").reindex(sel["person_id"]).reset_index(drop=True)
     sel_eeg = eeg.reindex(sel["rid"])[[c for c in ("qc_n_missing_or_dead_min", "usable_fraction") if c in eeg] + feat_cols
                                       ].reset_index(drop=True) if len(eeg) else pd.DataFrame(index=range(len(sel)))
+    sel_emb = emb.reindex(sel["rid"])[emb_cols].reset_index(drop=True) if emb_cols else pd.DataFrame(index=range(len(sel)))
     Ys = Y.reindex(sel["person_id"]).reset_index(drop=True)
     Hs = hints.reindex(sel["person_id"]).reset_index(drop=True) if len(hints.columns) else pd.DataFrame(index=range(len(sel)))
     ssites = sel["SiteID"].astype(str)
@@ -408,6 +432,7 @@ def assemble(a) -> Assembly:
     idx = np.flatnonzero(anyl)
     sel, sel_bl, sel_eeg, y, m = sel.iloc[idx].reset_index(drop=True), sel_bl.iloc[idx].reset_index(drop=True), \
         sel_eeg.iloc[idx].reset_index(drop=True), y[idx], m[idx]
+    sel_emb = sel_emb.iloc[idx].reset_index(drop=True)
     Hs = Hs.iloc[idx].reset_index(drop=True) if len(Hs.columns) else pd.DataFrame(index=range(len(sel)))
     ssites = sel["SiteID"].astype(str)                       # re-derived: the row filter above must reach the site vector too
     flow = {"steps": [{"step": s, "n_total": suppress_count(int(msk.sum())),
@@ -436,6 +461,17 @@ def assemble(a) -> Assembly:
                            "no_label_family_dx_before_t0": suppress_count(int(parts["no_dx"].sum())),
                            "no_sedative_opioid_6h": suppress_count(int(parts["no_sedation"].sum()))}}
     eeg_df = sel_eeg[feat_cols].astype(float)
+    embedding_info: dict = {}
+    if emb_cols:
+        has_emb = sel_emb.notna().any(axis=1).to_numpy(bool)
+        if has_emb.sum() >= MIN_SITE_CELL:               # rows without an embedding stay NaN (fold-local imputation + indicator)
+            eeg_df = pd.concat([eeg_df, sel_emb.astype(float)], axis=1)
+            embedding_info = {"family": "cbramod_frozen", "dim": len(emb_cols),
+                              "n_recordings_with_embedding_in_cohort": suppress_count(emb_stats["n_emb_ok"]),
+                              "n_analysed_with_embedding": suppress_count(int(has_emb.sum())),
+                              "share_analysed_with_embedding": suppress_proportion(int(has_emb.sum()), len(sel_emb)),
+                              "per_site_with_embedding": {site_labels.get(s_, s_): suppress_count(int((has_emb & (ssites.to_numpy() == s_)).sum()))
+                                                          for s_ in uniq}}
     qmiss = pd.to_numeric(sel_eeg.get("qc_n_missing_or_dead_min"), errors="coerce") if "qc_n_missing_or_dead_min" in sel_eeg \
         else pd.Series(np.nan, index=sel.index)
     gcs_eq = gcs_equivalent(sel.get("gcs_nearest_window", pd.Series(np.nan, index=sel.index)),
@@ -447,7 +483,7 @@ def assemble(a) -> Assembly:
            "sedated": sedation_flag(sel_bl, Hs, a.sedation_source)}
     return Assembly(sel, baseline, eeg_df, y, m, names, primary, e7_primary, bsets, cov, ssites.to_numpy(object),
                     sel["t0"].to_numpy("datetime64[us]"), flow, label_report, site_labels, iu_sets, flag, subgroup_info,
-                    baseline_scope(a.baselines))
+                    baseline_scope(a.baselines), embedding_info)
 
 
 # ===================================================================================== model data per scheme
@@ -603,7 +639,7 @@ def _rung_summary(rr) -> dict:
 
 def run_controls(md, res, split, bname, bcols, headline, cfg, probes, null_reps, seed, site_labels, n_boot_small) -> dict:
     rr = res.get(headline, bname)
-    spec = [r for r in DEFAULT_RUNGS if r.name == headline]
+    spec = [r for r in BASE_RUNGS if r.name == headline]
     cfg_s = replace(cfg, per_label=False, n_boot=n_boot_small)
     out = {"site_concentration": delta_concentration_by_site(rr, site_labels),
            "site_probe_control_failed": control_failed(probes, rr, site_labels),
@@ -713,7 +749,7 @@ def run_intended_use(A: Assembly, a, cfg: LadderConfig, headline: str, splits: l
 
     EEG-derived information is never an input or label evidence: the sets hold no EEG-derived column, and the silver labels are
     EEG-blind (E3 and the EEG-report flags are excluded; reports_findings feeds only the circularity audit)."""
-    spec = [r for r in DEFAULT_RUNGS if r.name == headline]
+    spec = [r for r in BASE_RUNGS if r.name == headline]
     sets = {k: A.iu_sets[k] for k, _ in IU_COMPARISONS if k in A.iu_sets}
     out: dict = {"title": IU_TITLE, "question": "Given an unknown EEG recorded in the ED or early in an admission, with little or no "
                  "history known, what is the cause (E1 structural, E2 hypoxic-ischemic, E4a toxic-antidote, E5 metabolic, E6 "
@@ -777,11 +813,15 @@ def run_intended_use(A: Assembly, a, cfg: LadderConfig, headline: str, splits: l
 # ==================================================================================================== driver
 def run_analysis(A: Assembly, a, store=None) -> dict:
     cfg = LadderConfig(n_boot=a.n_boot, seed=a.seed, include_e7=A.include_e7, temporal_test_fraction=a.temporal_fraction)
-    rungs = [r for r in DEFAULT_RUNGS if r.name in RUNG_NAMES]
+    rungs = list(BASE_RUNGS)
+    has_emb = any(str(c).startswith(CBRAMOD_PREFIX) for c in A.eeg.columns)
+    if has_emb:
+        rungs += [CBRAMOD_FROZEN_RUNG, next(r for r in COMMERCIAL_RUNGS if r.name == "combined_cbramod")]
     n_sites = len(np.unique(A.sites))
     splits = [s for s in a.splits if (s == "temporal" or n_sites >= 2)]
     avail_rungs = [r for r in RUNG_NAMES if r != "prior" and any(c.startswith(p) for c in A.eeg.columns
                                                                 for p in next(x.prefixes for x in rungs if x.name == r))]
+    eeg_only_cols = [c for c in A.eeg.columns if str(c).startswith(EEG_PREFIXES)]
     headline = "combined" if "combined" in avail_rungs else (avail_rungs[0] if avail_rungs else None)
     if headline is None:
         raise SystemExit("no qeeg./conn. feature columns found")
@@ -809,9 +849,14 @@ def run_analysis(A: Assembly, a, store=None) -> dict:
         R["circularity_audit"] = {"note": "skipped with --skip-controls"}
         return R
     first = mds[splits[0]]
-    probes = leakage_probes(first.eeg, first.sites, A.covariates["duration_s"] if np.isfinite(A.covariates["duration_s"]).any() else None,
+    probes = leakage_probes(first.eeg[eeg_only_cols], first.sites, A.covariates["duration_s"] if np.isfinite(A.covariates["duration_s"]).any() else None,
                             A.covariates["n_channels"] if np.isfinite(A.covariates["n_channels"]).any() else None, seed=a.seed)
     R["controls"]["leakage_probes"] = clean(probes)
+    if has_emb:             # the embeddings can encode site / recording length too: probe them as their own rung
+        emb_cols = [c for c in A.eeg.columns if str(c).startswith(CBRAMOD_PREFIX)]
+        R["controls"]["leakage_probes_cbramod_frozen"] = clean(leakage_probes(
+            first.eeg[emb_cols], first.sites, A.covariates["duration_s"] if np.isfinite(A.covariates["duration_s"]).any() else None,
+            A.covariates["n_channels"] if np.isfinite(A.covariates["n_channels"]).any() else None, seed=a.seed))
     R["controls"]["by_scheme"] = {}
     n_small = max(200, min(a.n_boot, 1000))
     for split in splits:
@@ -845,12 +890,15 @@ def report_json(A: Assembly, a, R: dict) -> dict:
                      "ci_policy": "99% within-site stratified bootstrap (D-095, evaluation_sample_size.md s8) with the every-site "
                                   "rule; 95% within_site / cluster / two_stage / site_t co-reported (cluster, two_stage and site_t "
                                   "are degenerate or extremely wide with two sites)",
-                     "rungs": ["prior", "qeeg", "connectivity", "combined (= qeeg + connectivity, the top available rung)"],
-                     "skipped_rungs": ["morgoth", "embeddings (CBraMod)", "dynamics"]},
+                     "rungs": ["prior", "qeeg", "connectivity", "combined (= qeeg + connectivity, the headline rung)"]
+                              + (["cbramod_frozen (frozen public CBraMod embedding alone)", "combined_cbramod (= qeeg + connectivity + embedding)"]
+                                 if A.embedding_info else []),
+                     "skipped_rungs": ["morgoth", "dynamics"] + ([] if A.embedding_info else ["embeddings (CBraMod)"])},
         "data_flow": A.flow, "labels": {"analysed": list(A.label_names), "primary_for_delta": list(A.primary),
                                          "e7_primary": A.include_e7, "detail": A.label_report},
         "n_analysed": suppress_count(len(A.frame)),
-        "n_eeg_features": len(A.eeg.columns), "n_baseline_columns": {b: len(c) for b, c in A.baseline_sets.items()},
+        "n_eeg_features": sum(str(c).startswith(EEG_PREFIXES) for c in A.eeg.columns),
+        "frozen_cbramod": A.embedding_info or {"skipped": "no embedding parquet parts found (scripts/extract_embeddings.py)"}, "n_baseline_columns": {b: len(c) for b, c in A.baseline_sets.items()},
         **{k: v for k, v in R.items() if k not in ("banner", "intended_use")}, "limitations": list(LIMITATIONS)})
 
 
@@ -870,6 +918,8 @@ def _controls_markdown(c: dict) -> list[str]:
           "| Probe | AUROC | flagged |", "|---|---|---|"]
     for nm, p in c["leakage_probes"]["probes"].items():
         L.append(f"| {nm} | {_f(p['auroc'])} | {p['flagged']} |")
+    for nm, p in c.get("leakage_probes_cbramod_frozen", {}).get("probes", {}).items():
+        L.append(f"| {nm} (frozen CBraMod embedding alone) | {_f(p['auroc'])} | {p['flagged']} |")
     L += ["", "### Site concentration, sedative-excluded subset, negative controls", "",
           "| Scheme | Baseline | top-site share of gain | carried by one site | site probe control failed | sedative-excluded Delta | 99% CI | every site < 0 | n excluded | shuffled-label mean Delta | reps with spurious gain | permuted-EEG Delta |", "|---|---|---|---|---|---|---|---|---|---|---|---|"]
     for split, per in c["by_scheme"].items():
@@ -958,7 +1008,13 @@ def render_markdown(J: dict) -> str:
     for st in J["data_flow"]["steps"]:
         L.append(f"| {st['step']} | {st['n_total']} | " + " | ".join(str(st["per_site"].get(s, "")) for s in sites) + " |")
     L += ["", f"Analysed patients: {J['n_analysed']}; EEG features: {J['n_eeg_features']}; "
-          f"baseline columns: {J['n_baseline_columns']}.", "", "## Labels", "",
+          f"baseline columns: {J['n_baseline_columns']}.", ""]
+    fc = J.get("frozen_cbramod", {})
+    if "dim" in fc:
+        L += [f"Frozen CBraMod embedding rung: {fc['dim']} dimensions; analysed patients with an embedding {fc['n_analysed_with_embedding']} "
+              f"({fc['share_analysed_with_embedding']}); rows without one are imputed fold-locally with a missingness indicator. "
+              "Rungs `cbramod_frozen` and `combined_cbramod` are added to the Delta table; the headline rung is unchanged.", ""]
+    L += ["## Labels", "",
           f"Analysed: {', '.join(J['labels']['analysed'])}. Primary for Delta: {', '.join(J['labels']['primary_for_delta'])}.", "",
           "| Label | n assessable | n positive | prevalence | per-site positives | note |", "|---|---|---|---|---|---|"]
     for lab, d in J["labels"]["detail"].items():
@@ -971,7 +1027,7 @@ def render_markdown(J: dict) -> str:
           "| Scheme | Baseline | Rung | Delta | 99% CI | per-site Delta | every site < 0 | pattern |", "|---|---|---|---|---|---|---|---|"]
     for split, lad in J["ladder"].items():
         for b, rungs in lad["rungs"].items():
-            for rn in ("qeeg", "connectivity", "combined"):
+            for rn in ("qeeg", "connectivity", "combined", *EXTRA_RUNG_NAMES):
                 r = rungs.get(rn)
                 if not r or not r.get("available") or not r.get("has_eeg", True):
                     continue
@@ -1037,6 +1093,9 @@ def build_parser() -> argparse.ArgumentParser:
     ap.add_argument("--features", default="out/local_only/features")
     ap.add_argument("--silver", default="out/local_only/silver/silver_labels.csv")
     ap.add_argument("--baselines", default="out/local_only/baselines_AC.parquet")
+    ap.add_argument("--embeddings", default=None,
+                    help="frozen-CBraMod parquet parts from scripts/extract_embeddings.py (default: <features dir>/../embeddings); "
+                         "adds the cbramod_frozen and combined_cbramod rungs when present, skipped silently otherwise")
     ap.add_argument("--recording-map", help="optional CSV (person_id, recording_id) if the extractor input carried explicit ids")
     ap.add_argument("--out", default="out/silver_feasibility")
     ap.add_argument("--cohort-def", choices=sorted(bb.COHORT_DEFS), default="strict")

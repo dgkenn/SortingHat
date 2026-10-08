@@ -48,6 +48,14 @@ DEFAULT_RUNGS = (
     RungSpec("dynamics", ("dyn.",)),
     RungSpec("combined", ("qeeg.", "conn.", "morgoth.", "emb.", "dyn.")),
 )
+# Frozen public-CBraMod embedding rung (scripts/extract_embeddings.py -> emb.cbramod.<j>). Not part of DEFAULT_RUNGS (which already
+# holds the generic "embeddings" family rung); it is added by callers that load the embedding parquet, and it is unavailable
+# (RungResult.available False, never fitted) when no emb.cbramod. column exists.
+CBRAMOD_FROZEN_RUNG = RungSpec("cbramod_frozen", ("emb.cbramod.",), requires=("emb.cbramod.",))
+# MORGOTH finding-probability rung (scripts/extract_morgoth.py features -> morgoth.<head>.<class>.<stat>, loaded with
+# inputs.load_morgoth_findings). Same pattern: not in DEFAULT_RUNGS (whose generic "morgoth" rung stays for synthetic
+# frames); callers that load the parquet add it, and it is unavailable (never fitted) when no morgoth. column exists.
+MORGOTH_FINDINGS_RUNG = RungSpec("morgoth_findings", ("morgoth.",), requires=("morgoth.",))
 # Commercial-clean gap pair (plan: CBraMod vs MORGOTH alongside each other).
 COMMERCIAL_RUNGS = (
     RungSpec("combined_morgoth", ("qeeg.", "conn.", "morgoth.", "dyn."), requires=("morgoth.",)),

@@ -265,7 +265,9 @@ def embed_prepared(prep: Prepared, embedder: Embedder, qcs: dict, cfg: EmbedConf
                "qc_n_missing_or_dead_min": int(q.n_missing_or_dead_min), "qc_coverage_fraction": float(q.coverage_fraction),
                "emb_ok": False, "emb_n_segments": int(sl.stop - sl.start), "emb_n_used": 0,
                "emb_valid_token_frac": float(prep.seg_valid_frac[sl].mean()),
-               "emb_frac_over_amp": float(prep.seg_over_amp[sl].mean()), "emb_n_absent_channels": prep.n_absent_channels}
+               "emb_frac_over_amp": float(prep.seg_over_amp[sl].mean()), "emb_n_absent_channels": prep.n_absent_channels,
+               **dict.fromkeys(emb_columns(), float("nan")),
+               **(dict.fromkeys(emb_columns(ATTN_PREFIX), float("nan")) if cfg.attention else {})}
         if name in wanted:
             use = np.flatnonzero(prep.seg_ok[sl]) + sl.start
             if len(use):
@@ -307,15 +309,13 @@ def embed_recording(src, embedder: Embedder, windows=None, qc_cfg: QCConfig | No
     status.update(n_missing_min=len(minimum & set(status["missing"])) - len(minimum & set(notes["invalid_scaling"])),
                   n_dead_min=len(minimum & set(notes["dead"])), n_invalid_min=len(minimum & set(notes["invalid_scaling"])))
     if not (cfg.compute_failed or any(q.passes for q in qcs.values())):      # nothing to embed: skip filtering and the model
-        prep_rows = EmbedResult([], qcs, status, 0)
-        prep_rows.rows = [{"window": k, "qc_pass": False, "usable_fraction": float(q.usable_fraction),
-                           "qc_n_missing_or_dead_min": int(q.n_missing_or_dead_min),
-                           "qc_coverage_fraction": float(q.coverage_fraction), "emb_ok": False,
-                           "emb_n_segments": int(round(windows[k].duration_s / cfg.segment_s)), "emb_n_used": 0,
-                           "emb_valid_token_frac": float("nan"), "emb_frac_over_amp": float("nan"),
-                           "emb_n_absent_channels": len(CBRAMOD_CHANNELS) - len(rec.ch_names)}
-                          for k, q in qcs.items()]
-        return prep_rows
+        nan_row = dict.fromkeys(emb_columns() + (emb_columns(ATTN_PREFIX) if cfg.attention else []), float("nan"))
+        rows = [{"window": k, "qc_pass": False, "usable_fraction": float(q.usable_fraction),
+                 "qc_n_missing_or_dead_min": int(q.n_missing_or_dead_min), "qc_coverage_fraction": float(q.coverage_fraction),
+                 "emb_ok": False, "emb_n_segments": int(round(windows[k].duration_s / cfg.segment_s)), "emb_n_used": 0,
+                 "emb_valid_token_frac": float("nan"), "emb_frac_over_amp": float("nan"),
+                 "emb_n_absent_channels": len(CBRAMOD_CHANNELS) - len(rec.ch_names), **nan_row} for k, q in qcs.items()]
+        return EmbedResult(rows, qcs, status, 0)
     pre = PreprocessConfig(target_fs=FS, notch_hz=cfg.notch_hz, band=tuple(cfg.band))
     x, fs = preprocess(rec.data, rec.fs, pre)
     if cfg.reference == "car":
