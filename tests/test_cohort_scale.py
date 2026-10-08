@@ -149,3 +149,21 @@ def test_build_and_diag_stay_under_4gb(big_store, tmp_path):
     assert rep["visit_table"]["n_visit_rows_for_adult_candidates"] >= 2_000_000
     t = pd.read_csv(tmp_path / "o" / "local_only" / "cohort_study1.csv", low_memory=False)
     assert len(t) > 1000 and t["person_id"].is_unique
+
+
+def test_phase0a_audit_stays_under_4gb_on_the_same_store(big_store, tmp_path):
+    """The audit reuses the cohort's compact visits, two-stage row-group reads and candidate set."""
+    import time
+    t = time.time()
+    p = _run_module("sortinghat.audit.field_audit", "--data", str(big_store), "--out", str(tmp_path / "audit"))
+    took = time.time() - t
+    peak = resource.getrusage(resource.RUSAGE_CHILDREN).ru_maxrss / (1 << 20)
+    print(f"\n[scale] audit {took:.0f} s, peak RSS (children, cumulative max) {peak:.2f} GB")
+    assert peak < 4.0, f"peak RSS {peak:.2f} GB"
+    rep = json.loads((tmp_path / "audit" / "field_audit.json").read_text())
+    assert len(rep["rows"]) == 8 and rep["n_candidates"] != "<11"
+
+
+def _run_module(module, *args):
+    env = {k: v for k, v in os.environ.items() if k not in ("CLAUDECODE", "SORTINGHAT_AGENT_SESSION")}
+    return subprocess.run([sys.executable, "-m", module, *args], capture_output=True, text=True, check=True, env=env, cwd=REPO)

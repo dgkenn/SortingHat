@@ -31,12 +31,17 @@ import numpy as np
 import pandas as pd
 
 from .. import agent_safety, data_io, schema
+from ..cohort import rules as cohort_rules
+from ..cohort.config import CohortConfig
+from ..cohort.sources import (StoreSources, concat_frames, iter_filtered_batches, remap_ids)
 from ..safe_output import (SUPPRESSED, safe_print, safe_quantiles, safe_write_json,
                            safe_write_text, suppress_count, suppress_proportion,
                            write_local_only)
 
 ACUTE_CLASSES = {"ICU", "Inpatient", "ED"}
 ADULT_AGE = 18
+COHORT_CFG = CohortConfig()                  # D-111..D-115: the audit's candidates are the cohort's candidates
+STUDY_SITES = COHORT_CFG.study_sites         # I0002, I0003, S0001, S0002 (D-113); None = every site
 # Row filters. drug_source_value / measurement_source_value are free text in the real OMOP tables (no med_class,
 # no score_type column); classes are derived by regex, as the earlier research code did.
 SEDATION_RE = re.compile(r"propofol|midazolam|dexmedetomidine|precedex|fentanyl|ketamine|pentobarbital", re.I)
@@ -113,23 +118,29 @@ def derive_patient_class(eeg: pd.DataFrame, visits: pd.DataFrame) -> pd.Series:
     (``ClassTime``: the start, else reports_findings ``ReportBeginDTS`` / ``ReportEEGDateTime``), kept only if it
     has not ended before then. Sessions with no time at all (I0008/I0009 with a missing start) stay unclassified. Index = ``eeg`` index; unmatched sessions are ``None``."""
     out = pd.Series(None, index=eeg.index, dtype=object)
-    need = {"person_id", "visit_start_datetime"}
-    if not len(visits) or not need <= set(visits):
+    if not len(visits) or "person_id" not in visits or not ({"visit_start_datetime", "_start"} & set(visits)):
         return out
     tcol = "ClassTime" if "ClassTime" in eeg else "StartTime"
     e = eeg[["person_id", tcol]].rename(columns={tcol: "StartTime"}).dropna().assign(_i=lambda d: d.index)
-    v = visits.dropna(subset=["person_id", "visit_start_datetime"]).copy()
+    v = visits.dropna(subset=["person_id", "_start" if "_start" in visits else "visit_start_datetime"]).copy()
     if not len(e) or not len(v):
         return out
-    pairs = v[["visit_concept_id", "visit_source_value"]].drop_duplicates() if {"visit_concept_id",
-                                                                                 "visit_source_value"} <= set(v) else None
-    if pairs is None:
-        return out
-    pairs = pairs.assign(_cls=[visit_class(a, b) for a, b in zip(pairs["visit_concept_id"], pairs["visit_source_value"])])
-    v = v.merge(pairs, on=["visit_concept_id", "visit_source_value"], how="left")
+    if "_start" in v:                                  # compact visits (cohort.rules.compact_visits): class precomputed
+        v = v.rename(columns={"_start": "visit_start_datetime", "_end": "visit_end_datetime"}).assign(
+            _cls=v["_cls"].astype(object))
+    else:
+        pairs = v[["visit_concept_id", "visit_source_value"]].drop_duplicates() if {
+            "visit_concept_id", "visit_source_value"} <= set(v) else None
+        if pairs is None:
+            return out
+        pairs = pairs.assign(_cls=[visit_class(a, b) for a, b in zip(pairs["visit_concept_id"], pairs["visit_source_value"])])
+        v = v.merge(pairs, on=["visit_concept_id", "visit_source_value"], how="left")
     if "visit_end_datetime" not in v:
         v["visit_end_datetime"] = pd.NaT
     e["person_id"], v["person_id"] = e["person_id"].astype("int64"), v["person_id"].astype("int64")
+    e["StartTime"] = e["StartTime"].astype("datetime64[us]")
+    v["visit_start_datetime"] = v["visit_start_datetime"].astype("datetime64[us]")
+    v["visit_end_datetime"] = v["visit_end_datetime"].astype("datetime64[us]")
     mrg = pd.merge_asof(e.sort_values("StartTime"), v.sort_values("visit_start_datetime")[
         ["person_id", "visit_start_datetime", "visit_end_datetime", "_cls"]],
         left_on="StartTime", right_on="visit_start_datetime", by="person_id", direction="backward")
@@ -147,6 +158,8 @@ def merge_eeg(meta: pd.DataFrame, findings: pd.DataFrame | None, site: str) -> p
     m = pd.DataFrame({"SiteID": site, "person_id": person_ids(meta, site),
                       "SessionID": meta["SessionID"].astype("string")})
     m["AgeAtVisit"] = meta_age(meta)
+    m["ServiceName"] = (meta["ServiceName"].astype("string").str.strip().str.upper().to_numpy(object)
+                        if "ServiceName" in meta else None)
     m["PatientClass"] = meta["PatientClass"] if "PatientClass" in meta else None       # ASSUMED column (derived on disk)
     m[["StartTime", "EndTime"]] = meta[["StartTime", "EndTime"]] if {"StartTime", "EndTime"} <= set(meta) else pd.NaT
     if findings is not None and len(findings):
@@ -157,6 +170,15 @@ def merge_eeg(meta: pd.DataFrame, findings: pd.DataFrame | None, site: str) -> p
                           "f_eegdt": findings["ReportEEGDateTime"] if "ReportEEGDateTime" in findings else pd.NaT})
         f = f.sort_values("f_start", na_position="last").drop_duplicates(["person_id", "SessionID"])
         m = m.merge(f, on=["person_id", "SessionID"], how="left")
+        if "ServiceName(EEG)" in findings and m["ServiceName"].isna().any():          # S-sites: findings service
+            sv = pd.DataFrame({"person_id": person_ids(findings, site), "SessionID": findings["SessionID"].astype("string"),
+                               "_svc": findings["ServiceName(EEG)"].astype("string").str.strip().str.upper()}
+                              ).drop_duplicates(["person_id", "SessionID"])
+            n0 = len(m)
+            m = m.merge(sv, on=["person_id", "SessionID"], how="left")
+            assert len(m) == n0
+            m["ServiceName"] = m["ServiceName"].where(m["ServiceName"].notna(), m["_svc"])
+            m = m.drop(columns="_svc")
         m["AgeAtVisit"] = m["f_age"].fillna(m["AgeAtVisit"])
         m["StartTime"] = m["f_start"].fillna(m["StartTime"])
         m["EndTime"] = m["f_end"].fillna(m["EndTime"])
@@ -258,6 +280,8 @@ def from_raw_tables(raw: dict[str, pd.DataFrame]) -> dict[str, pd.DataFrame]:
     eeg = pd.concat(parts, ignore_index=True)
     if not eeg["PatientClass"].notna().any() and "omop_visit_occurrence" in raw:     # real files have no PatientClass
         eeg["PatientClass"] = derive_patient_class(eeg, raw["omop_visit_occurrence"])
+        eeg["PatientClass"] = eeg["PatientClass"].where(eeg["PatientClass"].notna(),
+                                                        cohort_proxy_class(eeg, raw["omop_visit_occurrence"]))
     cohort = set(build_candidates(eeg)["person_id"])         # same cohort filter as the streaming loader
     drugs = filter_drugs(raw["omop_drug_exposure"])
     concept = select_concepts(raw.get("omop_concept"), _type_ids(drugs))
@@ -291,49 +315,77 @@ def select_concepts(concept: pd.DataFrame | None, type_ids: list[int]) -> pd.Dat
     return c[(nm & dom) | c["concept_id"].isin(type_ids)].reset_index(drop=True)
 
 
-# ---- streaming helpers (Arrow-side filtering: memory scales with the matching rows, not the table)
-def _arrow_mask(batch, text_col: str | None, pattern: str | None, id_col: str | None, ids):
-    """Boolean Arrow mask: text column matches ``pattern`` (case-insensitive RE2) OR id column is in ``ids``.
-    ``None`` when neither criterion can apply to this batch (then no row is kept)."""
-    import pyarrow as pa
-    import pyarrow.compute as pc
-    names = set(batch.schema.names)
-    masks = []
-    if text_col and pattern and text_col in names:
-        masks.append(pc.match_substring_regex(pc.cast(batch.column(text_col), pa.string()), pattern, ignore_case=True))
-    if id_col and ids and id_col in names:
-        masks.append(pc.is_in(pc.cast(batch.column(id_col), pa.int64(), safe=False),
-                              value_set=pa.array(sorted(int(i) for i in ids), type=pa.int64())))
-    if not masks:
-        return None
-    m = masks[0]
-    for x in masks[1:]:
-        m = pc.or_kleene(m, x)
-    return pc.fill_null(m, False)
+# ---- streaming loader. Reuses the cohort's readers (cohort.sources): compact visits, two-stage row-group reads with
+# the predicate pushed down (only person_id + the predicate column are fetched for row groups without a match), the
+# cohort's candidate rule (D-111..D-115), the merge map (D-114), and per-table compaction so the working set stays small.
+DRUG_COLS = ["person_id", "drug_exposure_start_datetime", "drug_exposure_end_datetime", "drug_source_value",
+             "drug_type_concept_id"]
+MEAS_COLS = ["person_id", "measurement_datetime", "measurement_date", "measurement_source_value",
+             "measurement_concept_id"]
+OBS_COLS = ["person_id", "observation_concept_id", "observation_datetime", "observation_date",
+            "observation_source_value"]
+NOTE_COLS = ["person_id", "note_datetime", "note_date"]
+SCORE_CATS = ["GCS", "FOUR", "RASS", "OTHER"]
 
 
-def _stream(s3, table: str, columns: list[str], cohort, *, text_col=None, pattern=None, id_col=None, ids=None,
-            prefix=None, filtered: bool = False) -> pd.DataFrame:
-    """Stream one OMOP/parquet table part by part for ``cohort``, optionally keeping only rows matching
-    ``pattern`` on ``text_col`` or with ``id_col`` in ``ids`` (applied in Arrow before pandas)."""
-    frames = []
-    kw = {"prefix": prefix} if prefix else {}
-    for batch in data_io.iter_omop_batches(table, person_ids=cohort, columns=columns, s3=s3, **kw):
-        if filtered:
-            mask = _arrow_mask(batch, text_col, pattern, id_col, ids)
-            if mask is None:
-                continue
-            batch = batch.filter(mask)
-            if not batch.num_rows:
-                continue
-        frames.append(batch.to_pandas())
-    return pd.concat(frames, ignore_index=True) if frames else pd.DataFrame()
+def _dt_us(d: pd.DataFrame, col: str) -> pd.Series:
+    return (schema.parse_datetimes(d[col]) if col in d else pd.Series(pd.NaT, index=d.index)).astype("datetime64[us]")
 
 
-def load_concepts(s3, type_ids: list[int]) -> pd.DataFrame:
+def _compact_drugs(batch, remap) -> pd.DataFrame:
+    d = remap_ids(batch.to_pandas(), remap)
+    d = filter_drugs(d)
+    return pd.DataFrame({
+        "person_id": pd.to_numeric(d["person_id"]).to_numpy("int64"),
+        "drug_exposure_start_datetime": _dt_us(d, "drug_exposure_start_datetime").to_numpy(),
+        "drug_exposure_end_datetime": _dt_us(d, "drug_exposure_end_datetime").to_numpy(),
+        "drug_type_concept_id": (pd.to_numeric(d["drug_type_concept_id"], errors="coerce").fillna(0).to_numpy("int64")
+                                 if "drug_type_concept_id" in d else np.zeros(len(d), "int64"))})
+
+
+def _compact_measurements(batch, remap, score_map, result_cols) -> pd.DataFrame:
+    d = remap_ids(batch.to_pandas(), remap)
+    d = filter_measurements(d, score_map)
+    out = {"person_id": pd.to_numeric(d["person_id"]).to_numpy("int64"),
+           "measurement_datetime": _dt_us(d, "measurement_datetime").to_numpy(),
+           "kind": pd.Categorical(d["kind"].to_numpy(object), categories=["score", "lab"]),
+           "score_class": pd.Categorical(d["score_class"].to_numpy(object), categories=SCORE_CATS)}
+    for c in result_cols:
+        if c in d:
+            out[c] = _dt_us(d, c).to_numpy()
+    return pd.DataFrame(out)
+
+
+def _compact_observations(batch, remap, score_map) -> pd.DataFrame:
+    d = remap_ids(batch.to_pandas(), remap)
+    d = filter_observations(d, score_map)
+    return pd.DataFrame({"person_id": pd.to_numeric(d["person_id"]).to_numpy("int64"),
+                         "observation_datetime": _dt_us(d, "observation_datetime").to_numpy(),
+                         "score_class": pd.Categorical(d["score_class"].to_numpy(object), categories=SCORE_CATS)})
+
+
+def _compact_notes(batch, remap) -> pd.DataFrame:
+    d = remap_ids(batch.to_pandas(), remap)
+    return pd.DataFrame({"person_id": pd.to_numeric(d["person_id"]).to_numpy("int64"),
+                         "note_datetime": _dt_us(d, "note_datetime").to_numpy()})
+
+
+def _collect(it, compact, like_cols: list[str]) -> pd.DataFrame:
+    """Stream Arrow tables through ``compact`` and concatenate column by column (peak = result + one column)."""
+    chunks = []
+    for b in it:
+        c = compact(b)
+        if len(c):
+            chunks.append(c)
+    if not chunks:
+        return pd.DataFrame(columns=like_cols)
+    return concat_frames(chunks, chunks[0].iloc[0:0])
+
+
+def load_concepts(s3, type_ids: list[int] | None = None, all_types: bool = False) -> pd.DataFrame:
     """Vocabulary rows the audit needs, streamed from ``omop_concept`` (column-pruned, filtered in Arrow):
-    score concepts by NAME (Measurement/Observation domain) and the given drug-type concept ids. Vocabulary
-    metadata only; no patient-level data."""
+    score concepts by NAME (Measurement/Observation domain) and drug-type concepts (the given ids, or every concept of
+    the type vocabularies when ``all_types``). Vocabulary metadata only; no patient-level data."""
     import pyarrow as pa
     import pyarrow.compute as pc
     cols = ["concept_id", "concept_name", "domain_id", "vocabulary_id"]
@@ -350,6 +402,9 @@ def load_concepts(s3, type_ids: list[int]) -> pd.DataFrame:
         if type_ids:
             hit = pc.or_kleene(hit, pc.is_in(pc.cast(b.column("concept_id"), pa.int64(), safe=False),
                                              value_set=pa.array(type_ids, type=pa.int64())))
+        if all_types and "vocabulary_id" in names:
+            hit = pc.or_kleene(hit, pc.is_in(pc.cast(b.column("vocabulary_id"), pa.string()),
+                                             value_set=pa.array(list(TYPE_VOCABS))))
         b = b.filter(pc.fill_null(hit, False))
         if b.num_rows:
             frames.append(b.to_pandas())
@@ -357,24 +412,20 @@ def load_concepts(s3, type_ids: list[int]) -> pd.DataFrame:
         columns=cols)
 
 
-# Minimal columns requested per table (data minimisation: nothing the audit does not use is read).
-DRUG_COLS = ["person_id", "drug_exposure_start_datetime", "drug_exposure_end_datetime", "drug_source_value",
-             "drug_type_concept_id"]
-MEAS_COLS = ["person_id", "measurement_datetime", "measurement_date", "measurement_source_value",
-             "measurement_concept_id"]
-OBS_COLS = ["person_id", "observation_concept_id", "observation_datetime", "observation_date",
-            "observation_source_value"]
-NOTE_COLS = ["person_id", "note_datetime", "note_date"]
-
-
-def load_audit_tables(s3, sites: list[str] | None = None, avail: dict | None = None) -> dict[str, pd.DataFrame]:
+def load_audit_tables(s3, sites: list[str] | None = None, avail: dict | None = None, workers: int = 3,
+                      cfg: CohortConfig | None = None) -> dict[str, pd.DataFrame]:
     """Read what the audit needs from a store (S3 client or ``LocalStore``) in the real layout.
 
-    EEG tables are read whole (one row per session). OMOP/imaging parquet is streamed part by part,
-    column-pruned and filtered to the candidate cohort inside Arrow (and, for drugs / measurements /
-    observations, by regex or concept id inside Arrow too), so memory scales with the matching rows.
-    """
+    Candidate set = the cohort's (``cohort_proxy_class`` fills the care setting that ``visit_concept_id`` cannot give,
+    ``acute_adult`` applies the Study 1 sites and the OR/EMU exclusion, the patient merge map is applied first).
+    Visits come as compact frames; every other OMOP table is read row group by row group with the predicate pushed
+    down and reduced to the columns the audit rows use (``_compact_*``), so memory scales with the matching rows of
+    the candidates, not with the tables. The big tables are read by ``workers`` threads at once (S3 reads overlap)."""
+    from concurrent.futures import ThreadPoolExecutor
+    cfg = cfg or COHORT_CFG
     sites = sites or data_io.discover_sites(s3)
+    store = StoreSources(s3, sites)
+    mm, _ = store.merge_map()
     parts = []
     for site in sites:
         try:
@@ -391,70 +442,126 @@ def load_audit_tables(s3, sites: list[str] | None = None, avail: dict | None = N
     if not parts:
         raise FileNotFoundError("no eeg_metadata CSV found for any site")
     eeg = pd.concat(parts, ignore_index=True)
+    if mm:                                                                       # D-114: merged ids -> surviving id
+        eeg["person_id"] = remap_ids(eeg.assign(person_id=eeg["person_id"].astype("Int64")), mm)["person_id"] \
+            if eeg["person_id"].notna().all() else eeg["person_id"].map(lambda x: mm.get(int(x), x) if pd.notna(x) else x)
+        eeg["person_id"] = eeg["person_id"].astype("Int64")
+    rev: dict[int, list[int]] = {}
+    for old, new in mm.items():
+        rev.setdefault(new, []).append(old)
     if not eeg["PatientClass"].notna().any():
         # No real eeg_metadata header has PatientClass: derive it from visit_occurrence for the adult sessions that
-        # have a start time (the acute-care cohort is a subset of these), then apply the acute-care filter.
+        # have a (class) time (every site: I0008/I0009 have no OMOP rows, so this costs nothing there), then fill unknown classes with the cohort proxy.
         e0 = eeg[(eeg["AgeAtVisit"] >= ADULT_AGE) & eeg["ClassTime"].notna() & eeg["person_id"].notna()]
-        pids = [int(p) for p in e0["person_id"].unique()]
-        vcols = ["person_id", "visit_start_datetime", "visit_end_datetime", "visit_concept_id", "visit_source_value"]
-        vb = [b.to_pandas() for b in data_io.iter_omop_batches("visit_occurrence", person_ids=pids, columns=vcols, s3=s3)]
-        if vb:
-            visits = schema.coerce_types("omop_visit_occurrence", pd.concat(vb, ignore_index=True))
+        pids = sorted({int(p) for p in e0["person_id"].unique()} | {o for p in e0["person_id"].unique() for o in rev.get(int(p), [])})
+        bounds = e0.groupby("person_id")["ClassTime"].agg(lo="min", hi="max").astype("datetime64[s]")
+        visits = store.visits(pids, bounds=bounds, remap=mm or None, slack_h=cfg.visit_slack_h,
+                              dates_only=False)          # exact times for the concept-id class; the proxy reduces to dates
+        if len(visits):
             eeg["PatientClass"] = derive_patient_class(eeg, visits)
+            eeg["PatientClass"] = eeg["PatientClass"].where(eeg["PatientClass"].notna(), cohort_proxy_class(eeg, visits, cfg))
+        del visits
     cohort = [int(p) for p in build_candidates(eeg)["person_id"].dropna().unique()]
+    fetch_ids = sorted(set(cohort) | {o for p in cohort for o in rev.get(p, [])})
     out = {"eeg_metadata": eeg}
     result_cols = schema.COLUMN_ALIASES["measurement.result_datetime"]
+    remap = mm or None
 
-    d = _stream(s3, "drug_exposure", DRUG_COLS, cohort, text_col="drug_source_value", pattern=SEDATION_RE.pattern,
-                filtered=True)
-    d = schema.coerce_types("omop_drug_exposure", d) if len(d) else pd.DataFrame(columns=DRUG_COLS)
-    out["omop_drug_exposure"] = filter_drugs(d)
+    def drugs():
+        it = iter_filtered_batches(s3, "drug_exposure", fetch_ids, DRUG_COLS, text_col="drug_source_value",
+                                   pattern=SEDATION_RE.pattern)
+        return _collect(it, lambda b: _compact_drugs(b, remap), DRUG_COLS[:2] + DRUG_COLS[2:3] + ["drug_type_concept_id"])
 
-    out["omop_concept"] = load_concepts(s3, _type_ids(out["omop_drug_exposure"]))
-    score_map, _ = concept_maps(out["omop_concept"])
-    score_ids = list(score_map)
+    def concepts():
+        return load_concepts(s3, all_types=True)
 
-    m = _stream(s3, "measurement", MEAS_COLS + result_cols, cohort, text_col="measurement_source_value",
-                pattern=SCORE_RE.pattern + "|" + LAB_RE.pattern, id_col="measurement_concept_id", ids=score_ids,
-                filtered=True)
-    m = schema.coerce_types("omop_measurement", m) if len(m) else pd.DataFrame(columns=MEAS_COLS)
-    m = filter_measurements(m, score_map)
-    for c in result_cols:
-        if c in m:
-            m[c] = schema.parse_datetimes(m[c])
-    out["omop_measurement"] = m
+    def notes():
+        it = iter_filtered_batches(s3, "note", fetch_ids, NOTE_COLS)
+        return _collect(it, lambda b: _compact_notes(b, remap), ["person_id", "note_datetime"])
 
-    o = _stream(s3, "observation", OBS_COLS, cohort, text_col="observation_source_value", pattern=SCORE_RE.pattern,
-                id_col="observation_concept_id", ids=score_ids, filtered=True)
-    o = schema.coerce_types("omop_observation", o) if len(o) else pd.DataFrame(columns=OBS_COLS)
-    out["omop_observation"] = filter_observations(o, score_map)
+    def imaging():
+        spec = data_io.TABLES["imaging"]
+        im = []
+        for b in iter_filtered_batches(s3, "imaging", fetch_ids, schema.columns("imaging"), prefix=spec.pattern):
+            im.append(remap_ids(b.to_pandas(), remap))
+        return schema.coerce_types("imaging", pd.concat(im, ignore_index=True)) if im else pd.DataFrame(
+            columns=schema.columns("imaging"))
 
-    n = _stream(s3, "note", NOTE_COLS, cohort)
-    out["omop_note"] = schema.coerce_types("omop_note", n) if len(n) else pd.DataFrame(columns=NOTE_COLS)
+    with ThreadPoolExecutor(max_workers=max(1, workers)) as pool:
+        f_drug, f_concept, f_note, f_img = (pool.submit(f) for f in (drugs, concepts, notes, imaging))
+        concept_all = f_concept.result()
+        score_map, _ = concept_maps(concept_all)
+        score_ids = list(score_map)
 
-    spec = data_io.TABLES["imaging"]
-    im = _stream(s3, "imaging", schema.columns("imaging"), cohort, prefix=spec.pattern)
-    out["imaging"] = schema.coerce_types("imaging", im) if len(im) else pd.DataFrame(columns=schema.columns("imaging"))
+        def meas():
+            it = iter_filtered_batches(s3, "measurement", fetch_ids, MEAS_COLS + result_cols,
+                                       text_col="measurement_source_value", pattern=SCORE_RE.pattern + "|" + LAB_RE.pattern,
+                                       id_col="measurement_concept_id", ids=score_ids)
+            return _collect(it, lambda b: _compact_measurements(b, remap, score_map, result_cols),
+                            ["person_id", "measurement_datetime", "kind", "score_class"])
+
+        def obs():
+            it = iter_filtered_batches(s3, "observation", fetch_ids, OBS_COLS, text_col="observation_source_value",
+                                       pattern=SCORE_RE.pattern, id_col="observation_concept_id", ids=score_ids)
+            return _collect(it, lambda b: _compact_observations(b, remap, score_map),
+                            ["person_id", "observation_datetime", "score_class"])
+        f_meas, f_obs = pool.submit(meas), pool.submit(obs)
+        out["omop_drug_exposure"] = f_drug.result()
+        out["omop_measurement"] = f_meas.result()
+        out["omop_observation"] = f_obs.result()
+        out["omop_note"] = f_note.result()
+        out["imaging"] = f_img.result()
+    out["omop_concept"] = select_concepts(concept_all, _type_ids(out["omop_drug_exposure"]))
     return out
 
 
 # ---------------------------------------------------------------- helpers
+def cohort_proxy_class(eeg: pd.DataFrame, visits: pd.DataFrame, cfg: CohortConfig | None = None) -> pd.Series:
+    """Care setting of each session by the COHORT's acute-care proxy (D-111, D-112): the visit covering the session's
+    ``ClassTime`` date ([start date - 24 h, end date + 24 h]); 'Inpatient' when that visit is acute by the cohort rule
+    (classified acute, else inpatient-length or an acute ServiceName), 'Outpatient' when a visit covers it but is not
+    acute, ``None`` when no visit covers it. ``visits`` is raw ``omop_visit_occurrence`` or compact visits. This fills
+    ``PatientClass`` where the concept-id class is unknown (it is 0 on every real visit)."""
+    cfg = cfg or COHORT_CFG
+    out = pd.Series(None, index=eeg.index, dtype=object)
+    if not len(visits) or "ClassTime" not in eeg:
+        return out
+    e = pd.DataFrame({"person_id": eeg["person_id"], "t0": eeg["ClassTime"],
+                      "ServiceName": eeg["ServiceName"] if "ServiceName" in eeg else None}).dropna(subset=["person_id", "t0"])
+    if not len(e):
+        return out
+    e["person_id"] = e["person_id"].astype("int64")
+    m = cohort_rules.match_visits(e, visits, cfg.acute_classes, cfg.visit_chain_gap_h, cfg.visit_slack_h, cfg.open_visit_days,
+                                  cfg.date_only_end_of_day, dates_only=cfg.visit_dates_only)
+    bc, bl, bs = cohort_rules.acute_parts(m["visit_class"], m["visit_inpatient_length"], e["ServiceName"],
+                                          cfg.acute_classes, cfg.service_acute, cfg.use_service_proxy)
+    has = m["visit_start"].notna()
+    lab = np.where(has & (bc | bl | bs), "Inpatient", np.where(has, "Outpatient", None))
+    out.loc[e.index] = lab
+    return out
+
+
 def acute_adult(eeg: pd.DataFrame) -> tuple[pd.DataFrame, bool]:
-    """Adult EEG sessions in acute care. PatientClass is in NO real eeg_metadata header; the loaders derive it from
-    omop_visit_occurrence (``derive_patient_class``). When the column is absent or empty (no visit matched) the
-    acute-care filter cannot be applied and all adult sessions are used (second return value False; the report
-    says so)."""
+    """Adult EEG sessions in acute care, at the Study 1 sites (D-113), excluding OR / EMU services (cohort rule).
+    PatientClass is in NO real eeg_metadata header; the loaders derive it from omop_visit_occurrence
+    (``derive_patient_class``, the concept-id class) and fill the unknown ones with the cohort proxy
+    (``cohort_proxy_class``). When the column is absent or empty (no visit matched) the acute-care filter cannot be
+    applied and all adult sessions are used (second return value False; the report says so)."""
     adult = eeg[eeg["AgeAtVisit"] >= ADULT_AGE]
+    if STUDY_SITES is not None and "SiteID" in adult:
+        adult = adult[adult["SiteID"].astype(str).isin(STUDY_SITES)]
+    if "ServiceName" in adult:
+        adult = adult[~adult["ServiceName"].astype("string").str.upper().isin(list(COHORT_CFG.exclude_services)).fillna(False)]
     have_class = "PatientClass" in eeg and bool(eeg["PatientClass"].notna().any())
     return (adult[adult["PatientClass"].isin(ACUTE_CLASSES)] if have_class else adult), have_class
 
 
 def build_candidates(eeg: pd.DataFrame) -> pd.DataFrame:
-    """First qualifying EEG per adult patient (acute care, start time present)."""
+    """First qualifying EEG per adult patient (acute care, start time present): the cohort's candidate set."""
     e, _ = acute_adult(eeg)
     e = e[e["StartTime"].notna() & e["person_id"].notna()]
-    e = e.sort_values(["person_id", "StartTime"], kind="stable")
-    first = e.drop_duplicates("person_id", keep="first")            # the whole earliest row (groupby.first() is per column)
+    e = e.sort_values(["person_id", "StartTime"] + (["SessionID"] if "SessionID" in e else []), kind="stable")
+    first = e.groupby("person_id", as_index=False).first()
     return first[["person_id", "SiteID", "StartTime"]].rename(columns={"StartTime": "t0"})
 
 
@@ -999,6 +1106,12 @@ def main(argv: list[str] | None = None) -> int:
     ap.add_argument("--probe-prefixes", action="store_true",
                     help="with --dry-run-schema: also list metadata-level prefix names (Delimiter='/') at the "
                          "access point root and under Imaging/ (names only; per-patient folders never listed)")
+    ap.add_argument("--workers", type=int, default=3,
+                    help="threads reading the big OMOP tables at once (S3 reads overlap; raise only with memory headroom)")
+    ap.add_argument("--all-sites", action="store_true",
+                    help="do not restrict the candidates to the Study 1 sites I0002, I0003, S0001, S0002 (D-113)")
+    ap.add_argument("--max-memory-gb", type=float, default=None,
+                    help="guard: RLIMIT_AS in GB (address space; pick generously); prints an aggregate error if exceeded")
     ap.add_argument("--seed", type=int, default=0, help="seed for the hand-check sample")
     ap.add_argument("--handcheck-n", type=int, default=HANDCHECK_N)
     ap.add_argument("--strict", action="store_true",
@@ -1011,6 +1124,11 @@ def main(argv: list[str] | None = None) -> int:
 
     if a.data:
         agent_safety.assert_not_restricted_in_agent(a.data)
+    global STUDY_SITES
+    if a.all_sites:
+        STUDY_SITES = None
+    from ..cohort.memguard import apply_limit, peak_rss_gb
+    apply_limit(a.max_memory_gb)
     s3 = data_io.open_store(a.data, profile=a.profile)       # make_client refuses inside an agent session
 
     if a.dry_run_schema:
@@ -1026,9 +1144,14 @@ def main(argv: list[str] | None = None) -> int:
 
     stage = "load"
     try:
-        tables = load_audit_tables(s3, a.sites)
+        tables = load_audit_tables(s3, a.sites, workers=a.workers)
         stage = "audit"
         report, ids = run_audit(tables, a.seed, a.handcheck_n)
+    except MemoryError:
+        safe_print(f"field audit FAILED at stage '{stage}': MemoryError (aggregate only): exceeded the memory limit"
+                   f"{f' of {a.max_memory_gb:g} GB' if a.max_memory_gb else ''}; peak RSS {peak_rss_gb():.2f} GB. "
+                   "Re-run with a larger --max-memory-gb, fewer --sites or --workers 1.")
+        return 3
     except Exception as exc:  # noqa: BLE001
         if a.data:                       # local / synthetic: normal traceback for debugging
             raise
@@ -1052,7 +1175,8 @@ def main(argv: list[str] | None = None) -> int:
     safe_print(f"Stop rows (automated): {'PASS' if report['gate_0a_automated_stop_rows_pass'] else 'FAIL'}; "
                f"fallbacks triggered: {len(report['fallbacks_triggered'])}", known_ids=known)
     safe_print(f"Hand-check sampling list ({len(ids)} cases) written to local file: {hc}", known_ids=known)
-    safe_print(f"Reports: {out / 'field_audit.md'}, {out / 'field_audit.json'}", known_ids=known)
+    safe_print(f"Reports: {out / 'field_audit.md'}, {out / 'field_audit.json'}; peak RSS {peak_rss_gb():.2f} GB",
+               known_ids=known)
     if a.strict and not report["gate_0a_automated_stop_rows_pass"]:
         return 1
     return 0

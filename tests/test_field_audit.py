@@ -436,3 +436,62 @@ def test_real_data_failure_prints_stage_and_class_only(synth_dir, monkeypatch, c
     assert field_audit.main(["--s3", "--out", str(tmp_path / "o")]) == 2
     out = capsys.readouterr().out
     assert "ValueError" in out and "load" in out and "sub-S0001" not in out and "2019" not in out
+
+
+# ------------------------------------------------------------ the audit reuses the cohort's candidates and readers
+def _real_like_store(synth_dir, tmp_path):
+    """Synthetic store made to look like the real visit table: every visit_concept_id 0, no source text."""
+    import pyarrow as pa
+    import pyarrow.parquet as pq
+    d = tmp_path / "reallike"
+    shutil.copytree(synth_dir, d)
+    for part in (d / "OMOP/Merged/visit_occurrence").glob("*.parquet"):
+        t = pq.read_table(part).to_pandas()
+        t["visit_concept_id"] = 0
+        t["visit_source_value"] = None
+        pq.write_table(pa.Table.from_pandas(t, preserve_index=False), part)
+    return d
+
+
+def test_candidates_follow_the_cohort_rules_when_concept_ids_are_all_zero(synth_dir, tmp_path):
+    from sortinghat.cohort import CohortConfig, StoreSources, build_cohort
+    d = _real_like_store(synth_dir, tmp_path)
+    store = data_io.LocalStore(d)
+    tabs = field_audit.load_audit_tables(store)
+    cands = field_audit.build_candidates(tabs["eeg_metadata"])
+    assert set(cands["SiteID"]) <= {"I0002", "I0003", "S0001", "S0002"}                 # D-113
+    assert tabs["eeg_metadata"]["PatientClass"].isin(["Inpatient", "Outpatient"]).sum() > 1000     # proxy-filled classes
+    report, _ = run_audit(tabs)
+    assert report["rows"][0]["acute_care_filter_applied"] is True                       # not the "all adult EEGs" fallback
+    res = build_cohort(StoreSources(store), CohortConfig())                              # the cohort's own candidates
+    cohort_ids = set(res.stages["first_eeg"]["person_id"])
+    audit_ids = set(cands["person_id"])
+    assert len(audit_ids) > 300 and len(cohort_ids & audit_ids) / len(cohort_ids | audit_ids) > 0.97
+
+
+def test_staged_reader_matches_the_plain_reader(synth_dir):
+    from sortinghat.cohort.sources import iter_filtered_batches
+    store = data_io.LocalStore(synth_dir)
+    ids = range(50_000_000, 50_001_500)
+    pat = field_audit.SCORE_RE.pattern
+    got = sum(t.num_rows for t in iter_filtered_batches(store, "measurement", ids, ["person_id", "measurement_datetime",
+                                                        "measurement_source_value"], text_col="measurement_source_value",
+                                                        pattern=pat))
+    ref = 0
+    for b in data_io.iter_omop_batches("measurement", person_ids=ids, columns=["person_id", "measurement_source_value"], s3=store):
+        d = b.to_pandas()
+        ref += int(d["measurement_source_value"].astype(str).str.contains(pat, case=False, regex=True).sum())
+    assert got == ref > 100
+
+
+def test_loader_applies_the_patient_merge_map(synth_dir, tmp_path):
+    d = tmp_path / "m"
+    shutil.copytree(synth_dir, d)
+    base = field_audit.load_audit_tables(data_io.LocalStore(synth_dir))["eeg_metadata"]
+    c = field_audit.build_candidates(base).sort_values("person_id")
+    a, b = int(c["person_id"].iloc[0]), int(c["person_id"].iloc[1])
+    (d / "PatientMergeHistory").mkdir()
+    pd.DataFrame({"MergedBDSPPatientID": [b], "BDSPPatientID": [a], "LineNBR": [1],
+                  "BDSPLastModifiedDTS": ["2020-01-01"]}).to_csv(d / "PatientMergeHistory" / "m.csv", index=False)
+    merged = field_audit.load_audit_tables(data_io.LocalStore(d))["eeg_metadata"]
+    assert b not in set(merged["person_id"]) and a in set(merged["person_id"])

@@ -147,3 +147,15 @@ def test_edf_key_is_the_extractors_first_candidate(world):
     k = r.keys.iloc[0]
     assert k["edf_key"] == data_io.bids_edf_candidates(k["SiteID"], k["BidsFolder"], k["SessionID"],
                                                        None if pd.isna(k["EEGFolder"]) else k["EEGFolder"])[0][1]
+
+
+def test_store_and_frame_sources_agree_on_the_synthetic_cohort(synth, synth_dir):
+    """The streaming (compact, pruned, row-group) readers must give the same cohort as the in-memory tables, under
+    the default (D-111..D-115) configuration: date-only visit cover included."""
+    a = build_cohort(FrameSources(synth[0])).table.reset_index(drop=True)
+    b = build_cohort(StoreSources(LocalStore(synth_dir))).table.reset_index(drop=True)
+    cols = ["SiteID", "person_id", "SessionID", "BidsFolder", "t0", "acute_basis", "visit_inpatient_length", "onset",
+            "onset_basis", "hours_since_onset", "severity_strict", "severity_strict_pm6", "phenotype", "in_strict",
+            "in_strict_pm6", "in_broad", "duration_s"]
+    assert len(a) == len(b) > 100
+    pd.testing.assert_frame_equal(a[cols].astype(str), b[cols].astype(str))

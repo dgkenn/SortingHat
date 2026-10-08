@@ -129,6 +129,68 @@ def concat_frames(chunks: list[pd.DataFrame], like: pd.DataFrame) -> pd.DataFram
     return pd.DataFrame(out)
 
 
+def iter_filtered_batches(s3, table: str, person_ids, columns: list[str], *, text_col: str | None = None,
+                          pattern: str | None = None, id_col: str | None = None, ids=None, prefix: str | None = None,
+                          retry=None):
+    """Yield pyarrow tables of ``table`` rows for ``person_ids`` that also satisfy a row predicate, reading each row
+    group in TWO stages so that most of a big table is never fetched:
+
+    1. the row group is skipped when its ``person_id`` min/max statistics cannot contain any wanted id;
+    2. only ``person_id`` (and the predicate columns ``text_col`` / ``id_col``) are read; the mask is
+       ``person in ids AND (text matches ``pattern`` (RE2, case-insensitive) OR id_col in ``ids``)``;
+    3. only if some row survives are the remaining ``columns`` read, and they are filtered by the mask.
+    With no predicate (``pattern`` and ``ids`` both None) the mask is the person filter alone. A predicate whose
+    columns do not exist in the file keeps nothing (as a missing column cannot match). Reads are retried
+    (``data_io.with_retries``)."""
+    import pyarrow as pa
+    import pyarrow.compute as pc
+    want = sorted({int(p) for p in person_ids})
+    if not want:
+        return
+    pid_arr = pa.array(want, type=pa.int64())
+    bucket = data_io.access_point()
+    parts = data_io.parquet_parts(s3, prefix, bucket=bucket) if prefix else data_io.omop_parts(s3, table, bucket=bucket)
+    outer = data_io._outer(retry)
+    pred = bool(pattern) or bool(ids)
+    id_arr = pa.array(sorted({int(i) for i in ids}), type=pa.int64()) if ids else None
+    for key in parts:
+        pf = data_io.with_retries(lambda key=key: data_io.open_parquet(s3, bucket, key, policy=retry), outer)
+        have = set(pf.schema_arrow.names)
+        use = [c for c in columns if c in have]
+        if "person_id" not in use:
+            continue
+        t_ok = bool(pattern) and text_col in have
+        i_ok = id_arr is not None and id_col in have
+        if pred and not (t_ok or i_ok):
+            continue
+        stage1 = ["person_id"] + ([text_col] if t_ok else []) + ([id_col] if i_ok and id_col != "person_id" else [])
+        rest = [c for c in use if c not in stage1]
+        for rg in range(pf.num_row_groups):
+            if not data_io._rowgroup_may_match(pf, rg, "person_id", want):
+                continue
+            t1 = data_io.with_retries(lambda rg=rg: pf.read_row_group(rg, columns=stage1), outer)
+            mask = pc.fill_null(pc.is_in(pc.cast(t1.column("person_id"), pa.int64(), safe=False), value_set=pid_arr), False)
+            if pred:
+                pm = []
+                if t_ok:
+                    pm.append(pc.match_substring_regex(pc.cast(t1.column(text_col), pa.string()), pattern, ignore_case=True))
+                if i_ok:
+                    pm.append(pc.is_in(pc.cast(t1.column(id_col), pa.int64(), safe=False), value_set=id_arr))
+                m2 = pm[0]
+                for x in pm[1:]:
+                    m2 = pc.or_kleene(m2, x)
+                mask = pc.and_kleene(mask, pc.fill_null(m2, False))
+            if not pc.any(mask).as_py():
+                continue
+            tbl = t1
+            if rest:
+                t2 = data_io.with_retries(lambda rg=rg: pf.read_row_group(rg, columns=rest), outer)
+                tbl = pa.table({c: (t1.column(c) if c in stage1 else t2.column(c)) for c in use})
+            else:
+                tbl = t1.select(use)
+            yield tbl.filter(mask)
+
+
 def prune_window(df: pd.DataFrame, tcol: str, window: pd.DataFrame | None) -> pd.DataFrame:
     """Keep rows whose time is within the person's [lo, hi] (``window`` indexed by person_id)."""
     if window is None or not len(df):
