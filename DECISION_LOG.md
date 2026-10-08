@@ -1,10 +1,10 @@
 # Sorting Hat Decision Log
 
-**Purpose.** This log records every protocol change in the Research Plan (`docs/research_plan_v1.txt`) relative to the master handoff v1.0 (29 Sep 2026). It exists for preregistration integrity: each decision is dated and written down before any HEEDB data, Phase 0 audit result, pilot label, or model output is viewed.
+**Purpose.** This log records every protocol change in the Research Plan (`docs/research_plan_v1.txt`) relative to the master handoff v1.0 (29 Sep 2026). It exists for preregistration integrity: each decision is dated and written down before any outcome data (pilot label or model output) is viewed; data-quality aggregates are noted separately (see Rules).
 
 **Rules.**
 - Append-only. Do not edit or delete an entry. If a decision changes, add a new entry that cites the superseded ID (e.g., "Supersedes D-014").
-- Every entry records whether outcome data had been seen. All entries below are "No".
+- Each entry records whether OUTCOME data (gold/silver label distributions by EEG feature, or any model performance) had been seen — none has been as of 2026-10-08. Data-quality aggregates (schema, field-audit, cohort-flow and EEG-QC counts) have been viewed since 2026-10-07 and are noted per entry where they informed a decision.
 - Elements the plan keeps unchanged from the handoff (cohort definition, primary window, preprocessing, representation ladder, ordinal gold states, leakage probes, sedative-excluded subset) are not logged.
 
 **Dating note.** Entries are dated 2026-10-07, the date this log was written. The plan has no internal date. Its "Next 30 days" list still shows the HEEDB metadata pull, the Phase 0 field audit and all modeling as future work, so no outcome data exists to have been seen.
@@ -768,3 +768,159 @@
 - **Rationale:** The first real run failed the old proxy (63.6% "misaligned", 20.45% ordering violations of 4.7M pairs) because it asked whether the MEDIAN event is near the EEG; patients have multi-year EHR histories, so the median is far from the EEG whatever the date shift. The valid question is whether some event is near the EEG, and a constant offset shows as a non-zero whole-day gap mode. Other real evidence already pointed to alignment (78 to 99% of EEG starts within a visit date range +-24 h; about 3,300 patients with a GCS within [-6, +1] h). The rule cannot detect a shift applied identically to every table; that remains the human hand-check.
 - **Related fix (same change):** per-site cells of the field-audit table printed "<11/n" for a site where nearly everyone passes (the complement rule of `suppress_proportion` hid the pass count when fewer than 11 records FAILED). Such a cell now reads ">=n-10" with a floored lower-bound proportion; per-site pass counts add up to the overall count (exactly, or within the suppression bounds), asserted for every row in `tests/test_field_audit.py`.
 - **Source:** `sortinghat/audit/field_audit.py`, `sortinghat/audit/alignment.py`; synthetic tests only.
+
+---
+
+## Compliance follow-up (2026-10-08)
+
+Entries below follow `docs/research/plan_compliance_2026-10-08.md`. Dates are 2026-10-08 unless stated.
+
+### D-118 Streaming aggregate-only real-data jobs may run from agent sessions (exception to Phase 0e rule 2)
+- **Date:** 2026-10-08 · **Area:** safety · **Outcome data seen?** No
+- **Decision:** The project lead explicitly authorised (2026-10-07/08, in session) running streaming, aggregate-only real-data jobs from the Claude Code agent session with the agent-session guard bypassed for those commands (`scripts/heedb_run.sh`, `scripts/overnight.sh`). This overrides Phase 0e rule 2 for those jobs. Record-level outputs stay in `local_only/` and are never printed; notes are never read by a hosted model.
+- **Rationale:** The lead is unavailable to run jobs locally. DUA permission for cloud processing is to be confirmed by the lead.
+- **Source:** Project-lead instruction in session (2026-10-07/08); CLAUDE.md hard rules 2 and 4; `scripts/overnight.sh`; `docs/research/plan_compliance_2026-10-08.md` s2 item 1 and s5 item 1.
+
+### D-119 GCS/FOUR/RASS Phase 0a row judged per Study 1 site with clinical data
+- **Date:** 2026-10-08 · **Area:** data · **Outcome data seen?** No · **Data-quality aggregates seen?** Yes
+- **Decision:** The GCS/FOUR/RASS within ±6 h row (at least 50%) is judged per Study 1 site with clinical data. It passes at S0001 (53.8%) and S0002 (65.4%). I0002 and I0003 lack scores, notes and medication records. The GCS-from-EHR tool is not applied.
+- **Rationale:** Pooled over all sites the row fails (42.1%, 21,572 of 51,260; D-034 fallback). The per-site judgement is the one recorded here.
+- **Source:** `out/audit/field_audit.md`; `docs/research/plan_compliance_2026-10-08.md` s1 (0a GCS row) and s2 item 2; D-034; D-105.
+
+### D-120 Only S0001 and S0002 contribute labelled patients; two-site validation schemes
+- **Date:** 2026-10-08 · **Area:** splits · **Outcome data seen?** No · **Data-quality aggregates seen?** Yes
+- **Decision:** Only S0001 and S0002 contribute labelled patients. The plan's fallback for the site-identifier row is applied: leave-one-site-out across 2 sites plus a late-calendar temporal holdout within each site are co-primary validation schemes. The cross-site claim is weakened accordingly. Power is to be recomputed for this design.
+- **Rationale:** The strict primary cohort is 3,292 patients (2,002 at S0001, 1,290 at S0002); I0002 and I0003 each have fewer than 11. This is below the three-site minimum of D-024, which was applied to candidate counts, so the two-site design is recorded here.
+- **Source:** `out/cohort/flow.md`; `docs/research/plan_compliance_2026-10-08.md` s1 (0a site row) and s5 item 3; D-024; D-025; D-113.
+
+### D-121 Medication administration row denominator = candidates with a sedation-class exposure
+- **Date:** 2026-10-08 · **Area:** data · **Outcome data seen?** No
+- **Decision:** The medication administration row denominator is candidates with a sedation-class `drug_exposure` in the 48 h before t0, as implemented in `field_audit.py`.
+- **Rationale:** The plan states the row over candidates. Baseline A uses t0 sedative exposure (D-014), so administration timing matters for the candidates with that exposure. D-034 logs only the fallback, not this denominator.
+- **Source:** `sortinghat/audit/field_audit.py`; `docs/research/plan_compliance_2026-10-08.md` s1 (0a medication row) and s2 item 4; D-014; D-034.
+
+### D-122 Baseline C has no imaging inputs; Baseline A has no NESI input
+- **Date:** 2026-10-08 · **Area:** baselines · **Outcome data seen?** No
+- **Decision:** Baseline C has no imaging inputs (no imaging at Study 1 sites). Baseline A has no NESI input (no NESI source found). Both are reported as limitations.
+- **Rationale:** Imaging exists only at I0001 and I0004, which have no EEG (D-102) and are not Study 1 sites (D-113). `docs/data_access.md` marks NESI "not found".
+- **Source:** `docs/research/heedb_schema_dryrun_2026-10-07.md`; `docs/data_access.md`; `docs/baselines_spec.md` s2.3; D-014; D-102; D-103; D-113; `docs/research/plan_compliance_2026-10-08.md` s2 item 5.
+
+### D-123 Silver labels are structured-data only until an open-weight note model is available
+- **Date:** 2026-10-08 · **Area:** labels · **Outcome data seen?** No
+- **Decision:** Silver labels are structured-data only until an open-weight model on approved compute is available for notes.
+- **Rationale:** The plan's silver sources include notes (ICD codes, clinical attribution and notes). A hosted model may not read notes (D-083), and no open-weight model on approved compute is in place, so note-derived silver evidence is deferred. This narrows the silver scope.
+- **Source:** CLAUDE.md hard rule 4; D-083; `docs/silver_extraction.md`; `docs/research/plan_compliance_2026-10-08.md` s2 item 6.
+
+### D-124 Feature windows use t0 = sustained EEG signal onset; cohort, baselines and silver use metadata start
+- **Date:** 2026-10-08 · **Area:** data · **Outcome data seen?** No
+- **Decision:** Feature windows use t0 = sustained EEG signal onset (D-109). Cohort, baselines and silver windows are anchored at the metadata EEG start, which is never later than the signal onset, so baselines are conservative with respect to leakage.
+- **Rationale:** Baseline inputs all precede the signal onset, so they cannot contain information from the EEG-derived window. The join that applies the onset offset to the cohort is not yet implemented.
+- **Source:** D-108; D-109; `docs/eeg_pipeline.md`; `docs/research/plan_compliance_2026-10-08.md` s2 item 7.
+
+### D-125 Feature and structured-label extraction before Gate 0 is data preparation, not training
+- **Date:** 2026-10-08 · **Area:** data · **Outcome data seen?** No
+- **Decision:** Feature and structured-label extraction before Gate 0 is data preparation, not training. No model is fitted, and no label-by-feature summaries are computed, until Gate 0 passes.
+- **Rationale:** D-039 bars model training before Phase 0 passes and does not name extraction. The plan's sequence ("no modeling yet"; nothing trained until the field audit and pilot pass) puts extraction after Gate 0; the order used is recorded here as a departure from that sequence.
+- **Source:** D-039; D-051; `docs/research_plan_v1.txt` (Phase 0 introduction); `docs/research/plan_compliance_2026-10-08.md` s3 item 1.
+
+### D-126 Evaluation size of about 1,000 cases is provisional
+- **Date:** 2026-10-08 · **Area:** labor · **Outcome data seen?** No
+- **Decision:** The ~1,000-case evaluation size (D-093) is provisional and will be recalculated with formal methods after the pilot, as the plan specifies.
+- **Rationale:** D-027 requires the size to follow measured pilot minutes and kappa. D-093 fixed the figure before the pilot, and its simulations assume three sites, whereas D-120 uses two.
+- **Source:** D-027; D-093; D-120; `sortinghat/metrics/power.py`; `docs/research/plan_compliance_2026-10-08.md` s1 (evaluation size row).
+
+### D-127 Transparency note: D-117 replaced the date-shift proxy after the original proxy returned FAIL
+- **Date:** 2026-10-08 · **Area:** data · **Outcome data seen?** No · **Data-quality aggregates seen?** Yes
+- **Decision:** Transparency note: D-117 replaced the date-shift alignment proxy after the original proxy had returned FAIL (63.6% "misaligned", 20.45% ordering violations). The median-based proxy is invalid for multi-year EHR histories. The original result will be reported alongside the new one. No outcome data had been seen.
+- **Rationale:** The median event is far from the EEG for patients with multi-year histories whatever the date shift, so the original proxy could not test alignment. The replacement is D-117's nearest-event gate.
+- **Source:** D-117; `docs/research/plan_compliance_2026-10-08.md` s2 item 10 and s3 item 6.
+
+### D-128 SAP s16.1: "possible" scoring
+- **Date:** 2026-10-08 · **Area:** labels · **Outcome data seen?** No
+- **Decision:** Primary scoring sets y = 0 for "possible" (binary positive = probable or definite). Sensitivities mask "possible" and score it as 1 (SAP s12).
+- **Rationale:** The plan keeps the handoff's ordinal states but does not state how "possible" is scored. The SAP follows `docs/labels_spec.md`.
+- **Source:** SAP s3.2, s12 and s16 item 1; `docs/labels_spec.md`.
+
+### D-129 SAP s16.2: probability clipping eps = 1e-4
+- **Date:** 2026-10-08 · **Area:** hypotheses · **Outcome data seen?** No
+- **Decision:** Predicted probabilities are clipped to [eps, 1 - eps] with eps = 1e-4 (`DEFAULT_EPS`). Sensitivities use eps = 1e-6 and 1e-3.
+- **Rationale:** Without clipping, a single confident miss can dominate the mean log loss.
+- **Source:** SAP s5, s12 and s16 item 2.
+
+### D-130 SAP s16.3: primary EEG model is the top ladder rung
+- **Date:** 2026-10-08 · **Area:** hypotheses · **Outcome data seen?** No
+- **Decision:** The primary EEG model is the top ladder rung ("combined") on the 10-minute window. Its head family and hyperparameter budget are fixed before evaluation-set unblinding. Other rungs are descriptive ladder results, not hypothesis tests.
+- **Rationale:** The plan does not name the rung that carries H1 and H2. Naming one avoids best-of-ladder selection.
+- **Source:** SAP s4.2 and s16 item 3; D-017.
+
+### D-131 SAP s16.4: within-site stratified bootstrap carries the H1/H2 interval
+- **Date:** 2026-10-08 · **Area:** hypotheses · **Outcome data seen?** No
+- **Decision:** The within-site stratified bootstrap carries the H1/H2 CI (99%, D-095). Cluster, two-stage and site-level t intervals are co-reported.
+- **Rationale:** SAP s7.2 gives the reason as S = 3 sites, for which a cluster interval cannot support a coverage claim. The two-site design of D-120 revisits that premise, and the choice is to be re-checked there.
+- **Source:** SAP s7.2 and s16 item 4; D-095; D-120.
+
+### D-132 SAP s16.5: H3 stratum rule and severity cut points
+- **Date:** 2026-10-08 · **Area:** hypotheses · **Outcome data seen?** No
+- **Decision:** "Delta below 0 within a stratum" means the point estimate is below 0. The minimum stratum size is n = 50 (placeholder). Severity cut points are fixed before unblinding.
+- **Rationale:** The plan does not define a stratum-level rule or a minimum size. A stratum under 50 patients is treated as not estimable and not favourable, and the n = 50 minimum is a placeholder for the pilot to replace.
+- **Source:** SAP s6 (H3 row) and s16 item 5; D-019.
+
+### D-133 SAP s16.6: H4 "near chance" and rank statistic
+- **Date:** 2026-10-08 · **Area:** hypotheses · **Outcome data seen?** No
+- **Decision:** "Near chance" for E6 vs E5 means the pairwise AUROC CI contains 0.5. Kendall tau-b is reported between the predicted and observed label rankings, with a bootstrap CI.
+- **Rationale:** The plan says "near chance" without a criterion. H4 is recorded before unblinding and reported whichever way it falls.
+- **Source:** SAP s6 (H4 row) and s16 item 6; D-020.
+
+### D-134 SAP s16.7: H5 "supported" rule (H5 currently dropped)
+- **Date:** 2026-10-08 · **Area:** hypotheses · **Outcome data seen?** No
+- **Decision:** H5 is "supported" if the interaction estimate is below 0 and its CI lies entirely below 0. The rule applies only if H5 is reinstated.
+- **Rationale:** The plan gives an interaction estimate with a 95% CI but no decision rule. H5 is dropped from Study 1 under D-103, and the SAP has not yet been updated to say so.
+- **Source:** SAP s6 (H5 row) and s16 item 7; D-021; D-103.
+
+### D-135 SAP s16.8: H6 "met" rule and interpretability threshold
+- **Date:** 2026-10-08 · **Area:** hypotheses · **Outcome data seen?** No
+- **Decision:** H6 is "met" if the ratio Delta(2 min)/Delta(10 min) has a point estimate of at least 0.70 and Delta(10 min) < 0. The ratio is reported as uninterpretable when the CI for Delta(10 min) includes 0 or fewer than 90% of bootstrap draws have Delta(10 min) < 0 (90% is a placeholder).
+- **Rationale:** The 70% threshold is the plan's. The sign condition and the interpretability threshold are operational, and the 90% level is a placeholder.
+- **Source:** SAP s6 (H6 row) and s16 item 8; D-022.
+
+### D-136 SAP s16.9: "improves individually" for G2
+- **Date:** 2026-10-08 · **Area:** hypotheses · **Outcome data seen?** No
+- **Decision:** A label "improves individually" for G2 when its per-label Delta CI upper bound is below 0 and its Holm-adjusted one-sided p-value is below 0.05.
+- **Rationale:** The plan says "improve individually" without a test. Holm adjustment is applied across the primary labels.
+- **Source:** SAP s7.4, s8 and s16 item 9; D-052.
+
+### D-137 SAP s16.10: G2 sedative adjustment
+- **Date:** 2026-10-08 · **Area:** hypotheses · **Outcome data seen?** No
+- **Decision:** The G2 "sedative adjustment" condition is met when the sedative-excluded subset has a pooled Delta point estimate below 0.
+- **Rationale:** Baseline A already contains sedation (D-014), so the subset check tests whether Delta is carried by sedative signatures.
+- **Source:** SAP s11 and s16 item 10; D-052; D-014.
+
+### D-138 SAP s16.11: temporal holdout fraction 0.20
+- **Date:** 2026-10-08 · **Area:** splits · **Outcome data seen?** No
+- **Decision:** The late-calendar temporal holdout is the latest 20% of cases in each site by calendar time. Training uses earlier cases only, optionally with an embargo. The fraction is fixed at 0.20.
+- **Rationale:** The plan does not give a fraction. If the date shift does not preserve calendar order across patients within a site, the holdout is dropped and recorded, not replaced by another construction.
+- **Source:** SAP s7.1 and s16 item 11; D-025; D-117.
+
+### D-139 SAP s16.12: E7 eligibility reading
+- **Date:** 2026-10-08 · **Area:** labels · **Outcome data seen?** No
+- **Decision:** E7 is a primary label if it has at least 100 total gold positives and at least two sites with at least one positive (`metrics.labels.e7_eligible`). Eligibility is decided on evaluation-set gold counts before any model output is unblinded.
+- **Rationale:** D-004 sets the 100-positive, two-site threshold. "At least one positive at each of two sites" is the operational reading of "across at least 2 sites".
+- **Source:** SAP s3.1 and s16 item 12; D-004.
+
+### D-140 SAP s16.13: gating of H3 and H5 interpretation
+- **Date:** 2026-10-08 · **Area:** hypotheses · **Outcome data seen?** No
+- **Decision:** H3 is interpreted as confirmatory only if H1 is met. H5 is interpreted as confirmatory only if H2 is met. Otherwise both are reported descriptively. No further alpha adjustment is applied.
+- **Rationale:** The gating stops secondary tests from being read as confirmatory when the primary fails. H3 and H5 use point-estimate or single-CI rules, so no multiplicity adjustment is added.
+- **Source:** SAP s8 and s16 item 13; D-018.
+
+### D-141 SAP s16.14: bootstrap replicates B = 10,000 for final analyses
+- **Date:** 2026-10-08 · **Area:** hypotheses · **Outcome data seen?** No
+- **Decision:** Final analyses use B = 10,000 percentile-bootstrap replicates with a fixed seed recorded in the analysis log. The code default of 2,000 is for development only. The sub-items 14a to 14d are covered by D-093 to D-097.
+- **Rationale:** The plan does not state a replicate count. The final-analysis value is set here so that the development default is not reported as final.
+- **Source:** SAP s7.2 and s16 item 14; D-093; D-094; D-095; D-096; D-097.
+
+### D-142 SAP s16.15: G0 kappa type and prevalence source
+- **Date:** 2026-10-08 · **Area:** data · **Outcome data seen?** No
+- **Decision:** G0 kappa is the unweighted binary kappa (probable or definite positive) on the 200-case pilot. Prevalence is taken from pilot gold labels.
+- **Rationale:** The plan says "kappa" without a type. The binary positive definition follows `docs/labels_spec.md` section 6.
+- **Source:** SAP s11 (G0 row) and s16 item 15; `docs/labels_spec.md` s6; D-051.

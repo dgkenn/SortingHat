@@ -73,6 +73,9 @@ class PowerConfig:
     noise_corr: float = 0.6                  # correlation of baseline and EEG score noise
     assess_prob: float = 0.90                # P(label assessable), per patient and label
     n_sites: int = 3
+    site_fracs: tuple[float, ...] | None = None   # share of N per site (D-120 2-site design); None = equal
+    drift: float = 0.0                       # AUROC decay of the EEG gain in the late calendar period
+    late_frac: float = 0.30                  # share of each site's calendar time that is the late period
 
     def __post_init__(self):
         k = len(self.labels)
@@ -430,6 +433,145 @@ def default_scenarios() -> dict[str, PowerConfig]:
     }
 
 
+# --------------------------------------------------------------------------
+# 2-site design (D-120): leave-one-site-out and late-calendar temporal holdout, co-primary
+# --------------------------------------------------------------------------
+TWO_SITE_FRACS = (0.6, 0.4)
+TWO_SITE_TAUS = (0.015, 0.03)
+TWO_SITE_DRIFTS = (0.0, 0.01)
+TWO_SITE_N = (800, 1000, 1500, 2000)
+TWO_SITE_GAINS = (0.0, 0.02, 0.04, 0.06)
+SCHEMES = ("loso", "temporal", "both")
+
+
+def two_site_config(**kw) -> PowerConfig:
+    return replace(PowerConfig(), n_sites=2, site_fracs=TWO_SITE_FRACS, **kw)
+
+
+def site_sizes_frac(n_total: int, fracs: Sequence[float]) -> list[int]:
+    """Split ``n_total`` by ``fracs`` (sums to n_total)."""
+    f = np.asarray(fracs, float)
+    sizes = np.floor(n_total * f / f.sum()).astype(int)
+    sizes[0] += n_total - sizes.sum()
+    return [int(x) for x in sizes]
+
+
+def _moments(d: np.ndarray):
+    ok = ~np.isnan(d)
+    cnt = ok.sum(axis=1)
+    mean = np.where(ok, d, 0.0).sum(axis=1) / cnt
+    var = np.where(ok, (d - mean[:, None]) ** 2, 0.0).sum(axis=1) / np.maximum(cnt - 1, 1)
+    return cnt, mean, var
+
+
+def simulate_scheme_stats(cfg: PowerConfig, scheme: str, n_total: int, reps: int, rng: np.random.Generator,
+                          u: np.ndarray, eta: np.ndarray):
+    """Per-rep, per-site (n, mean, var) of d_i for one validation scheme, given shared site effects.
+
+    ``u``, ``eta`` are (reps, S). ``loso``: the held-out site's whole calendar range, of which the late
+    ``late_frac`` has the EEG gain reduced by ``drift``. ``temporal``: only the late ``late_frac`` of each
+    site (``n_total`` counts those held-out late patients), gain reduced by ``drift``.
+    """
+    S = cfg.n_sites
+    n_s, m_s, v_s = (np.zeros((reps, S)) for _ in range(3))
+    for s, n in enumerate(site_sizes_frac(n_total, cfg.site_fracs or (1.0,) * S)):
+        if scheme == "temporal":
+            d = simulate_site_d(cfg, n, reps, rng, u[:, s] - cfg.drift, eta[:, s])
+        else:
+            n_late = int(round(cfg.late_frac * n))
+            d = np.concatenate([simulate_site_d(cfg, n - n_late, reps, rng, u[:, s], eta[:, s]),
+                                simulate_site_d(cfg, n_late, reps, rng, u[:, s] - cfg.drift, eta[:, s])], axis=1)
+        n_s[:, s], m_s[:, s], v_s[:, s] = _moments(d)
+    return n_s, m_s, v_s
+
+
+def _rule(n_s, m_s, v_s, levels) -> dict[float, np.ndarray]:
+    n_tot = n_s.sum(axis=1)
+    est = (n_s * m_s).sum(axis=1) / n_tot
+    se = np.sqrt((n_s * v_s).sum(axis=1)) / n_tot
+    every = np.all(m_s < 0, axis=1)
+    return {lv: ((est + stats.norm.ppf(0.5 + lv / 2) * se) < 0) & every for lv in levels}
+
+
+def two_site_cell(cfg: PowerConfig, n_total: int, reps: int = 600, seed: int = 20261007, key: int = 0,
+                  levels: Sequence[float] = CI_LEVELS) -> dict[float, dict[str, float]]:
+    """P(rule passes) per CI level for LOSO, temporal holdout and both (D-095 rule within each scheme).
+
+    The two schemes share the site effects (tau, prevalence shift) of each simulated study but draw
+    independent patients, i.e. the patient-level overlap between the schemes is ignored. ``both`` is then
+    a lower bound for the true joint pass rate (power) and the null value is optimistic; ``both_ub`` =
+    min(loso, temporal) is the Frechet upper bound (conservative for the null).
+    """
+    rng = _cell_seed(seed, n_total, key)
+    sizes = site_sizes_frac(n_total, cfg.site_fracs or (1.0,) * cfg.n_sites)
+    chunk = max(1, int(2.0e6 // (max(max(sizes), 1) * cfg.k)))
+    acc = {lv: {"loso": [], "temporal": []} for lv in levels}
+    done = 0
+    while done < reps:
+        r = min(chunk, reps - done)
+        u = rng.normal(0.0, cfg.tau_gain, (r, cfg.n_sites))
+        eta = rng.normal(0.0, cfg.site_prev_sd, (r, cfg.n_sites))
+        for sch in ("loso", "temporal"):
+            res = _rule(*simulate_scheme_stats(cfg, sch, n_total, r, rng, u, eta), levels)
+            for lv in levels:
+                acc[lv][sch].append(res[lv])
+        done += r
+    out = {}
+    for lv in levels:
+        a, b = (np.concatenate(acc[lv][k]) for k in ("loso", "temporal"))
+        out[lv] = {"loso": float(a.mean()), "temporal": float(b.mean()), "both": float((a & b).mean()),
+                   "both_ub": float(min(a.mean(), b.mean()))}
+    return out
+
+
+def two_site_grid(reps: int = 600, seed: int = 20261007, taus=TWO_SITE_TAUS, drifts=TWO_SITE_DRIFTS,
+                  n_grid=TWO_SITE_N, gains=TWO_SITE_GAINS, levels=CI_LEVELS) -> list[dict]:
+    """Flat list of rows {tau, drift, n, gain, level, loso, temporal, both, both_ub}.
+
+    Common random numbers across gains (same cell seed per tau/drift/N).
+    """
+    rows = []
+    for ti, tau in enumerate(taus):
+        for di, dr in enumerate(drifts):
+            for n in n_grid:
+                for g in gains:
+                    cfg = two_site_config(gain=g, tau_gain=tau, drift=dr)
+                    res = two_site_cell(cfg, n, reps, seed, key=100 + 10 * ti + di, levels=levels)
+                    for lv, v in res.items():
+                        rows.append({"tau": tau, "drift": dr, "n": n, "gain": g, "level": lv, **v})
+    return rows
+
+
+def format_two_site(rows: list[dict], key: str = "both") -> str:
+    """Markdown: one row per (tau, drift, level); columns null and power at +0.02/+0.04/+0.06 per N."""
+    ns = sorted({r["n"] for r in rows})
+    gains = sorted({r["gain"] for r in rows})
+    h = "| tau | drift | CI | Quantity | " + " | ".join(f"N={n:,}" for n in ns) + " |\n|---|---|---|---|" + "---|" * len(ns) + "\n"
+    idx = {(r["tau"], r["drift"], r["level"], r["gain"], r["n"]): r for r in rows}
+    out = ""
+    for tau in sorted({r["tau"] for r in rows}):
+        for dr in sorted({r["drift"] for r in rows}):
+            for lv in sorted({r["level"] for r in rows}):
+                for g in gains:
+                    lab = "Null (gain 0)" if g == 0 else f"Power +{g:.2f}"
+                    cells = " | ".join(f"{idx[(tau, dr, lv, g, n)][key]:.3f}" if g == 0 else
+                                       f"{idx[(tau, dr, lv, g, n)][key]:.2f}" for n in ns)
+                    out += f"| {tau:g} | {dr:g} | {lv:.1%} | {lab} | {cells} |\n"
+    return h + out
+
+
+def two_site_min_n(rows: list[dict], gain: float = 0.04, key: str = "both") -> dict:
+    """{(tau, drift, level): min N for 80% power (interpolated; inf if above the grid)}."""
+    out = {}
+    for tau in sorted({r["tau"] for r in rows}):
+        for dr in sorted({r["drift"] for r in rows}):
+            for lv in sorted({r["level"] for r in rows}):
+                sel = sorted((r for r in rows if (r["tau"], r["drift"], r["level"], r["gain"]) == (tau, dr, lv, gain)),
+                             key=lambda r: r["n"])
+                out[(tau, dr, lv)] = min_n_for_power([r["n"] for r in sel], [r[key] for r in sel])
+    return out
+
+
 def main(argv=None) -> int:
     ap = argparse.ArgumentParser(description=__doc__.splitlines()[0])
     ap.add_argument("--reps", type=int, default=400)
@@ -437,8 +579,21 @@ def main(argv=None) -> int:
     ap.add_argument("--sensitivity", action="store_true", help="also print the min-N sensitivity table")
     ap.add_argument("--null", action="store_true", help="also print the zero-effect rejection-rate table")
     ap.add_argument("--levels", action="store_true", help="also print the CI-level scan for the H1/H2 rule")
+    ap.add_argument("--two-site", action="store_true", help="print only the D-120 2-site design tables and exit")
     ap.add_argument("--json", type=str, default=None, help="write the raw grid to this path")
     a = ap.parse_args(argv)
+    if a.two_site:
+        rows = two_site_grid(a.reps, a.seed)
+        for k, t in (("both", "both schemes pass"), ("loso", "LOSO only"), ("temporal", "temporal only"),
+                     ("both_ub", "min(LOSO, temporal), null upper bound")):
+            print(f"\n### 2-site design (D-120): {t}, {a.reps} reps\n\n" + format_two_site(rows, k))
+        print("\n### Minimum N for 80% power at +0.04 (both)\n")
+        for k, v in two_site_min_n(rows).items():
+            print(k, "inf" if not np.isfinite(v) else round(v))
+        if a.json:
+            with open(a.json, "w") as fh:
+                json.dump(rows, fh, indent=1)
+        return 0
     print(render(a.reps, a.seed))
     if a.sensitivity:
         print("\n### Table P8. Minimum N for 80% power (full rule, within-site CI), sensitivity scenarios\n")
