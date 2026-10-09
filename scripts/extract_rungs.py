@@ -243,8 +243,11 @@ def main(argv=None, s3=None, embedder=None, backend=None) -> int:
             raise SystemExit(f"{xmor.RUN_INFO} in --morgoth-dir differs from this run's settings (backend / heads / steps / "
                              "weights); use a new --morgoth-dir so one directory never mixes configurations (to resume one begun with the old "
                              "six-head default pass --morgoth-heads normal,bs,spikes,slowing,spikeloc,iiic)")
-        info_path.write_text(json.dumps(info, indent=2, sort_keys=True))
-        os.chmod(info_path, 0o600)
+        if not info_path.exists():  # shards start together: write atomically so a sibling never reads a half-written file
+            tmp = info_path.with_name(f"{info_path.name}.{os.getpid()}.tmp")
+            tmp.write_text(json.dumps(info, indent=2, sort_keys=True))
+            os.chmod(tmp, 0o600)
+            os.replace(tmp, info_path)
 
     if s3 is None and todo:
         from sortinghat import data_io
