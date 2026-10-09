@@ -25,7 +25,7 @@ from sklearn.preprocessing import StandardScaler
 
 from ..metrics.bootstrap import paired_bootstrap_delta
 from ..metrics.hypotheses import h3_severity_stratified
-from ..safe_output import SUPPRESS_BELOW, suppress_count
+from ..safe_output import SUPPRESS_BELOW, SUPPRESSED, suppress_count
 from .data import ModelData
 from .ladder import COMMERCIAL_RUNGS, DEFAULT_RUNGS, LadderConfig, LadderResult, RungSpec, run_ladder
 
@@ -89,6 +89,54 @@ def sedation_probe(eeg: pd.DataFrame, sedated, sites, threshold: float = LEAKAGE
         per_site[labels[u]] = {"auroc": a, "estimable": not np.isnan(a)}
     return {"auroc": auc, "flagged": bool(ok and auc > threshold), "estimable": ok, "n": suppress_count(len(s)),
             "n_sedated": suppress_count(int(s.sum())), "informational": True, "per_site": per_site}
+
+
+def _ordinal_spearman(eeg: pd.DataFrame, grade: np.ndarray, n_splits: int, seed: int, min_cell: int = SUPPRESS_BELOW) -> float:
+    """Spearman correlation between the cross-validated (out-of-fold) ridge prediction of the grade from the EEG columns and
+    the true grade; NaN when fewer than 2 grades hold at least ``max(min_cell, n_splits)`` patients."""
+    from scipy.stats import spearmanr
+    from sklearn.linear_model import Ridge
+    from sklearn.model_selection import KFold
+    classes, counts = np.unique(grade, return_counts=True)
+    if (counts >= max(min_cell, n_splits)).sum() < 2:
+        return float("nan")
+    cv = (StratifiedKFold(n_splits, shuffle=True, random_state=seed) if counts.min() >= n_splits
+          else KFold(n_splits, shuffle=True, random_state=seed))
+    pipe = make_pipeline(SimpleImputer(strategy="median"), StandardScaler(), Ridge(alpha=100.0))
+    pr = cross_val_predict(pipe, eeg.values, grade.astype(float), cv=cv)
+    rho = spearmanr(pr, grade).correlation
+    return float(rho) if np.isfinite(rho) else float("nan")
+
+
+def sedation_grade_probe(eeg: pd.DataFrame, grade, sites, thresholds: Sequence[int] = (1, 2), n_splits: int = 5, seed: int = 0,
+                         site_labels: Mapping | None = None, min_cell: int = SUPPRESS_BELOW) -> dict:
+    """How much sedation INTENSITY the EEG representation alone encodes (informational, like ``sedation_probe``).
+    Binary: cross-validated AUROC of ``grade >= k`` vs ``< k`` for each k in ``thresholds`` (k = 2, heavy vs light, is the
+    primary), pooled and within each site (same pipeline and folds as the other probes; a binary probe needs ``min_cell``
+    patients per class). Ordinal: Spearman correlation between the out-of-fold ridge prediction of the grade and the grade
+    (pooled and within site; needs two grades with at least ``min_cell`` patients). Counts under ``min_cell`` are shown "<11" and
+    both classes' counts are hidden together."""
+    g = np.asarray(grade).astype(int)
+    sites = np.asarray(sites)
+    labels = dict(site_labels or {})
+    uniq = sorted(str(u) for u in np.unique(sites))
+    for i, u in enumerate(uniq):
+        labels.setdefault(u, f"site_{i + 1}")
+    out: dict = {"informational": True, "n": suppress_count(len(g)), "binary": {}, "ordinal": {}}
+    for k in thresholds:
+        p = sedation_probe(eeg, g >= k, sites, n_splits=n_splits, seed=seed, site_labels=labels, min_cell=min_cell)
+        npos, nneg = int((g >= k).sum()), int((g < k).sum())
+        hide = min(npos, nneg) < min_cell
+        out["binary"][f"ge{k}"] = {"auroc": p["auroc"], "estimable": p["estimable"], "per_site": p["per_site"],
+                                   "n_at_or_above": SUPPRESSED if hide else npos, "n_below": SUPPRESSED if hide else nneg}
+    rho = _ordinal_spearman(eeg, g, n_splits, seed, min_cell)
+    per_site = {}
+    for u in uniq:
+        m = sites.astype(str) == u
+        r = _ordinal_spearman(eeg.iloc[np.flatnonzero(m)], g[m], n_splits, seed, min_cell)
+        per_site[labels[u]] = {"spearman": r, "estimable": not np.isnan(r)}
+    out["ordinal"] = {"spearman": rho, "estimable": not np.isnan(rho), "per_site": per_site}
+    return out
 
 
 def leakage_probes(eeg: pd.DataFrame, sites, duration_s=None, n_channels=None, threshold: float = LEAKAGE_AUROC_FLAG,

@@ -151,7 +151,61 @@ patients from training and scoring), so three further analyses are reported, non
    representation encodes sedation and that sedation is a live explanation of Delta; a low one makes it less plausible. A pooled AUROC
    can ride on a site shift when sedation prevalence differs by site; the within-site AUROCs cannot.
 
-**Checkpoints.** None of these adds a model fit: they read the stored `d_i` / predictions, so a resumed run reuses every cached fit
+**Sedation intensity (report section "Sedation intensity"; D-154, pre-specified before any intensity-stratified result was seen).**
+On the real run the binary sedation flag covers 93% of the patients, so the non-sedated stratum is about 120 patients and inconclusive.
+The intensity analysis asks the sharper, graded question: *does the EEG gain shrink toward 0 as sedation intensity falls, and does it
+exist at grades 0-1 (none / light)?* No model is refitted (stored held-out `d_i` only). Code: `sortinghat/metrics/sedation.py`
+(`GRADE_SPEC`, `sedation_intensity_grade`, `graded_delta`), `sortinghat/models/controls.py` (`sedation_grade_probe`),
+`scripts/run_silver_feasibility.py` (`sedation_intensity_block`).
+
+1. *Grade (fixed here; the cut points are not to be re-tuned after a real run).* An ordinal t0 grade from the Baseline A `sed__*`
+   columns only: no EEG, no silver label and not the silver `e4b` hint (EEG-blind and outcome-blind). Columns that exist
+   (`baselines/features.py`): for the eight named agents (propofol, midazolam, lorazepam, dexmedetomidine, ketamine, fentanyl,
+   hydromorphone, morphine) `sed__<agent>__on_t0`, `__qty_6h`, `__qty_24h`; for the classes `sed__{sedative,opioid}__on_t0` and
+   `__n_24h`; `sed__n_agents_24h`; `sed__approx_time`. `on_t0` = an administration record started with no stop recorded by t0, or,
+   with no administration record, an order within 2 h of t0 (the best available proxy for a continuous infusion).
+
+   | Grade | Rule (highest grade met wins; a missing column counts as 0) |
+   |---|---|
+   | 0 | none recorded: nothing running at t0 and no recorded administration / order in the prior 24 h |
+   | 1 | recent intermittent exposure only: a recorded sedative / opioid administration in the prior 24 h (`sed__<class>__n_24h` > 0, any `sed__<agent>__qty_6h/24h` > 0, or `sed__n_agents_24h` > 0) but nothing running at t0 |
+   | 2 | a sedative or opioid running at t0 (`sed__sedative__on_t0`, `sed__opioid__on_t0` or any named `sed__<agent>__on_t0`) |
+   | 3 | anaesthetic-depth proxy: `sed__propofol__on_t0`, OR two or more of the named continuous-capable sedatives (propofol, midazolam, lorazepam, dexmedetomidine, ketamine) running at t0 |
+
+   Light = grades 0-1, heavy = grades 2-3. **Columns that do NOT exist**, so the requested definition was adapted: no infusion rate or
+   dose of a running drug (its quantity is censored to unknown at t0, so "propofol + high dose" cannot be graded: propofol running is
+   the only anaesthetic-depth marker); no route (bolus vs infusion; "running at t0" is the proxy, and a bolus with an open-ended
+   record or an order within 2 h counts as running); no separate barbiturate, diazepam, clonazepam or etomidate columns (they sit in
+   the class aggregate, so they reach grade 2 through `sed__sedative__on_t0` but never grade 3 by identity); no normalised doses.
+   The grade counts (suppressed, per site) are printed with the definition.
+2. *Delta by grade.* Delta of the headline rung (and of `combined_cbramod` and `combined_morgoth` when they ran; all of them are
+   reported, none is picked by its result) for each scheme x baseline within grades 0, 1, 2, 3 and within the pooled light and heavy
+   strata, with the 99% (primary) and 95% within-site patient bootstrap intervals, per-site Deltas, the **heavy-minus-light
+   difference** (paired by bootstrap: one resample of all patients within site gives every stratum mean and the difference) and the
+   statement "light gain persists" (light 99% interval below 0). A grade or stratum under 50 patients is *not estimable*; counts under
+   11 are shown `<11`, grades are shown in the pairs (0,1) and (2,3) (if either member is hidden both are, so a hidden count cannot
+   be recovered from the pooled light / heavy count or the total), and a per-site Delta is hidden when its own cell is under 11.
+3. *Trend test.* Over the grades with at least 50 patients (at least 3 needed, else not estimable), all from the same bootstrap
+   replicates: **primary = the site-adjusted OLS slope of the per-patient d_i on grade** (grade and d_i demeaned within site, so a site
+   difference in grade mix and in Delta cannot create a slope), in Delta units per grade step; also the pooled OLS slope and
+   Spearman's rho between grade and d_i. Negative slope (rho < 0) = the gain grows with intensity; a slope interval that includes 0
+   together with a light Delta below 0 = the gain does not depend on recorded intensity.
+   Reading, fixed in advance: (a) light 99% interval below 0 and slope interval including 0: the gain exists without appreciable
+   recorded sedation and does not track intensity (against a sedation explanation); (b) light interval including 0 and slope interval
+   below 0: the gain lives in the sedated end (consistent with a sedation contribution); (c) both below 0: a gain at every level that
+   also grows with intensity (a sedation contribution cannot be excluded for the part that grows); (d) anything not estimable is
+   inconclusive, never exculpatory.
+4. *Sedation-intensity probe.* Cross-validated AUROC of `grade >= 2` vs `< 2` (primary) and of `grade >= 1` vs `0` from the EEG
+   representation alone (hand-crafted qEEG + connectivity, frozen CBraMod, MORGOTH findings when present), plus the Spearman
+   correlation of the out-of-fold ridge prediction of the grade with the grade, pooled and within site (same pipeline and folds as the
+   other probes; needs 11 patients per class / two grades with 11 patients). Informational, not a pass/fail control, and run with the
+   controls (`--skip-controls` skips it; the Delta tables still run).
+
+   Limits: recorded exposure is confounded with illness severity, and the baselines already carry the sedation columns, so Delta is
+   the EEG increment over recorded exposure; sedation with no recorded administration sits at grade 0; the strata split held-out rows
+   of models fitted on all training rows.
+
+**Checkpoints.** None of these (including the sedation-intensity analysis) adds a model fit: they read the stored `d_i` / predictions, so a resumed run reuses every cached fit
 (fit units are keyed by data, not code). No new command-line argument was added, so the step's argument digest is unchanged. The step key
 does contain the code version (`git HEAD` + hash of the uncommitted tracked diff), `--out` and the other arguments: a commit or edit
 of any tracked file, or a different `--out`, starts a fresh checkpoint directory and refits everything once. To reuse the fits of an
@@ -269,7 +323,7 @@ the +1 h score window uses data charted after the EEG began (P only).
 ### How to read the report
 
 * Look first at the controls. A shuffled-label or permuted-EEG Delta away from 0, a flagged site/duration probe with the gain
-  concentrated in one site, or a sedative-excluded Delta that vanishes means the headline Delta is not interpretable. Then "Sedation confounding": a non-sedated-stratum Delta near 0 (99% interval including 0 while the sedated stratum is clearly negative), a difference of Deltas away from 0, or a high sedation-probe AUROC all point to sedation as part of the gain; a non-sedated Delta that stays negative with a 99% interval below 0 argues against sedation as the whole explanation (it cannot rule out sedation the baseline features miss).
+  concentrated in one site, or a sedative-excluded Delta that vanishes means the headline Delta is not interpretable. Then "Sedation confounding": a non-sedated-stratum Delta near 0 (99% interval including 0 while the sedated stratum is clearly negative), a difference of Deltas away from 0, or a high sedation-probe AUROC all point to sedation as part of the gain; a non-sedated Delta that stays negative with a 99% interval below 0 argues against sedation as the whole explanation (it cannot rule out sedation the baseline features miss). Then "Sedation intensity" (D-154): read the light-stratum Delta and the site-adjusted slope together, as pre-specified under "Sedation intensity" above; a non-estimable stratum or trend is inconclusive.
 * Then the per-label table. A gain on E1/E2/E5 with no gain on E4a (no EEG signature expected) is the pattern the
   planted-signal test shows; a gain on every label equally suggests a recording-property proxy.
 * Then baseline-only AUROC (anchor overlap) and the circularity audit. A flag for the **baseline-only** model (which never

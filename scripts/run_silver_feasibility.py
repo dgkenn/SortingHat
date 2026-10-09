@@ -44,6 +44,8 @@ Design
                 severity strata, shuffled-label and permuted-EEG negative controls.
     sedation    "Sedation confounding" section: Delta of the headline rung within sedated and non-sedated strata of the SAME held-out
                 predictions (no refit), their difference with a bootstrap CI, and whether Baselines A / C already carry sedation features.
+    intensity   "Sedation intensity" section (D-154): ordinal t0 grade 0-3 from the Baseline A sed__ columns, Delta by grade and light/heavy,
+                a trend test over grade and an EEG-only intensity probe (no refit; the probe runs with the controls).
     audit       circularity audit: held-out silver-trained predictions' agreement with EEG-report findings vs with silver labels.
 """
 from __future__ import annotations
@@ -71,13 +73,14 @@ from sortinghat.metrics.bootstrap import bootstrap_ci, paired_bootstrap_delta  #
 from sortinghat.metrics.calibration import per_label_report  # noqa: E402
 from sortinghat.metrics.hypotheses import h3_severity_stratified  # noqa: E402
 from sortinghat.metrics.labels import e7_eligible  # noqa: E402
-from sortinghat.metrics.sedation import MIN_STRATUM_N as SED_MIN_STRATUM_N, stratified_delta  # noqa: E402
+from sortinghat.metrics.sedation import (MIN_STRATUM_N as SED_MIN_STRATUM_N, GRADES as SED_GRADES, GRADE_SPEC as SED_GRADE_SPEC,  # noqa: E402
+                                         grade_counts_shown, graded_delta, sedation_intensity_grade, stratified_delta)
 from sortinghat.metrics.splits import late_temporal_holdout  # noqa: E402
 from sortinghat.models import (CBRAMOD_FROZEN_RUNG, COMMERCIAL_RUNGS, DEFAULT_RUNGS, MORGOTH_FINDINGS_RUNG,  # noqa: E402
                                LadderConfig, ModelData, RungSpec, delta_concentration_by_site, leakage_probes,
                                load_morgoth_findings, negative_control, run_ladder, sedative_excluded_rerun)
 from sortinghat.models import ladder as ladder_mod  # noqa: E402
-from sortinghat.models.controls import control_failed  # noqa: E402
+from sortinghat.models.controls import control_failed, sedation_grade_probe  # noqa: E402
 from sortinghat.models.report import clean  # noqa: E402
 from sortinghat.safe_output import (SUPPRESSED, SUPPRESS_BELOW, safe_print, safe_write_json, safe_write_text,  # noqa: E402
                                     suppress_count, suppress_proportion)
@@ -1014,6 +1017,65 @@ def sedation_block(A: Assembly, results: dict, cfg: LadderConfig, headline: str,
     return clean(out)
 
 
+# ============================================================================================ sedation intensity (D-154)
+INTENSITY_RUNGS = ("combined_cbramod", "combined_morgoth")        # reported next to the headline rung when they ran (all of them: none picked by result)
+INTENSITY_READING = ("Pre-specified question (D-154, before any intensity-stratified result was seen): does the EEG gain shrink toward 0 "
+                     "as sedation intensity falls, and does it exist at grades 0-1 (none / light)? Delta is negative when the EEG helps. "
+                     "A light-stratum 99% interval below 0 means the gain exists without appreciable recorded sedation; a site-adjusted "
+                     "slope of Delta on grade whose 99% interval is below 0 means the gain grows with intensity (a dose-response "
+                     "signature of a sedation contribution, whether or not it vanishes at grade 0); a slope interval that includes 0 "
+                     "with a negative light Delta means the gain does not depend on recorded intensity. A stratum or trend that is "
+                     "not estimable is inconclusive, never exculpatory.")
+INTENSITY_CAVEATS = ("The grade is built from the Baseline A sedation columns only (EEG-blind, outcome-blind). 'Running at t0' (an "
+                     "administration with no stop recorded by t0, or an order within 2 h of t0 when there is no administration record) "
+                     "is only a proxy for a continuous infusion: the route, the infusion rate and the dose of a running drug are not "
+                     "recorded in the features, units are not normalised, and barbiturates, diazepam and etomidate are visible only "
+                     "inside the class aggregate. So 'high dose' cannot be graded, grade 3 is propofol running or two or more named "
+                     "sedatives running, and depth of sedation within a grade is invisible. Sedation with no recorded administration "
+                     "puts the patient at grade 0. Models are the ones fitted on all training rows; the grades only split the "
+                     "held-out rows (no refit). Strata are cut by recorded exposure, which is confounded with illness severity; the "
+                     "baselines already adjust for the sedation columns, so Delta is the EEG increment over recorded exposure.")
+
+
+def intensity_rungs(res, headline: str, baseline_sets: dict) -> list[str]:
+    """The headline rung, then the CBraMod / MORGOTH combined rungs that have a stored result in this scheme for every baseline."""
+    return [headline] + [r for r in INTENSITY_RUNGS if all((b, r) in res.rungs for b in baseline_sets)]
+
+
+def sedation_intensity_block(A: Assembly, results: dict, cfg: LadderConfig, headline: str) -> dict:
+    """Sedation-intensity analysis (aggregate-only; no refit): the ordinal t0 grade 0-3 from the baseline ``sed__`` columns
+    (sortinghat.metrics.sedation.GRADE_SPEC), its suppressed distribution, and Delta of the headline rung (and the combined
+    CBraMod / MORGOTH rungs when they ran) within each grade, within the light (0-1) and heavy (2-3) strata with their
+    paired-by-bootstrap difference, and a trend test over grade. The EEG-only intensity probe is added by the driver (controls)."""
+    grade, info = sedation_intensity_grade(A.baseline)
+    out: dict = {"headline_rung": headline, "definition": SED_GRADE_SPEC, "grade_info": {k: v for k, v in info.items() if k != "spec"},
+                 "min_stratum_n": SED_MIN_STRATUM_N, "reading": INTENSITY_READING, "caveats": INTENSITY_CAVEATS, "by_scheme": {}}
+    if grade is None:
+        out["available"] = False
+        out["reason"] = info["reason"]
+        return clean(out)
+    out["available"] = True
+    n = len(grade)
+    cnt = {g: int((grade == g).sum()) for g in SED_GRADES}
+    out["distribution"] = {"n": suppress_count(n), "n_by_grade": {str(g): v for g, v in grade_counts_shown(cnt).items()},
+                           "per_site": {}}
+    for s_ in sorted(np.unique(A.sites)):
+        m = A.sites == s_
+        c = {g: int((m & (grade == g)).sum()) for g in SED_GRADES}
+        out["distribution"]["per_site"][A.site_labels[s_]] = {str(g): v for g, v in grade_counts_shown(c).items()}
+    for split, res in results.items():
+        out["by_scheme"][split] = {}
+        for rung in intensity_rungs(res, headline, A.baseline_sets):
+            out["by_scheme"][split][rung] = {}
+            for b in A.baseline_sets:
+                rr = res.get(rung, b)
+                out["by_scheme"][split][rung][b] = graded_delta(
+                    rr.d, grade[np.asarray(res.eval_idx)], res.eval_sites, res.site_labels, cfg.n_boot, cfg.seed,
+                    cfg.alpha_primary, cfg.alpha_secondary)
+    out["rungs"] = sorted({r for v in out["by_scheme"].values() for r in v})
+    return clean(out)
+
+
 # ==================================================================================================== driver
 DRIFT_RATIO = 3.0                      # flag a label when test / train prevalence is > this or < 1 / this
 
@@ -1094,7 +1156,7 @@ def run_analysis(A: Assembly, a, store=None) -> dict:
     if headline is None:
         raise SystemExit("no qeeg./conn. feature columns found")
     R: dict = {"banner": BANNER, "headline_rung": headline, "intended_use": None, "ladder": {}, "discrimination_calibration": {},
-               "commercial_clean_gap": {"available": False}, "sedation": None, "controls": {}, "circularity_audit": None,
+               "commercial_clean_gap": {"available": False}, "sedation": None, "sedation_intensity": None, "controls": {}, "circularity_audit": None,
                "label_drift": label_drift_screen(A, a.temporal_fraction, getattr(a, "drift_ratio", DRIFT_RATIO))}
     R["intended_use"] = run_intended_use(A, a, cfg, headline, splits)             # D-145: reported FIRST
     taps: dict = {}
@@ -1120,7 +1182,9 @@ def run_analysis(A: Assembly, a, store=None) -> dict:
                  if isinstance(v["pooled"], float) and v["pooled"] >= ANCHOR_OVERLAP_AUROC] for b in A.baseline_sets}
         for sp in splits}
     R["sedation"] = sedation_block(A, results, cfg, headline, a.sedation_source)       # reads the held-out d_i only: no refit, cheap, runs even with --skip-controls
+    R["sedation_intensity"] = sedation_intensity_block(A, results, cfg, headline)    # D-154: reads the held-out d_i only, no refit
     if a.skip_controls:
+        R["sedation_intensity"]["probe"] = {"skipped": "--skip-controls was set: the intensity probe is a control and was NOT run"}
         R["controls"] = {"skipped": "--skip-controls was set: the mandatory controls were NOT run; do not interpret Delta"}
         R["circularity_audit"] = {"note": "skipped with --skip-controls"}
         return R
@@ -1138,6 +1202,15 @@ def run_analysis(A: Assembly, a, store=None) -> dict:
         mg_cols = [c for c in A.eeg.columns if str(c).startswith(MORGOTH_PREFIX)]
         R["controls"]["leakage_probes_morgoth_findings"] = clean(leakage_probes(
             first.eeg[mg_cols], first.sites, dur, nch, seed=a.seed, sedated=sed, site_labels=A.site_labels))
+    if R["sedation_intensity"].get("available"):         # D-154: how much sedation intensity the representation alone encodes
+        grade_, _ = sedation_intensity_grade(A.baseline)
+        reps_ = {"hand_crafted_qeeg_connectivity": eeg_only_cols}
+        if has_emb:
+            reps_["cbramod_frozen"] = emb_cols
+        if has_mg:
+            reps_["morgoth_findings"] = mg_cols
+        R["sedation_intensity"]["probe"] = clean({k: sedation_grade_probe(first.eeg[c], grade_, first.sites, seed=a.seed,
+                                                                           site_labels=A.site_labels) for k, c in reps_.items()})
     R["controls"]["by_scheme"] = {}
     n_small = max(200, min(a.n_boot, 1000))
     for split in splits:
@@ -1251,6 +1324,79 @@ def _sedation_markdown(sb: dict | None) -> list[str]:
             c99, c95 = df.get("ci_99_within_site") or {}, df.get("ci_95_within_site") or {}
             L.append(f"| {split} | {b} | {_f(df['delta'])} | [{_f(c99.get('lo'))}, {_f(c99.get('hi'))}] | "
                      f"[{_f(c95.get('lo'))}, {_f(c95.get('hi'))}] | {v['non_sedated_gain_persists_99']} |")
+    return L
+
+
+def _ci_str(c: dict | None) -> str:
+    c = c or {}
+    return f"[{_f(c.get('lo'))}, {_f(c.get('hi'))}]"
+
+
+def _intensity_markdown(sb: dict | None) -> list[str]:
+    """"Sedation intensity" section: the grade definition and distribution, Delta by grade and light / heavy, the trend, the probe."""
+    if not sb:
+        return []
+    spec = sb["definition"]
+    L = ["", "## Sedation intensity", "",
+         "Sedation-intensity analysis (D-154; pre-specified in docs/silver_feasibility.md before any intensity-stratified result was seen). "
+         "The ordinal t0 grade comes from the Baseline A `sed__*` columns only (EEG-blind, outcome-blind):", "",
+         "| Grade | Rule |", "|---|---|"]
+    for g, txt in spec["grades"].items():
+        L.append(f"| {g} | {txt} |")
+    L += ["", f"Precedence: {spec['precedence']}. Not available in the features: " + "; ".join(spec["not_available"]) + ".", ""]
+    if not sb.get("available"):
+        return L + [f"Not run: {sb.get('reason')}."]
+    dist = sb["distribution"]
+    L += [f"Grade distribution (n < 11 shown as <11; grades 0/1 and 2/3 are hidden together): total {dist['n']}; "
+          + ", ".join(f"grade {g}: {v}" for g, v in dist["n_by_grade"].items()) + "; per site " +
+          "; ".join(f"{s_}: " + ", ".join(f"{g}: {v}" for g, v in c.items()) for s_, c in dist["per_site"].items()) + ".", "",
+          sb["reading"], "", sb["caveats"], "",
+          f"A stratum or grade under {sb['min_stratum_n']} patients is not estimable (no Delta, no interval); the trend needs at least 3 "
+          "estimable grades. Intervals: within-site patient bootstrap, every grade, the light / heavy strata, their difference and the "
+          "trend statistics from the same resamples. Slopes are Delta units per grade step (negative: the gain grows with intensity); "
+          "the site-adjusted slope (grade and d demeaned within site) is the primary trend statistic; Spearman rho has the sign of the slope (rho > 0: Delta rises toward 0 with intensity).", ""]
+    for split, per_rung in sb["by_scheme"].items():
+        for rung, per in per_rung.items():
+            L += [f"### Delta by sedation grade: {split}, rung `{rung}`" + (" (headline)" if rung == sb["headline_rung"] else ""), "",
+                  "| Baseline | Stratum | n | Delta | 99% CI | 95% CI | per-site Delta (n) |", "|---|---|---|---|---|---|---|"]
+            for b, v in per.items():
+                rows = [(f"grade {g}", c, {s_: x[g] for s_, x in v["per_site"].items()}) for g, c in v["grades"].items()] + \
+                       [("light (0-1)", v["strata"]["light"], None), ("heavy (2-3)", v["strata"]["heavy"], None)]
+                for nm, c, ps in rows:
+                    pstr = ", ".join(f"{s_}: {_f(x['delta'])} (n={x['n']})" for s_, x in ps.items()) if ps else ""
+                    if not c["estimable"]:
+                        L.append(f"| {b} | {nm} | {c['n']} | not estimable: {c['not_estimable']} | | | {pstr} |")
+                    else:
+                        L.append(f"| {b} | {nm} | {c['n']} | {_f(c['delta'])} | {_ci_str(c['ci_99_within_site'])} | "
+                                 f"{_ci_str(c['ci_95_within_site'])} | {pstr} |")
+            L += ["", "| Baseline | light gain persists (99% CI < 0) | heavy minus light | 99% CI | 95% CI | site-adjusted slope | 99% CI | pooled slope | 99% CI | Spearman rho | 99% CI |",
+                  "|---|---|---|---|---|---|---|---|---|---|---|"]
+            for b, v in per.items():
+                df, tr = v["difference_heavy_minus_light"], v["trend"]
+                dtxt = (f"{_f(df['delta'])} | {_ci_str(df['ci_99_within_site'])} | {_ci_str(df['ci_95_within_site'])}"
+                        if df["estimable"] else f"not estimable | | ")
+                if tr["estimable"]:
+                    t1, t2, t3 = tr["slope_site_adjusted_primary"], tr["slope_pooled"], tr["spearman_rho"]
+                    ttxt = (f"{_f(t1['delta'])} | {_ci_str(t1['ci_99_within_site'])} | {_f(t2['delta'])} | {_ci_str(t2['ci_99_within_site'])} | "
+                            f"{_f(t3['delta'])} | {_ci_str(t3['ci_99_within_site'])}")
+                else:
+                    ttxt = f"not estimable: {tr['not_estimable']} | | | | | "
+                L.append(f"| {b} | {v['light_gain_persists_99']} | {dtxt} | {ttxt} |")
+            L.append("")
+    pr = sb.get("probe")
+    L += ["### Sedation-intensity probe (EEG representation alone, cross-validated)", ""]
+    if not pr or "skipped" in pr:
+        return L + [(pr or {}).get("skipped", "not run")]
+    L += ["AUROC of predicting `grade >= k` vs `< k` from the EEG features alone (k = 2, heavy vs light, is the primary), and the "
+          "Spearman correlation of the out-of-fold ridge prediction of the grade with the grade, pooled and within site "
+          "(informational, not a pass/fail control; a pooled value can ride on a site shift, the within-site values cannot).", "",
+          "| Representation | Probe | pooled | per site | n at/above, below |", "|---|---|---|---|---|"]
+    for rep, p in pr.items():
+        for k, q in p["binary"].items():
+            L.append(f"| {rep} | AUROC {k.replace('ge', 'grade >= ')} | {_f(q['auroc'])} | "
+                     + ", ".join(f"{s_}: {_f(x['auroc'])}" for s_, x in q["per_site"].items()) + f" | {q['n_at_or_above']}, {q['n_below']} |")
+        o = p["ordinal"]
+        L.append(f"| {rep} | ordinal Spearman rho | {_f(o['spearman'])} | " + ", ".join(f"{s_}: {_f(x['spearman'])}" for s_, x in o["per_site"].items()) + " | |")
     return L
 
 
@@ -1481,6 +1627,7 @@ def render_markdown(J: dict) -> str:
                              f"{_f(v['calibration_in_the_large'], 3)} | {sl} | {_f(v['ece'], 3)} | {_f(v['brier'], 3)} |")
     L += _controls_markdown(J["controls"])
     L += _sedation_markdown(J.get("sedation"))
+    L += _intensity_markdown(J.get("sedation_intensity"))
     ca = J["circularity_audit"]
     L += ["", "## Circularity audit (leave-one-site-out predictions)", ""]
     if "per_model" in ca and ca["per_model"]:
