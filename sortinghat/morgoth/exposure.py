@@ -18,6 +18,15 @@ column whose NAME says patient / person / bdsp id is taken as bare ids. Both red
 Assumptions to confirm (docs/morgoth.md): the lists use BDSP ids (not re-hashed ones), and appearing in ANY list means the
 patient's EEG was available to MORGOTH's development (training, validation or test); a split column, if found, gives the
 narrower ``in_train_split`` flag.
+
+Master-table rule (confirmed on the real release by header names and aggregate value classes, 2026-10-09): the BDSP workbook
+``datasets_deidentified_list.xlsx`` holds a master patient table (one row per HEEDB patient with EEG, ``BDSPPatientID``) whose
+``Morgoth`` column is blank for patients MORGOTH never used and ``pretrain`` / ``train`` / ``test`` otherwise; the other sheets
+(``bdsp_mrn`` = the integer BDSPPatientID, ``file_name`` = ``sub-<SITE><id>_...`` or ``<SITE><id>_<n>_...``) are per-task subsets with
+the same column. A column named ``Morgoth`` therefore acts as the membership column: rows where it is blank are NOT in MORGOTH's
+data and are dropped before ids are read, and its value is the split (``pretrain``, ``train``, ``val``, ``test``). Mere presence in
+that master table is not exposure. The per-task event lists (``internal_dataset/<TASK>/list*.xlsx|csv``) carry no split: their patients
+count as members of unknown split.
 """
 
 from __future__ import annotations
@@ -38,6 +47,26 @@ _ID_COL_RE = re.compile(r"(bdsp|patient|person|subject|\bpid\b|bids|mrn)", re.I)
 _PATHLIKE_COL_RE = re.compile(r"(file|name|path|key|record|segment|event|mat|edf)", re.I)
 _SPLIT_COL_RE = re.compile(r"^(split|set|subset|partition|fold|group|train_?test|dataset_?split)$", re.I)
 _TRAIN_WORDS = {"train", "training", "tr", "trn"}
+_MEMBER_COL = "morgoth"                     # membership + split column of the BDSP master / per-task sheets
+_TRAINING_SPLITS = {"train", "pretrain"}    # splits that count as "trained on" (SSL pretraining included)
+
+
+def _norm_split(v) -> str | None:
+    """Normalise a split cell to pretrain / train / val / test / other; None when blank."""
+    if v is None or (isinstance(v, float) and np.isnan(v)):
+        return None
+    t = str(v).strip().lower()
+    if t in ("", "nan", "none"):
+        return None
+    if t.startswith("pretrain") or t.startswith("pre-train") or t.startswith("pre_train"):
+        return "pretrain"
+    if t in _TRAIN_WORDS or t.startswith("train"):
+        return "train"
+    if t.startswith("val") or t == "dev":
+        return "val"
+    if t.startswith("test"):
+        return "test"
+    return "other"
 
 
 @dataclass
@@ -50,6 +79,14 @@ class TrainingIndex:
     n_files_with_ids: int = 0
     n_cells: int = 0
     n_lists_per_id: dict[int, int] = field(default_factory=dict)
+    splits: dict[int, set] = field(default_factory=dict)   # id -> splits seen (pretrain / train / val / test / other)
+    unsplit_ids: set[int] = field(default_factory=set)     # ids seen in a row with no split information
+    sources: dict[str, set[int]] = field(default_factory=dict)   # source label -> ids (label = file name [+ sheet / split])
+
+    @property
+    def split_complete(self) -> bool:
+        """True when every id has a known split (the narrower train flag is then defensible)."""
+        return self.has_split_info and not self.unsplit_ids
 
 
 def _read_any(path: Path) -> list[pd.DataFrame]:
@@ -70,7 +107,7 @@ def inspect_columns(path: str | Path) -> dict:
     for i, df in enumerate(_read_any(Path(path))):
         cols = [str(c) for c in df.columns]
         out[f"sheet{i}"] = {"columns": cols, "id_columns": _choose_columns(df),
-                            "split_columns": [c for c in cols if _SPLIT_COL_RE.match(c)]}
+                            "split_columns": [c for c in cols if _SPLIT_COL_RE.match(c) or c.strip().lower() == _MEMBER_COL]}
     return out
 
 
@@ -94,11 +131,19 @@ def ids_from_bare_column(values: Iterable) -> list[int]:
     return [int(v) for v in s[(s > 0) & (s == s.round())]]
 
 
-def scan_frame(df: pd.DataFrame, idx: TrainingIndex, merge_map: Mapping[int, int] | None = None) -> int:
-    """Add the ids found in one table to ``idx``; returns how many distinct ids this table contributed."""
-    cols = _choose_columns(df)
+def scan_frame(df: pd.DataFrame, idx: TrainingIndex, merge_map: Mapping[int, int] | None = None, label: str | None = None) -> int:
+    """Add the ids found in one table to ``idx``; returns how many distinct ids this table contributed.
+
+    A ``Morgoth`` column (see module docstring) is the membership column: rows with it blank are dropped, its value is the split.
+    Otherwise the first generic split-like column, if any, gives the split; with no split column the ids have unknown split."""
+    member = next((c for c in df.columns if str(c).strip().lower() == _MEMBER_COL), None)
     split_cols = [c for c in df.columns if _SPLIT_COL_RE.match(str(c))]
-    found: dict[int, bool] = {}                  # id -> seen in a train row
+    split_col = member if member is not None else (split_cols[0] if split_cols else None)
+    if member is not None:
+        df = df[df[member].notna()].reset_index(drop=True)
+    cols = [c for c in _choose_columns(df) if c != member]
+    row_split = [_norm_split(v) for v in df[split_col].tolist()] if split_col is not None else None
+    found: dict[int, set] = {}                   # id -> splits seen (None = unknown)
     for c in cols:
         col = df[c]
         idx.n_cells += int(col.notna().sum())
@@ -109,20 +154,27 @@ def scan_frame(df: pd.DataFrame, idx: TrainingIndex, merge_map: Mapping[int, int
                 got = ids_from_bare_column([v])
             if not got:
                 continue
-            is_train = False
-            if split_cols:
-                sv = str(df[split_cols[0]].iloc[pos]).strip().lower()
-                is_train = sv in _TRAIN_WORDS or sv.startswith("train")
+            sp = row_split[pos] if row_split is not None else None
             for i in got:
-                found[i] = found.get(i, False) or is_train
-    if split_cols:
+                found.setdefault(i, set()).add(sp)
+    if split_col is not None:
         idx.has_split_info = True
-    for i, tr in found.items():
+    for i, sps in found.items():
         for j in {i, (merge_map or {}).get(i, i)}:
             idx.ids.add(j)
             idx.n_lists_per_id[j] = idx.n_lists_per_id.get(j, 0) + 1
-            if tr:
+            known = {x for x in sps if x is not None}
+            idx.splits.setdefault(j, set()).update(known)
+            if None in sps:
+                idx.unsplit_ids.add(j)
+            if known & _TRAINING_SPLITS:
                 idx.train_ids.add(j)
+            if label is not None:
+                if member is not None:       # one source per split value of the membership column
+                    for x in known or {"unsplit"}:
+                        idx.sources.setdefault(f"{label}:{x}", set()).add(j)
+                else:
+                    idx.sources.setdefault(label, set()).add(j)
     return len(found)
 
 
@@ -131,7 +183,11 @@ def scan_lists(paths: Iterable[str | Path], merge_map: Mapping[int, int] | None 
     idx = TrainingIndex()
     for p in paths:
         idx.n_files += 1
-        n = sum(scan_frame(df, idx, merge_map) for df in _read_any(Path(p)))
+        dfs = _read_any(Path(p))
+        stem = Path(p).name
+        n = 0
+        for k, df in enumerate(dfs):
+            n += scan_frame(df, idx, merge_map, label=stem if len(dfs) == 1 else f"{stem}#sheet{k}")
         idx.n_files_with_ids += int(n > 0)
     return idx
 
@@ -143,27 +199,49 @@ def add_names(idx: TrainingIndex, names: Iterable[str]) -> int:
     idx.ids |= got
     for i in got:
         idx.n_lists_per_id[i] = idx.n_lists_per_id.get(i, 0) + 1
+        idx.splits.setdefault(i, set()).add("pretrain")     # the pretrain/ prefix holds the SSL pretraining recordings
+    idx.sources.setdefault("pretrain_key_names", set()).update(got)
     return len(idx.ids) - before
+
+
+def _hit(pid: pd.Series, src: pd.Series, ids) -> np.ndarray:
+    return (pid.isin(ids) | src.isin(ids)).to_numpy()
 
 
 def flag_cohort(cohort: pd.DataFrame, idx: TrainingIndex, id_col: str = "person_id",
                 source_col: str | None = "person_id_source", site_col: str = "SiteID") -> pd.DataFrame:
     """Per-patient flags. RECORD-LEVEL: write under ``local_only/`` only. Columns: ``person_id``, ``SiteID`` (if present),
-    ``in_morgoth_lists`` (patient id, or its pre-merge id, appears in a MORGOTH list), ``in_morgoth_train_split``
-    (only when the lists carry a split column; else NaN) and ``n_morgoth_lists``."""
+    ``in_morgoth_lists`` (patient id, or its pre-merge id, appears in MORGOTH's data: any pretrain / train / test membership,
+    or a per-task list), ``in_morgoth_train_or_pretrain`` (split says train or pretrain; a lower bound when some lists have no
+    split), ``in_morgoth_pretrain``, ``in_morgoth_test_only`` (split known, test or val only, never train / pretrain, and in no
+    split-less list), ``in_morgoth_train_split`` (the narrower flag, emitted only when EVERY list carries a split; else NaN so a
+    reader falls back to ``in_morgoth_lists``) and ``n_morgoth_lists``."""
     pid = pd.to_numeric(cohort[id_col], errors="coerce")
     src = pd.to_numeric(cohort[source_col], errors="coerce") if source_col and source_col in cohort else pid
-    hit = pid.isin(idx.ids) | src.isin(idx.ids)
+    hit = _hit(pid, src, idx.ids)
+    train = _hit(pid, src, idx.train_ids)
+    pre = _hit(pid, src, {i for i, sp in idx.splits.items() if "pretrain" in sp})
+    held = {i for i, sp in idx.splits.items() if sp and not (sp & _TRAINING_SPLITS) and i not in idx.unsplit_ids}
     out = pd.DataFrame({"person_id": cohort[id_col].to_numpy()})
     if site_col in cohort:
         out["SiteID"] = cohort[site_col].to_numpy()
-    out["in_morgoth_lists"] = hit.to_numpy()
-    out["in_morgoth_train_split"] = ((pid.isin(idx.train_ids) | src.isin(idx.train_ids)).to_numpy()
-                                     if idx.has_split_info else np.nan)
+    out["in_morgoth_lists"] = hit
+    out["in_morgoth_train_or_pretrain"] = train
+    out["in_morgoth_pretrain"] = pre
+    out["in_morgoth_test_only"] = _hit(pid, src, held)
+    out["in_morgoth_train_split"] = train if idx.split_complete else np.nan
     out["n_morgoth_lists"] = [max(idx.n_lists_per_id.get(int(a), 0) if a == a else 0,
                                   idx.n_lists_per_id.get(int(b), 0) if b == b else 0)
                               for a, b in zip(pid, src)]
     return out
+
+
+def source_counts(cohort: pd.DataFrame, idx: TrainingIndex, id_col: str = "person_id",
+                  source_col: str | None = "person_id_source") -> dict:
+    """Per source (list file / sheet / split) count of cohort patients present, suppressed. Aggregate-only."""
+    pid = pd.to_numeric(cohort[id_col], errors="coerce")
+    src = pd.to_numeric(cohort[source_col], errors="coerce") if source_col and source_col in cohort else pid
+    return {k: suppress_count(int(_hit(pid, src, ids).sum())) for k, ids in sorted(idx.sources.items())}
 
 
 def summarize(flags: pd.DataFrame, idx: TrainingIndex) -> dict:
@@ -176,8 +254,14 @@ def summarize(flags: pd.DataFrame, idx: TrainingIndex) -> dict:
            "n_cohort": suppress_count(n),
            "n_in_lists": suppress_count(k) if (n - k) >= 11 else "<11",
            "in_lists_proportion": suppress_proportion(k, n),
-           "split_column_found": bool(idx.has_split_info)}
-    if idx.has_split_info:
+           "split_column_found": bool(idx.has_split_info), "split_complete": bool(idx.split_complete)}
+    for col, key in (("in_morgoth_train_or_pretrain", "train_or_pretrain"), ("in_morgoth_pretrain", "pretrain"),
+                     ("in_morgoth_test_only", "test_only")):
+        if col in flags:
+            kk = int(flags[col].sum())
+            out[f"n_{key}"] = suppress_count(kk) if (n - kk) >= 11 else "<11"
+            out[f"{key}_proportion"] = suppress_proportion(kk, n)
+    if idx.split_complete:
         kt = int(pd.Series(flags["in_morgoth_train_split"]).fillna(False).astype(bool).sum())
         out["in_train_split_proportion"] = suppress_proportion(kt, n)
     if "SiteID" in flags:

@@ -109,3 +109,43 @@ def test_script_exposure_end_to_end_stdout_has_no_ids(tmp_path, capsys):
     with pytest.raises(SystemExit):
         xm.main(["exposure", "--cohort", str(lo / "cohort.csv"), "--lists", str(lo / "list.csv"),
                  "--out", str(tmp_path / "plain.parquet")])
+
+
+def test_master_table_morgoth_column_is_membership_and_split(tmp_path):
+    """Master-table layout (SYNTHETIC): a blank Morgoth cell means not a MORGOTH patient; its value is the split."""
+    master = pd.DataFrame({"BDSPPatientID": [1000001, 1000002, 1000003, 1000004, 1000005],
+                           "SiteID": ["S0001"] * 5,
+                           "Morgoth": ["pretrain", "train", "test", np.nan, None],
+                           "SpikeNet": ["train", np.nan, np.nan, "train", "test"]})
+    task = pd.DataFrame({"bdsp_mrn": [1000006, 1000007], "file_name": ["sub-S0001001000006_ses-1", "S0001001000007_1_20240101"],
+                         "label": [1, 0]})
+    with pd.ExcelWriter(tmp_path / "datasets_deidentified_list.xlsx") as w:
+        master.to_excel(w, sheet_name="a", index=False)
+    task.to_csv(tmp_path / "IIIC__list.csv", index=False)
+    idx = ex.scan_lists([tmp_path / "datasets_deidentified_list.xlsx", tmp_path / "IIIC__list.csv"])
+    assert idx.ids == {1000001, 1000002, 1000003, 1000006, 1000007}          # blank-Morgoth rows are not members
+    assert idx.train_ids == {1000001, 1000002}                                # train + pretrain
+    assert idx.unsplit_ids == {1000006, 1000007} and not idx.split_complete   # per-task lists carry no split
+    c = pd.DataFrame({"person_id": np.arange(1000001, 1000009), "person_id_source": np.arange(1000001, 1000009),
+                      "SiteID": ["S0001"] * 8})
+    f = ex.flag_cohort(c, idx).set_index("person_id")
+    assert f["in_morgoth_lists"].tolist() == [True, True, True, False, False, True, True, False]
+    assert f["in_morgoth_train_or_pretrain"].tolist() == [True, True, False, False, False, False, False, False]
+    assert f["in_morgoth_pretrain"].tolist() == [True, False, False, False, False, False, False, False]
+    assert f["in_morgoth_test_only"].tolist() == [False, False, True, False, False, False, False, False]
+    assert f["in_morgoth_train_split"].isna().all()                           # incomplete split info: no narrow flag
+    src = ex.source_counts(c, idx)
+    assert "datasets_deidentified_list.xlsx:pretrain" in src and "IIIC__list.csv" in src
+
+
+def test_complete_split_emits_train_flag_and_summary_has_sources():
+    idx = ex.TrainingIndex()
+    ex.scan_frame(pd.DataFrame({"BDSPPatientID": list(range(1000001, 1000021)), "Morgoth": ["train"] * 12 + ["test"] * 8}), idx,
+                  label="m.xlsx")
+    c = cohort(40)
+    f = ex.flag_cohort(c, idx)
+    assert idx.split_complete and f["in_morgoth_train_split"].sum() == 12 and f["in_morgoth_test_only"].sum() == 8
+    s = ex.summarize(f, idx)
+    assert_aggregate_only(s)
+    assert s["split_complete"] and s["n_in_lists"] == 20
+    assert_aggregate_only(ex.source_counts(c, idx))

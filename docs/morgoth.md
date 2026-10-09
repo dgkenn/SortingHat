@@ -150,13 +150,35 @@ integer BDSPPatientID, and flags each cohort patient (`person_id`, or the pre-me
 `in_morgoth_lists`, `in_morgoth_train_split` (only when a split column exists), `n_morgoth_lists`. The per-patient table is written only under
 `local_only/` (0600); stdout carries suppressed counts, proportions and per-site (pseudonymised) shares.
 
-**Not done, needs a human:** the list files have not been opened by an agent (patient-level). Open points to confirm before using the flag:
-1. download the lists (`aws s3 cp` via the wrapper) into `out/local_only/morgoth_lists/`, then run `exposure --inspect --lists ...` (prints header
-   names only) and confirm the id columns; the file name `datasets_deidentified_list.xlsx` suggests the ids may be re-keyed, in which case
-   no match is possible and the output carries a "no patient ids parsed" warning instead of a silent zero;
-2. "in a list" means available to MORGOTH's development (train, validation or test), not necessarily trained on; the narrower flag needs a split column;
-3. `--pretrain-names` also takes ids embedded in the 9,242 key names under `morgoth1/data/pretrain/` (a listing of names only), if those names carry ids.
-The models-layer registry (`controls.default_exposure_registry`) still reports MORGOTH as UNVERIFIED (a test pins it); fill it from the flags once confirmed.
+**Run on the real release (2026-10-09, D-118 wrapper, aggregate output only; per-patient flags in `out/local_only/morgoth/exposure.parquet`, 0600).**
+Lists: 29 files downloaded from the projects access point into `out/local_only/morgoth_lists/` (0700/0600): `morgoth1/data/internal_dataset/datasets_deidentified_list.xlsx`
+(18 sheets) and the per-task event lists `internal_dataset/<TASK>/list*.xlsx|csv` (BETS, BIPD x2, BIRD, BS, FOCALSLOWING, GENSLOWING, GPD, GRDA, IIIC, LPD, LRDA, N1/N2_19Channel,
+PDR x2, POSTS, SEIZURE, SEIZURE_BCH, SPIKES, SPIKES_BCH, SPIKES_FOCAL_GEN, SPIKES_HM, SPINDLES, VW x2, WICKETS x2). NORMAL, ABNORMAL, AWAKE and `MoE/` have no list file at their top level
+(label sets only); `SLEEPSTAGING/list/*.csv` (BCH/MGH PSG sets, not the EEG cohort's source) was not downloaded or checked. `--pretrain-names` listed the 9,242 key names under `morgoth1/data/pretrain/`
+(names only, in memory): every name embeds one patient id (about 1,565 cohort patients).
+
+Layout (header names plus aggregate value classes; no values read): list columns are `bdsp_mrn` (integer BDSPPatientID, 9 digits, equal to cohort `person_id`),
+`file_name` (`sub-<SITE><id>_...` or `<SITE><id>_<n>_...`), `event_time`, label and rater columns. The workbook's sheet 1 is a **master table of 108,666 HEEDB patients** (`BDSPPatientID`,
+`SiteID`, `HasEEG` ...) with a `Morgoth` column that is blank for 81,491 patients and `pretrain` (10,000) / `train` (7,081) / `test` (10,094) for the others, plus `SpikeNet` / `SparcNet`
+columns (other models, ignored). The other sheets repeat the `Morgoth` column as train or test per task. Consequence, and the fix made in `exposure.py`: presence in the master table is NOT
+exposure; a column named `Morgoth` is the membership column (blank rows dropped, value = split). Cohort ids match directly: 13,219 of 14,516 cohort ids appear in the master table, 5,783 of them
+as MORGOTH members (the per-task lists add 636 more cohort patients whose master `Morgoth` cell is blank, so the union is broader than the master column alone).
+
+Id mapping: `person_id` (= int BDSPPatientID, 9 digits) or the pre-merge `person_id_source` against the integer id from `bdsp_mrn` / `BDSPPatientID` / the `file_name` regex (site code ignored).
+
+Flag columns (`flag_cohort`): `in_morgoth_lists` (any pretrain / train / test membership or any per-task list or pretrain key name; the conservative flag
+`run_silver_feasibility.py` uses), `in_morgoth_train_or_pretrain`, `in_morgoth_pretrain`, `in_morgoth_test_only`, `in_morgoth_train_split` (NaN here: the per-task lists carry no split, so the
+narrow flag is withheld and readers fall back to `in_morgoth_lists`), `n_morgoth_lists`.
+
+Cohort result (n = 14,516 patients, `cohort_study1.csv`): in any MORGOTH list **6,425 (44.3%)**; train or pretrain (split-labelled, a lower bound for training exposure) 2,794 (19.3%); pretrain 1,712 (11.8%);
+known test-only <11. By pseudonymised site: site 1 (n 1,504) 3.1%, site 2 (n 12) <11, site 3 (n 8,032) 51.1%, site 4 (n 4,968) 45.8%. Per-list counts are printed by the command (largest: the master
+sheet's test 3,070, pretrain 1,712, train 1,001; SPIKES_FOCAL_GEN 1,626; GENSLOWING 1,438; IIIC 876).
+
+Caveats still open: (1) "in a list" means available to MORGOTH's development (train, validation or test); only the master/per-sheet `Morgoth` column separates train from test, and the per-task
+event lists (the head fine-tuning sets) have no split. (2) The heads this project runs (`normal`, `bs`, `slowing`, `iiic`) are tied to specific task lists; the all-list flag is the safe sensitivity.
+(3) A bare numeric `id` column (workbook sheet 13, with `SiteID`) is not read as an id column; it would add about 60 cohort patients not otherwise flagged. (4) Whether the pretraining
+recording ids are the same patients as the master `pretrain` rows is not checked beyond the counts above. The models-layer registry (`controls.default_exposure_registry`) still reports MORGOTH
+as UNVERIFIED (a test pins it; not edited here); fill it from these flags.
 
 ## 6. Limits and open items
 

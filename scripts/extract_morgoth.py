@@ -222,14 +222,21 @@ def cmd_exposure(a) -> int:
         from sortinghat import data_io
         s3 = data_io.make_client(a.profile)
         names = data_io.list_keys(s3, "morgoth1/data/pretrain/", bucket=data_io.ap_arn("projects"))
-        expo.add_names(idx, names)
+        n_names = len(names)
+        n_added = expo.add_names(idx, names)
+        safe_print(f"pretrain key names: {suppress_count(n_names)} listed | ids parsed from names (new to the lists): "
+                   f"{suppress_count(len(idx.sources.get('pretrain_key_names', ())))} ({suppress_count(n_added)})")
     flags = expo.flag_cohort(cohort, idx)
     expo.write_flags(flags, a.out)
     summ = expo.summarize(flags, idx)
+    summ["by_source"] = expo.source_counts(cohort, idx)
     safe_print("MORGOTH exposure accounting (aggregates; per-patient flags are in local_only):")
     for k, v in summ.items():
-        if k != "by_site":
+        if k not in ("by_site", "by_source"):
             safe_print(f"  {k}: {v}")
+    safe_print("  cohort patients present per source (list file[#sheet][:split]):")
+    for k, v in summ["by_source"].items():
+        safe_print(f"    {k}: {v}")
     for s, e in summ.get("by_site", {}).items():
         safe_print(f"  {s}: n {e['n']} | in lists {e['in_lists_proportion']}")
     if a.summary:
