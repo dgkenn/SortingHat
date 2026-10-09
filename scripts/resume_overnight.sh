@@ -18,7 +18,10 @@ start overnight_finish.sh finisher "driver done"
 start stage2b.sh stage2b
 start stage3c.sh stage3c
 start stage4b.sh stage4b
-if ! ps -eo args | grep -qE "^(/bin/)?bash scripts/watchdog.sh\$" && ! grep -q "watchdog v2: all stages done" "$LOG" 2>/dev/null; then
+start stage3d.sh stage3d
+start stage4d.sh stage4d
+start stage4c.sh stage4c
+if ! ps -eo args | grep -qE "^(/bin/)?bash scripts/watchdog.sh\$" && ! grep -q "watchdog v3: all stages done" "$LOG" 2>/dev/null; then
   (setsid nohup scripts/watchdog.sh > /dev/null 2>&1 < /dev/null &)
 fi
 exit 0
