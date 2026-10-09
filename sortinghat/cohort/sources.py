@@ -462,6 +462,43 @@ class StoreSources:
         if buf:
             yield buf[0] if len(buf) == 1 else pd.concat(buf, ignore_index=True)
 
+    def iter_units(self, what: str, key_obj, table: str, columns: list[str], person_ids, fn):
+        """``fn(raw coerced chunk) -> frame | None`` applied to ``table`` row group by row group; yields the list of non-empty
+        results of each row group in order. With an active checkpoint every row group's result is stored atomically as soon as
+        it is computed and a relaunch skips the stored ones WITHOUT reading them (``key_obj`` = everything ``fn`` depends on:
+        ids, window / bounds, merge map ...). Progress is logged as aggregate lines (``cohort: visits 120/4174 row groups``)."""
+        from .. import checkpoint as ck
+        cp = ck.active()
+        pids = sorted({int(p) for p in person_ids})
+        key = ck.digest("cohort-unit-v1", what, table, columns, key_obj) if cp is not None else None
+        loaded: dict = {}
+
+        def have(uid: str) -> bool:
+            if cp is None:
+                return False
+            got = cp.get(f"cohort:{key}:{uid}")
+            if got is ck.MISS:
+                return False
+            loaded[uid] = got
+            return True
+        prog = ck.UnitProgress(cp.step if cp is not None else "cohort", what)
+        for uid, batches, total in data_io.iter_omop_units(table[len("omop_"):], person_ids=pids, columns=columns, s3=self.s3,
+                                                           batch_rows=1 << 18, skip=have if cp is not None else None):
+            if batches is None:
+                res = loaded.pop(uid)
+                prog.tick(True, total)
+            else:
+                res = []
+                for b in batches:
+                    c = fn(schema.coerce_types(table, b.to_pandas()))
+                    if c is not None and len(c):
+                        res.append(c)
+                if cp is not None:
+                    cp.put(f"cohort:{key}:{uid}", res)
+                prog.tick(False, total)
+            yield res
+        prog.emit(final=True)
+
     def visits(self, person_ids, bounds=None, remap=None, slack_h: float = 0.0, dates_only: bool = False
                ) -> pd.DataFrame:
         """COMPACT visits (``rules.compact_visits``), compacted, re-keyed and pruned PER CHUNK as they stream in."""
@@ -469,13 +506,10 @@ class StoreSources:
                        lambda: self._visits(person_ids, bounds, remap, slack_h, dates_only))
 
     def _visits(self, person_ids, bounds, remap, slack_h, dates_only) -> pd.DataFrame:
-        chunks = []
-        for raw in self.iter_rows("omop_visit_occurrence", _VISIT_COLS, person_ids, min_rows=250_000):
-            c = rules.compact_visits(raw, dates_only=dates_only)
-            del raw
-            c = rules.prune_visits(remap_ids(c, remap), bounds, slack_h)
-            if len(c):
-                chunks.append(c)
+        def one(raw):
+            return rules.prune_visits(remap_ids(rules.compact_visits(raw, dates_only=dates_only), remap), bounds, slack_h)
+        chunks = [c for res in self.iter_units("visits", (person_ids, bounds, remap, slack_h, dates_only),
+                                               "omop_visit_occurrence", _VISIT_COLS, person_ids, one) for c in res]
         return concat_frames(chunks, rules.compact_visits(pd.DataFrame({
             "person_id": [1], "visit_start_datetime": [pd.Timestamp("2000-01-01")]})).iloc[0:0])
 
@@ -484,31 +518,26 @@ class StoreSources:
         return _staged("scores", (person_ids, window, remap), lambda: self._scores(person_ids, window, remap))
 
     def _scores(self, person_ids, window, remap) -> pd.DataFrame:
-        chunks = []
-        for raw in self.iter_rows("omop_measurement", _MEAS_COLS, person_ids, min_rows=250_000):
-            c = rules.compact_scores(rules.filter_score_rows(raw))
-            del raw
-            c = prune_window(remap_ids(c, remap), "t", window)
-            if len(c):
-                chunks.append(c)
+        def one(raw):
+            return prune_window(remap_ids(rules.compact_scores(rules.filter_score_rows(raw)), remap), "t", window)
+        chunks = [c for res in self.iter_units("scores", (person_ids, window, remap), "omop_measurement", _MEAS_COLS,
+                                               person_ids, one) for c in res]
         return concat_frames(chunks, rules.compact_scores(pd.DataFrame()))
 
     def conditions(self, person_ids, window=None, remap=None) -> pd.DataFrame:
         return _staged("conditions", (person_ids, window, remap), lambda: self._conditions(person_ids, window, remap))
 
     def _conditions(self, person_ids, window, remap) -> pd.DataFrame:
-        chunks = []
-        for raw in self.iter_rows("omop_condition_occurrence", _COND_COLS, person_ids, min_rows=250_000):
+        def one(raw):
             f = rules.filter_phenotype_rows(raw)
-            del raw
             if not len(f):
-                continue
+                return None
             c = pd.DataFrame({"person_id": pd.to_numeric(f["person_id"]).to_numpy().astype("int64"),
                               "condition_start_datetime": pd.to_datetime(f["condition_start_datetime"], errors="coerce"
                                                                          ).astype("datetime64[s]").to_numpy()})
-            c = prune_window(remap_ids(c, remap), "condition_start_datetime", window)
-            if len(c):
-                chunks.append(c)
+            return prune_window(remap_ids(c, remap), "condition_start_datetime", window)
+        chunks = [c for res in self.iter_units("conditions", (person_ids, window, remap), "omop_condition_occurrence",
+                                               _COND_COLS, person_ids, one) for c in res]
         like = pd.DataFrame({"person_id": np.zeros(0, "int64"),
                              "condition_start_datetime": np.zeros(0, "datetime64[s]")})
         return concat_frames(chunks, like)

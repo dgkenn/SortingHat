@@ -27,7 +27,6 @@ from __future__ import annotations
 
 import argparse
 import re
-import time
 from collections import Counter
 from dataclasses import dataclass, field
 from pathlib import Path
@@ -543,30 +542,6 @@ def _set_visit_starts(visits: pd.DataFrame, ctx: _Ctx) -> None:
     ctx.visit_start = s[~s.index.duplicated(keep="last")]
 
 
-PROGRESS_EVERY_S = 30.0          # a progress line at least this often (and one per 25 units)
-
-
-class _UnitProgress:
-    """Aggregate progress of one table: ``silver_labels: measurement 120/551 row groups (resumed 100)``. Throttled by time and
-    count, plus a line at the end; no ids, no rows."""
-
-    def __init__(self, label: str):
-        self.label, self.done, self.resumed, self.total = label, 0, 0, None
-        self._t, self._n = time.monotonic(), 0
-
-    def tick(self, resumed: bool, total) -> None:
-        self.done += 1
-        self.resumed += int(resumed)
-        self.total = total if total is not None else self.total
-        if self.done - self._n >= 25 or time.monotonic() - self._t >= PROGRESS_EVERY_S:
-            self.emit()
-
-    def emit(self, final: bool = False) -> None:
-        self._t, self._n = time.monotonic(), self.done
-        tot = f"/{self.total}" if self.total is not None else ""
-        ck.log(f"silver_labels: {self.label} {self.done}{tot} row groups (resumed {self.resumed})" + (" done" if final else ""))
-
-
 def classify_store(store, ctx: _Ctx, on_error: Callable | None = None) -> Classified:
     """Streaming path: each table is read in column-pruned, cohort-filtered Arrow batches and classified ROW GROUP by row group,
     so only matched rows are held in memory. ``store`` is a ``data_io.LocalStore`` or the S3 client (human-run only).
@@ -580,7 +555,7 @@ def classify_store(store, ctx: _Ctx, on_error: Callable | None = None) -> Classi
     cp = ck.active()
 
     def units(table: str, fn: Callable, cols: list[str], extra=None, label: str | None = None) -> pd.DataFrame:
-        prog = _UnitProgress(label or table)
+        prog = ck.UnitProgress("silver_labels", label or table)
         key = ck.digest("silver-unit-v2", table, fn.__name__, cols, ctx.cases, ctx.cfg, ctx.cm.raw, ck.digest(ctx.index.state()),
                         extra) if cp is not None else None
         loaded: dict = {}
@@ -638,7 +613,7 @@ def _concept_index(store, ctx: _Ctx, on_error: Callable | None, cp) -> ConceptIn
             return ctx.index
     failed = []
     handler = on_error if on_error is None else (lambda k, e: (failed.append(k), on_error(k, e)))
-    prog = _UnitProgress("concept")
+    prog = ck.UnitProgress("silver_labels", "concept")
     for _uid, batches, total in data_io.iter_omop_units("concept", columns=COLUMNS["concept"], s3=store, on_error=handler,
                                                        batch_rows=1 << 20):
         for b in batches:

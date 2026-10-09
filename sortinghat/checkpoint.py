@@ -272,6 +272,30 @@ class RowGroupProgress:
             f"{'done, ' if final else ''}part {min(self.part, self.n_parts)}/{self.n_parts}")
 
 
+class UnitProgress:
+    """Aggregate progress of one checkpointed stream of units (row groups of one table): ``<step>: <label> 120/551 row groups
+    (resumed 100)``. A line at least every ``every_s`` seconds (default 30) or every 25 units, plus one when done. Counts only:
+    no ids, rows or timestamps."""
+
+    def __init__(self, step: str, label: str, every_s: float = 30.0, every_n: int = 25):
+        self.step, self.label, self.every_s, self.every_n = step, label, every_s, every_n
+        self.done = self.resumed = 0
+        self.total: int | None = None
+        self._t, self._n = time.monotonic(), 0
+
+    def tick(self, resumed: bool = False, total: int | None = None) -> None:
+        self.done += 1
+        self.resumed += int(resumed)
+        self.total = total if total is not None else self.total
+        if self.done - self._n >= self.every_n or time.monotonic() - self._t >= self.every_s:
+            self.emit()
+
+    def emit(self, final: bool = False) -> None:
+        self._t, self._n = time.monotonic(), self.done
+        tot = f"/{self.total}" if self.total is not None else ""
+        log(f"{self.step}: {self.label} {self.done}{tot} row groups (resumed {self.resumed})" + (" done" if final else ""))
+
+
 # ---------------------------------------------------------------------------------------------- the checkpoint
 class Checkpoint:
     def __init__(self, step: str, key: str, directory: Path, *, resume: bool = True, fail_after: int | None = None,
