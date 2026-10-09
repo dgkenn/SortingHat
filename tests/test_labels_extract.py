@@ -646,6 +646,37 @@ def test_silver_report_is_aggregate_only_with_small_cell_suppression():
     assert "50000" not in text and "T12:00" not in text
 
 
+def _report_result(site_sizes, pos_by_site, lab="E5"):
+    """A hand-built SilverResult (labels + cases only) to exercise silver_report's suppression."""
+    ids, sites, vals = [], [], []
+    for s, n in site_sizes.items():
+        for i in range(n):
+            ids.append(f"{s}-{i}"); sites.append(s); vals.append(i < pos_by_site[s])
+    labels = pd.DataFrame({lab: pd.array(vals, dtype="boolean")}, index=pd.Index(ids, name="case_id"))
+    cases = pd.DataFrame({"case_id": ids, "person_id": range(len(ids)), "t0": T0, "SiteID": sites})
+    return ex.SilverResult(labels=labels, events=pd.DataFrame(), cases=cases, fired={}, label_status={lab: "full"},
+                           anchor_status={}, gaps=[], diagnostics={})
+
+
+def test_per_site_prevalence_is_suppressed_whenever_its_count_is_suppressed():
+    # A: 394/1504 (26.2%) is hidden only by COMPLEMENTARY suppression (B has 2 positives, < 11, so A would be
+    # recoverable as total - others); showing 0.262 * 1504 would undo it. n and prevalence must come from one table.
+    res = _report_result({"A": 1504, "B": 12, "C": 8032}, {"A": 394, "B": 2, "C": 2912})
+    per = ex.silver_report(res)["per_label"]["E5"]
+    assert per["n_positive"] == 394 + 2 + 2912 and per["prevalence"] == round(3308 / 9548, 4)
+    assert per["per_site"]["B"] == {"n_positive": SUPPRESSED, "prevalence": SUPPRESSED}
+    assert per["per_site"]["A"] == {"n_positive": SUPPRESSED, "prevalence": SUPPRESSED}          # complementary
+    assert per["per_site"]["C"] == {"n_positive": 2912, "prevalence": round(2912 / 8032, 4)}
+
+
+def test_no_report_cell_shows_prevalence_without_its_count():
+    res = many_patients_fixture(30).run()
+    for lab, per in ex.silver_report(res)["per_label"].items():
+        if isinstance(per, dict):
+            for s, cell in per["per_site"].items():
+                assert (cell["n_positive"] == SUPPRESSED) <= (cell["prevalence"] == SUPPRESSED), (lab, s)
+
+
 def test_complementary_suppression_hides_the_second_cell():
     assert ex._suppress_group({"a": 5, "b": 40, "c": 60}, 105) == {"a": SUPPRESSED, "b": SUPPRESSED, "c": 60}
     assert ex._suppress_group({"a": 5, "b": 3, "c": 60}, 68) == {"a": SUPPRESSED, "b": SUPPRESSED, "c": 60}

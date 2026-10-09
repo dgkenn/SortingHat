@@ -1162,6 +1162,8 @@ def silver_report(res: SilverResult, *, site_col: str = "SiteID") -> dict:
         sup = _suppress_group(pos_by_site, total_pos)
         for s in sites:
             rep["per_label"][lab]["per_site"][s]["n_positive"] = sup[s]
+            if sup[s] == SUPPRESSED:     # primary OR complementary suppression: a shown prevalence * n_cases would
+                rep["per_label"][lab]["per_site"][s]["prevalence"] = SUPPRESSED   # recover the hidden count
     # per-anchor firing counts
     fire: Counter = Counter()
     fire_site: dict = {}
