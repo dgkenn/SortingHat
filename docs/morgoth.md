@@ -66,6 +66,20 @@ multi-class head: 12 probabilities x 3 = 36 columns, plus `n_missing_channels`, 
 reference's EEG-level step is 1 s). Windows failing the project QC (>= 60% usable, >= 8 of 10 minimum electrodes) get NaN features.
 CPU cost with the real weights: roughly 7 to 40 s per recording at a 10-s step on 4 threads (60 snippets x 5 heads plus 600 one-second spike snippets).
 
+**Heads run by default, and speed (2026-10-09).** `scripts/extract_rungs.py --morgoth-heads` defaults to the heads the plan needs: `normal`,
+`bs`, `slowing`, `iiic` (`heads.plan_heads()`). `spikes` (600 one-second snippets) and `spikeloc` (a fifth 10-s head) are **E3 positive-control
+extras**: about 35% of the model time and not used by the ladder; add them with `--morgoth-heads normal,bs,spikes,slowing,spikeloc,iiic`. The columns
+and values of the heads that run are unchanged (they are a subset of the six-head columns; tested). A `--morgoth-dir` holds one head set
+(`run_info.json`): to resume a directory begun with the old six-head default, pass the six names, or start a new directory.
+Measured on one CPU thread, synthetic 700-s recording, all six windows, CPU seconds per recording (CBraMod + MORGOTH, noisy shared machine):
+old 52 (six heads, 64 snippets per pass, QC run once per rung, one normalisation per head); same six heads after the changes 44 (1.2x, outputs
+equal to float rounding, max abs difference 3e-7); default four heads 33 (1.6x); default four heads with `--step-s 10` 19 (2.8x; this changes the
+features, it is a coarser snippet grid, and is not the default). Each model already ran once over the primary window and the nested windows pooled
+its per-snippet outputs; what changed is shared QC / channel selection, one normalised tensor shared by the 10-s heads, a vectorised normaliser,
+8 snippets per forward pass (small batches stay in cache; 64 was ~20% slower on 1 thread), `torch.inference_mode`, and per-stage timers in the
+run summary. About 87% of what remains is the four 10-s transformer forward passes (~7 s each at a 5-s step), which float-exact CPU tricks did
+not reduce (tried: `torch.compile` with freezing 8%, hand-written attention 0%, 2 threads per shard 1.1x speed for 1.4x CPU). Keep 4 shards x 1 thread.
+
 ## 3. Weights obtained
 
 Downloaded 2026-10-08 with `scripts/heedb_run.sh python3 -m sortinghat.morgoth.weights --fetch --eeg-level --heads normal,bs,spikes,slowing,spikeloc,iiic,sleep3`
