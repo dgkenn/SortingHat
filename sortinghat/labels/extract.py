@@ -555,7 +555,7 @@ def classify_store(store, ctx: _Ctx, on_error: Callable | None = None) -> Classi
     cp = ck.active()
 
     def units(table: str, fn: Callable, cols: list[str], extra=None, label: str | None = None) -> pd.DataFrame:
-        prog = ck.UnitProgress("silver_labels", label or table)
+        prog = ck.UnitProgress("silver_labels", label or table, enabled=cp is not None)
         key = ck.digest("silver-unit-v2", table, fn.__name__, cols, ctx.cases, ctx.cfg, ctx.cm.raw, ck.digest(ctx.index.state()),
                         extra) if cp is not None else None
         loaded: dict = {}
@@ -613,7 +613,7 @@ def _concept_index(store, ctx: _Ctx, on_error: Callable | None, cp) -> ConceptIn
             return ctx.index
     failed = []
     handler = on_error if on_error is None else (lambda k, e: (failed.append(k), on_error(k, e)))
-    prog = ck.UnitProgress("silver_labels", "concept")
+    prog = ck.UnitProgress("silver_labels", "concept", enabled=cp is not None)
     for _uid, batches, total in data_io.iter_omop_units("concept", columns=COLUMNS["concept"], s3=store, on_error=handler,
                                                        batch_rows=1 << 20):
         for b in batches:

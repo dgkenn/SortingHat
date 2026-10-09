@@ -481,7 +481,7 @@ class StoreSources:
                 return False
             loaded[uid] = got
             return True
-        prog = ck.UnitProgress(cp.step if cp is not None else "cohort", what)
+        prog = ck.UnitProgress(cp.step if cp is not None else "cohort", what, enabled=cp is not None)
         for uid, batches, total in data_io.iter_omop_units(table[len("omop_"):], person_ids=pids, columns=columns, s3=self.s3,
                                                            batch_rows=1 << 18, skip=have if cp is not None else None):
             if batches is None:
