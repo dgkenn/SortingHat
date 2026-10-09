@@ -180,6 +180,27 @@ def test_shock_from_systolic_and_diastolic_when_no_map():
     assert one(f, "E2")[2] == ["E2_shock"]
 
 
+def test_shock_from_combined_bp_text_rows_and_epic_unit_spelling():
+    """S0001/S0002 chart BP as one non-numeric 'SBP/DBP' text row per reading; Epic numeric rows say 'millimeter of mercury'."""
+    def text_rows(fx, p):
+        for i in range(0, 40, 5):
+            fx.lab(p, -2 + i / 60.0, "BLOOD PRESSURE", np.nan, None, vtext="70/35")        # MAP 46.7
+    assert one(text_rows, "E2")[2] == ["E2_shock"]
+
+    def epic_numeric(fx, p):
+        for i in range(0, 40, 5):
+            fx.lab(p, -2 + i / 60.0, "Systolic-Epic", 70, "millimeter of mercury")
+            fx.lab(p, -2 + i / 60.0, "Diastolic-Epic", 35, "millimeter of mercury")
+    assert one(epic_numeric, "E2")[2] == ["E2_shock"]
+
+    def junk(fx, p):                                    # free text, implausible and inverted pairs, a position field: ignored
+        for i in range(0, 40, 5):
+            for txt in ("Right arm", "300/20", "35/70", "999/99"):
+                fx.lab(p, -2 + i / 60.0, "BLOOD PRESSURE", np.nan, None, vtext=txt)
+            fx.lab(p, -2 + i / 60.0, "BP position", np.nan, None, vtext="70/35")
+    assert not one(junk, "E2")[1]
+
+
 # ------------------------------------------------------------------------------------------------ E6 / E7
 def e6_fixture(fx, p, abx_days=4, route="IV", organ=True, agent="VANCOMYCIN 1 G IV"):
     fx.lab(p, -5, "Blood culture", np.nan, None, vtext="No growth")

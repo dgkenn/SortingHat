@@ -46,6 +46,8 @@ unit_aliases:
   "meq/l": "meq/l"
   "mm[hg]": "mmhg"
   "mm hg": "mmhg"
+  "millimeterofmercury": "mmhg"     # Epic sites (S0001/S0002) write "millimeter of mercury"
+  "mmofmercury": "mmhg"
   "mmhg": "mmhg"
   "[degf]": "degf"
   "degf": "degf"
@@ -261,21 +263,30 @@ support_items:
     name_exclude: 'pulmonary|\bpap\b|\bcpp\b|cerebral|perfusion|intracranial|\bicp\b|target|goal|set|alarm|limit|\bmap kinase'
     unit: "mmHg"
     plausible: [10, 300]
-    conversions: {"mmHg": {mul: 1}, "kPa": {mul: 7.50062}}
+    conversions: {"mmHg": {mul: 1}, "kPa": {mul: 7.50062}, "@": {mul: 1}}
   sbp:
     codes: [{system: LOINC, code: "8480-6", unit: "mmHg"}]
-    name_regex: 'systolic|\bsbp\b'
+    name_regex: 'systolic|\bsbp\b|\bsyst bp\b'
     name_exclude: 'pulmonary|\bpap\b|target|goal|set|alarm|limit|home|orthostatic'
     unit: "mmHg"
     plausible: [20, 350]
-    conversions: {"mmHg": {mul: 1}}
+    conversions: {"mmHg": {mul: 1}, "@": {mul: 1}}      # "@" = placeholder unit on the S-site LFA blood-pressure rows (plausibility-guarded)
   dbp:
     codes: [{system: LOINC, code: "8462-4", unit: "mmHg"}]
-    name_regex: 'diastolic|\bdbp\b'
+    name_regex: 'diastolic|\bdbp\b|\bdias bp\b'
     name_exclude: 'pulmonary|\bpap\b|target|goal|set|alarm|limit|home|orthostatic'
     unit: "mmHg"
     plausible: [5, 250]
-    conversions: {"mmHg": {mul: 1}}
+    conversions: {"mmHg": {mul: 1}, "@": {mul: 1}}
+
+# Combined blood-pressure rows: S0001/S0002 chart the bulk of BP as ONE row per reading with the text "SBP/DBP" in
+# value_source_value and no number (measurement_source_value "BLOOD PRESSURE" / "Blood Pressure-Epic" / "Systolic/Diastolic-LFA...").
+# classify_measurements splits a strictly matching "NNN/NN" text into an sbp row and a dbp row (same timestamp; plausibility from the
+# sbp / dbp specs; sbp must exceed dbp). Rows that do not match the pattern ("Right arm", free text) are ignored.
+bp_text:
+  name_regex: '^blood pressure(-epic)?$|^systolic/diastolic'
+  name_exclude: 'pulmonary|\bpap\b|target|goal|\bset\b|alarm|limit|home|orthostatic|position|side|cuff'
+  value_regex: '^\s*(\d{2,3})\s*/\s*(\d{2,3})\s*(?:mm\s?hg)?\s*$'
 
 # =====================================================================================================
 # 2. Qualitative results (omop_measurement rows read as positive / negative)

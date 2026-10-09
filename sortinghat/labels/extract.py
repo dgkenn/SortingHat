@@ -309,6 +309,23 @@ def classify_measurements(d: pd.DataFrame, ctx: _Ctx) -> pd.DataFrame:
                     "person_id": d["person_id"].iloc[ii].to_numpy(), "t_event": t.iloc[ii].to_numpy(), "item": item,
                     "basis": g["basis"].to_numpy(), "value": np.nan, "status": sts,
                     "src_text": names.iloc[ii].to_numpy(), "approx": approx.iloc[ii].to_numpy()}))
+    # combined "SBP/DBP" text rows (S0001/S0002 chart most BP this way, no number) -> one sbp row + one dbp row
+    if cm.bp_name_re is not None and cm.bp_value_re is not None and "value_source_value" in d and "sbp" in cm.specs:
+        bpu = np.array([cm.is_bp_text_name(u) for u in nuniq] + [False], dtype=bool)
+        ci = np.flatnonzero(bpu[ncodes])
+        if len(ci):
+            pr = _txt(d, "value_source_value").iloc[ci].astype(str).str.extract(cm.bp_value_re).astype(float)
+            sb_, db_ = pr.iloc[:, 0].to_numpy(), pr.iloc[:, 1].to_numpy()
+            (slo, shi), (dlo, dhi) = cm.specs["sbp"].plausible, cm.specs["dbp"].plausible
+            good = (sb_ >= slo) & (sb_ <= shi) & (db_ >= dlo) & (db_ <= dhi) & (sb_ > db_)       # NaN compares False
+            ctx.count("bp_text_rows_split", int(good.sum()))
+            ctx.count("bp_text_rows_unparsed", int((~good).sum()))
+            gi = ci[good]
+            for item, vals in (("sbp", sb_[good]), ("dbp", db_[good])):
+                out.append(pd.DataFrame({
+                    "person_id": d["person_id"].iloc[gi].to_numpy(), "t_event": t.iloc[gi].to_numpy(), "item": item,
+                    "basis": "bp_text", "value": vals, "status": "ok", "src_text": names.iloc[gi].to_numpy(),
+                    "approx": approx.iloc[gi].to_numpy()}))
     # tox screens: rows that no item claimed
     tox_u = [cm.classify_tox_name(u) for u in nuniq]
     tox_flag = np.array([bool(x) for x in tox_u] + [False], dtype=bool)      # last slot: missing name (code -1)

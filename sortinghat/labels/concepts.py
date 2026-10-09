@@ -105,6 +105,10 @@ class ConceptMap:
             for key, d in r.get(sec, {}).items():
                 self.specs[key] = self._spec(key, kind, d)
         self.result_re = {k: re.compile(v, re.I) for k, v in r.get("result_text", {}).items()}
+        bp = r.get("bp_text") or {}                       # combined "SBP/DBP" text rows (split into sbp + dbp upstream)
+        self.bp_name_re = re.compile(bp["name_regex"], re.I) if bp.get("name_regex") else None
+        self.bp_excl_re = re.compile(bp["name_exclude"], re.I) if bp.get("name_exclude") else None
+        self.bp_value_re = re.compile(bp["value_regex"], re.I) if bp.get("value_regex") else None
         self.tox = {a: (re.compile(d["name_regex"], re.I), tuple(d["in_hospital_drugs"]))
                     for a, d in r.get("tox_agents", {}).items()}
         self.tox_context_re = re.compile(r["tox_context_regex"], re.I)
@@ -248,6 +252,13 @@ class ConceptMap:
                         and not (sp.excl_re is not None and sp.excl_re.search(low)))
             self._name_cache[key] = hit
         return hit
+
+    def is_bp_text_name(self, name) -> bool:
+        """True for a measurement name that carries a combined ``SBP/DBP`` text value (``bp_text`` section)."""
+        if self.bp_name_re is None or name is None or (isinstance(name, float) and np.isnan(name)):
+            return False
+        low = str(name).strip().lower()
+        return bool(self.bp_name_re.search(low)) and not (self.bp_excl_re is not None and self.bp_excl_re.search(low))
 
     def classify_tox_name(self, name) -> tuple[str, ...]:
         """Tox-screen agents named in a measurement name (needs screen/drug context; history/plan text excluded)."""
