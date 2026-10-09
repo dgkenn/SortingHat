@@ -191,5 +191,5 @@ availability_rules:
     bin_fraction: 0.10
     min_share: 0.10
     min_bin_cases: 50
-    keep_cases_with_source: false
+    keep_cases_with_source: true    # outcome-symmetric: in absent bins keep every case WITH a source row (pos or neg), NA the rest (D-153)
     reason: culture_source_absent

@@ -31,7 +31,7 @@ import pandas as pd
 
 REASON_CULTURE_SOURCE_ABSENT = "culture_source_absent"
 DEFAULT_RULE = {"enabled": True, "source_item": None, "window_hours": None, "bin_fraction": 0.10, "min_share": 0.10,
-                "min_bin_cases": 50, "keep_cases_with_source": False, "reason": REASON_CULTURE_SOURCE_ABSENT}
+                "min_bin_cases": 50, "keep_cases_with_source": True, "reason": REASON_CULTURE_SOURCE_ABSENT}
 
 
 def leaf_window(anchor_cfg: dict, label: str, item: str) -> list[float]:
