@@ -101,23 +101,43 @@ def snippet_valid(sn: np.ndarray) -> bool:
     return not np.all((c.max(axis=1) - c.min(axis=1)) < 1)
 
 
-def normalise_snippets(x: np.ndarray, starts: np.ndarray, win: int) -> tuple[np.ndarray, np.ndarray]:
+def snippets_valid(sn: np.ndarray) -> np.ndarray:
+    """Vectorised ``snippet_valid`` over a stack ``sn`` (B, C, win) in uV -> (B,) bool. Same rules and the same arithmetic."""
+    present = ~np.isnan(sn).any(axis=2)                                   # (B, C) electrodes with data
+    n = present.sum(axis=1)
+    a = np.abs(sn)
+    p3 = present[:, :, None]
+    small = np.all((a < 2) | ~p3, axis=(1, 2))
+    big = np.all((a > 3000) | ~p3, axis=(1, 2))
+    mean = np.where(p3, sn, 0.0).sum(axis=1, keepdims=True) / np.maximum(n, 1)[:, None, None]
+    c = sn - mean
+    rng = np.where(p3, c, -np.inf).max(axis=2) - np.where(p3, c, np.inf).min(axis=2)      # (B, C)
+    flat = np.all((rng < 1) | ~present, axis=1)
+    return (n > 0) & ~small & ~big & ~flat
+
+
+def normalise_snippets(x: np.ndarray, starts: np.ndarray, win: int, chunk: int = 32) -> tuple[np.ndarray, np.ndarray]:
     """Cut ``x`` (C, T) at ``starts`` -> (S, C, win) in model units ([-1, 1]) and a (S,) validity mask.
     Absent (NaN) channels are zero-filled after the common average over the present ones and then scaled like any
-    other (a constant row -> -1), as in the reference."""
+    other (a constant row -> -1), as in the reference. Vectorised over ``chunk`` snippets at a time (no per-snippet
+    Python loop); element-wise identical to the per-snippet formulation."""
     S, C = len(starts), x.shape[0]
     out = np.zeros((S, C, win), dtype=np.float32)
     valid = np.zeros(S, bool)
-    for i, s in enumerate(starts):
-        sn = x[:, s:s + win]
-        valid[i] = snippet_valid(sn)
-        if not valid[i]:
+    for a in range(0, S, chunk):
+        st = np.asarray(starts[a:a + chunk], dtype=np.int64)
+        sn = np.stack([x[:, s:s + win] for s in st])                      # (B, C, win)
+        v = snippets_valid(sn)
+        valid[a:a + len(st)] = v
+        if not v.any():
             continue
-        present = ~np.isnan(sn).any(axis=1)
-        y = np.zeros_like(sn)
-        y[present] = sn[present] - sn[present].mean(axis=0, keepdims=True)
+        sn = sn[v]
+        present = ~np.isnan(sn).any(axis=2)[:, :, None]
+        n = present.sum(axis=1, keepdims=True)
+        mean = np.where(present, sn, 0.0).sum(axis=1, keepdims=True) / n
+        y = np.where(present, sn - mean, 0.0)
         y = np.clip(y, -500.0, 500.0)
-        lo, hi = y.min(axis=1, keepdims=True), y.max(axis=1, keepdims=True)
+        lo, hi = y.min(axis=2, keepdims=True), y.max(axis=2, keepdims=True)
         span = np.where(hi - lo > 0, hi - lo, 1.0)
-        out[i] = ((y - lo) / span * 200.0 - 100.0) / 100.0       # MinMaxScaler((-100, 100)) then / 100
+        out[a:a + len(st)][v] = ((y - lo) / span * 200.0 - 100.0) / 100.0       # MinMaxScaler((-100, 100)) then / 100
     return out, valid

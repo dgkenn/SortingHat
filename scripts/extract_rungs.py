@@ -15,8 +15,18 @@ before) this one. Resume is per rung: a recording done for one rung only is fetc
 Same CLI conventions as the two (read their docstrings): ``--input``, ``--shard/--of``, ``--limit``, ``--torch-threads``
 (applied to both models), ``--windows``, ``--retry-permanent`` / ``--retry-reason``, ``--no-onset``, ``--compute-failed``,
 CBraMod options (``--weights --fetch-weights --batch-size --reference --amp-policy --attention``) and MORGOTH options
-(``--backend --allow-stub --heads --step-s --spike-step-s``). ``--rungs cbramod,morgoth`` (default both) restricts the run.
-``--timeout`` bounds the shared fetch and, separately, each model's processing. Run one process per shard.
+(``--backend --allow-stub --morgoth-heads --morgoth-batch-size --step-s --spike-step-s``). ``--rungs cbramod,morgoth`` (default
+both) restricts the run. ``--timeout`` bounds the shared fetch and, separately, each model's processing. Run one process per shard.
+
+Speed (CPU-bound, ~49 CPU-s per recording on 1 thread before; stdout reports per-stage seconds): each model runs ONCE over the
+primary window's segments / snippets and every nested window (20 s, 1, 2, 5, 10 min) pools those same outputs; channel selection
+and QC are computed once for both rungs; the 10-s MORGOTH heads share one filtered series and one normalised snippet tensor;
+MORGOTH runs 8 snippets per forward pass (cache-sized; ``--morgoth-batch-size``), under ``torch.inference_mode``.
+``--morgoth-heads`` defaults to the heads the plan needs: normal, bs (burst suppression), slowing, iiic. ``spikes`` (600 one-second
+snippets) and ``spikeloc`` are E3 positive-control extras, about 35% of the model time, off by default; add them with
+``--morgoth-heads normal,bs,spikes,slowing,spikeloc,iiic`` (columns of the heads that run are unchanged). A ``--morgoth-dir`` written
+with another head set is refused (run_info.json), so resuming a directory started with all six heads needs that full list.
+Thread layout: keep 1 torch thread per shard with one shard per core (2 threads/shard used ~1.3-1.5x the CPU for ~1.1x the speed).
 
 Records go ONLY to the two ``local_only/`` directories (mode 0600). stdout and ``--summary`` carry aggregates only
 (counts < 11 print as "<11").
@@ -45,8 +55,8 @@ from sortinghat.embed import weights as W  # noqa: E402
 from sortinghat.embed.cbramod import AMP_POLICIES, REFERENCES, Embedder, EmbedConfig  # noqa: E402
 from sortinghat.embed.store import require_local_only, write_meta, write_part as write_embed_part  # noqa: E402
 from sortinghat.morgoth.features import MorgothConfig  # noqa: E402
-from sortinghat.morgoth.heads import HEADS, default_heads, feature_names  # noqa: E402
-from sortinghat.morgoth.model import make_backend  # noqa: E402
+from sortinghat.morgoth.heads import HEADS, feature_names, plan_heads  # noqa: E402
+from sortinghat.morgoth.model import DEFAULT_BATCH, make_backend  # noqa: E402
 from sortinghat.rungs import DEFAULT_TIMEOUT_S, RUNGS, stream_rungs  # noqa: E402
 from sortinghat.safe_output import safe_print, safe_quantiles, safe_write_json, suppress_count  # noqa: E402
 
@@ -73,6 +83,7 @@ class RungState:
         self.feats: dict[str, list[float]] = {}
         self.buf_rows: list[dict] = []
         self.buf_ledger: list[list] = []
+        self.stage_s: Counter = Counter()                  # stage -> seconds summed over successful recordings (aggregate)
 
     def add(self, rid: str, res, feat_names=()):
         self.attempted += 1
@@ -83,6 +94,7 @@ class RungState:
             self.n_ok += 1
             self.fetch_s.append(res.fetch_s)
             self.proc_s.append(res.process_s)
+            self.stage_s.update(res.stage_s)
             self.buf_rows += [{"recording_id": rid, "onset_offset_s": float(res.onset_s or 0.0), **r} for r in res.rows]
             for r in res.rows:
                 if self.name == "cbramod":
@@ -139,7 +151,11 @@ def main(argv=None, s3=None, embedder=None, backend=None) -> int:
     # MORGOTH
     ap.add_argument("--backend", choices=("morgoth", "stub"), default="morgoth")
     ap.add_argument("--allow-stub", action="store_true")
-    ap.add_argument("--heads", default=",".join(default_heads()), help="comma-separated: " + ",".join(HEADS))
+    ap.add_argument("--morgoth-heads", "--heads", dest="heads", default=",".join(plan_heads()),
+                    help="comma-separated: " + ",".join(HEADS) + ". Default = the heads the plan needs; spikes and spikeloc are "
+                         "E3 positive-control extras (about 35%% of the model time)")
+    ap.add_argument("--morgoth-batch-size", type=int, default=DEFAULT_BATCH,
+                    help="snippets per MORGOTH forward pass (small is faster on 1 CPU thread: cache-sized)")
     ap.add_argument("--step-s", type=float, default=5.0)
     ap.add_argument("--spike-step-s", type=float, default=1.0)
     ap.add_argument("--summary", default=None, help="aggregate JSON (safe_write_json)")
@@ -218,14 +234,15 @@ def main(argv=None, s3=None, embedder=None, backend=None) -> int:
             if a.backend == "stub" and not a.allow_stub:
                 raise SystemExit("--backend stub on a real run needs --allow-stub (its output is meaningless)")
             try:
-                backend = make_backend(a.backend, heads=heads, threads=a.torch_threads)
+                backend = make_backend(a.backend, heads=heads, threads=a.torch_threads, batch_size=a.morgoth_batch_size)
             except FileNotFoundError as e:
                 raise SystemExit(str(e))
         info = xmor.run_info(getattr(backend, "name", "custom"), mcfg)
         info_path = mg_dir / xmor.RUN_INFO
         if info_path.exists() and json.loads(info_path.read_text()) != info:
             raise SystemExit(f"{xmor.RUN_INFO} in --morgoth-dir differs from this run's settings (backend / heads / steps / "
-                             "weights); use a new --morgoth-dir so one directory never mixes configurations")
+                             "weights); use a new --morgoth-dir so one directory never mixes configurations (to resume one begun with the old "
+                             "six-head default pass --morgoth-heads normal,bs,spikes,slowing,spikeloc,iiic)")
         info_path.write_text(json.dumps(info, indent=2, sort_keys=True))
         os.chmod(info_path, 0o600)
 
@@ -279,6 +296,16 @@ def main(argv=None, s3=None, embedder=None, backend=None) -> int:
                   "wall_seconds_per_recording": round(wall / n_attempt_total, 2) if n_attempt_total else None}
     safe_print(f"shard {a.shard}/{a.of} | recordings streamed (one fetch each): {summ['recordings_streamed']} | wall "
                f"s/recording: {summ['wall_seconds_per_recording']} | torch threads {a.torch_threads}")
+    stage_mean = {}
+    for st in states.values():
+        for k, v in st.stage_s.items():
+            stage_mean[k] = stage_mean.get(k, 0.0) + v
+    n_ok = max((st.n_ok for st in states.values()), default=0)
+    stage_mean = {k: round(v / n_ok, 2) for k, v in sorted(stage_mean.items())} if n_ok >= 11 else {}
+    if stage_mean:
+        summ["stage_seconds_per_recording"] = stage_mean
+        safe_print("stage s/recording (mean over successes; model forward = *.forward, morgoth.model.<head>):",
+                   ", ".join(f"{k} {v}" for k, v in stage_mean.items()))
     for r, st in states.items():
         if r == "cbramod":
             s = xemb.summarize(st.attempted, st.n_ok, st.reasons, st.elapsed, st.fetch_s, st.proc_s, st.bytes, st.retries,

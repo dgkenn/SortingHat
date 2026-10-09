@@ -40,7 +40,8 @@ class HeadSpec:
     binary: bool
     window_s: float = 10.0          # model input length
     size_bytes: int = 0             # from the names-only probe
-    default: bool = True            # fetched and run by default
+    default: bool = True            # fetched by default (weights --fetch)
+    plan: bool = True               # run by default by the extractors: False = E3 positive-control extra (costly, not in the plan)
 
     @property
     def n_out(self) -> int:
@@ -55,9 +56,9 @@ class HeadSpec:
 HEADS: dict[str, HeadSpec] = {h.name: h for h in (
     HeadSpec("normal", "NORMAL.pth", ("abnormal",), True, size_bytes=70108410),
     HeadSpec("bs", "BS.pth", ("burst_suppression",), True, size_bytes=70108410),
-    HeadSpec("spikes", "SPIKES.pth", ("spike",), True, window_s=1.0, size_bytes=70108410),
+    HeadSpec("spikes", "SPIKES.pth", ("spike",), True, window_s=1.0, size_bytes=70108410, plan=False),
     HeadSpec("slowing", "SLOWING.pth", ("none", "focal", "generalized"), False, size_bytes=70113338),
-    HeadSpec("spikeloc", "FOCGENSPIKES.pth", ("none", "focal", "generalized"), False, size_bytes=70113402),
+    HeadSpec("spikeloc", "FOCGENSPIKES.pth", ("none", "focal", "generalized"), False, size_bytes=70113402, plan=False),
     HeadSpec("iiic", "IIIC.pth", ("other", "seizure", "lpd", "gpd", "lrda", "grda"), False, size_bytes=70120570),
     HeadSpec("sleep3", "SLEEP.pth", ("awake", "n1", "n2"), False, size_bytes=70113274, default=False),
 )}
@@ -74,7 +75,16 @@ BURDEN_THRESHOLD = 0.5
 
 
 def default_heads() -> tuple[str, ...]:
+    """Heads whose weights are fetched by default (``weights --fetch``) and that ``extract_morgoth`` runs by default."""
     return tuple(n for n, h in HEADS.items() if h.default)
+
+
+def plan_heads() -> tuple[str, ...]:
+    """Heads the research plan needs, run by ``extract_rungs`` unless ``--morgoth-heads`` says otherwise: normal, burst
+    suppression, slowing, IIIC. ``spikes`` (600 one-second snippets) and ``spikeloc`` (a fifth 10-s head) are E3
+    positive-control extras: about 35% of the per-recording model cost, not needed by the ladder. Same column names
+    and values for the heads that run (a subset of the full-set columns)."""
+    return tuple(n for n, h in HEADS.items() if h.default and h.plan)
 
 
 def feature_names(heads=None, stats=STATS) -> list[str]:

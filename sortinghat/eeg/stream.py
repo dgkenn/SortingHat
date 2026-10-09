@@ -115,6 +115,7 @@ class StreamResult:
     fetch_s: float = 0.0
     process_s: float = 0.0
     elapsed_s: float = 0.0
+    stage_s: dict[str, float] = field(default_factory=dict)   # per-stage seconds (aggregate timing only; extract_rungs)
 
     @property
     def retryable(self) -> bool:

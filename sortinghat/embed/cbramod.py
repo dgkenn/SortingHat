@@ -47,10 +47,12 @@ from dataclasses import asdict, dataclass, field
 import numpy as np
 
 from ..agent_safety import assert_not_restricted_in_agent
-from ..eeg.io import Recording, drop_dead_channels, read_edf, select_channels
+from ..eeg.io import Recording, read_edf
+from ..eeg.prep import RecordingPrep
 from ..eeg.pipeline import PAD_S
 from ..eeg.preprocess import PreprocessConfig, common_average_masked, preprocess
-from ..eeg.window import QCConfig, WindowQC, WindowSpec, all_windows, qc_recording
+from ..eeg.window import QCConfig, WindowQC, WindowSpec, all_windows
+from ..timing import stage
 
 CBRAMOD_CHANNELS = ("Fp1", "Fp2", "F3", "F4", "C3", "C4", "P3", "P4", "O1", "O2", "F7", "F8", "T3", "T4", "T5", "T6",
                     "Fz", "Cz", "Pz")
@@ -249,7 +251,7 @@ def pool_window(E: np.ndarray, attention: bool, tau: float):
     return mean, (w @ E.astype(np.float64)).astype(np.float32)
 
 
-def embed_prepared(prep: Prepared, embedder: Embedder, qcs: dict, cfg: EmbedConfig) -> EmbedResult:
+def embed_prepared(prep: Prepared, embedder: Embedder, qcs: dict, cfg: EmbedConfig, timers=None) -> EmbedResult:
     wanted = {k: sl for k, sl in prep.window_segments.items() if qcs[k].passes or cfg.compute_failed}
     need = np.zeros(len(prep.tokens), bool)
     for sl in wanted.values():
@@ -257,7 +259,8 @@ def embed_prepared(prep: Prepared, embedder: Embedder, qcs: dict, cfg: EmbedConf
     E = np.full((len(prep.tokens), EMB_DIM), np.nan, np.float32)
     ix = np.flatnonzero(need)
     if len(ix):
-        E[ix] = embedder.encode(prep.tokens[ix], prep.valid[ix])
+        with stage(timers, "cbramod.forward"):
+            E[ix] = embedder.encode(prep.tokens[ix], prep.valid[ix])
     rows = []
     for name, sl in prep.window_segments.items():
         q: WindowQC = qcs[name]
@@ -281,10 +284,12 @@ def embed_prepared(prep: Prepared, embedder: Embedder, qcs: dict, cfg: EmbedConf
 
 
 def embed_recording(src, embedder: Embedder, windows=None, qc_cfg: QCConfig | None = None,
-                    cfg: EmbedConfig | None = None) -> EmbedResult:
+                    cfg: EmbedConfig | None = None, *, shared: RecordingPrep | None = None, timers=None) -> EmbedResult:
     """Embeddings for one recording. ``src``: EDF path / file-like, or a ``Recording`` already read in uV with
     ``offset_s`` and ``meta['edf_duration_s']`` (as ``stream.fetch_window`` returns). Windows default to primary + nested
-    relative to the file start; the streaming wrapper shifts them by the D-109 onset. Raises on unreadable input."""
+    relative to the file start; the streaming wrapper shifts them by the D-109 onset. Raises on unreadable input.
+    ``shared`` (``eeg.prep.RecordingPrep``, built from the same Recording / windows / QC config) lets the MORGOTH rung reuse
+    this rung's channel selection and QC; ``timers`` (``timing.StageTimers``) collects per-stage seconds."""
     cfg = cfg or EmbedConfig()
     qc_cfg = qc_cfg or QCConfig()
     windows = dict(windows or all_windows())
@@ -296,13 +301,13 @@ def embed_recording(src, embedder: Embedder, windows=None, qc_cfg: QCConfig | No
         t0 = max(0.0, min(w.start_s for w in windows.values()) - PAD_S)
         t1 = max(w.end_s for w in windows.values()) + PAD_S
         rec = read_edf(src, start_s=t0, duration_s=t1 - t0, channels=list(CBRAMOD_CHANNELS))
-    rec = drop_dead_channels(select_channels(rec))          # exactly-constant channels are MISSING (D-110), not flat data
+    if shared is None or not shared.compatible(windows, qc_cfg):
+        shared = RecordingPrep(rec, windows, qc_cfg, timers)
+    rec = shared.rec                                        # exactly-constant channels are MISSING (D-110), not flat data
     if not rec.ch_names:
         raise ValueError("no usable EEG channels")
-    total = rec.meta.get("edf_duration_s", rec.offset_s + rec.duration_s)
-    notes = {"dead": rec.meta.get("dead_channels", []), "invalid_scaling": rec.meta.get("invalid_scaling_channels", [])}
-    qcs, ef = qc_recording(rec.data, rec.fs, rec.ch_names, rec.offset_s, windows, qc_cfg, rec_duration_s=total,
-                           channel_notes=notes)
+    notes = shared.notes
+    qcs, ef = shared.qc()
     status = {"n_channels": len(rec.ch_names), "missing": list(rec.meta.get("missing_channels", [])),
               "dead": notes["dead"], "invalid_scaling": notes["invalid_scaling"]}
     minimum = set(qc_cfg.minimum_channels)
@@ -316,14 +321,17 @@ def embed_recording(src, embedder: Embedder, windows=None, qc_cfg: QCConfig | No
                  "emb_valid_token_frac": float("nan"), "emb_frac_over_amp": float("nan"),
                  "emb_n_absent_channels": len(CBRAMOD_CHANNELS) - len(rec.ch_names), **nan_row} for k, q in qcs.items()]
         return EmbedResult(rows, qcs, status, 0)
-    pre = PreprocessConfig(target_fs=FS, notch_hz=cfg.notch_hz, band=tuple(cfg.band))
-    x, fs = preprocess(rec.data, rec.fs, pre)
-    if cfg.reference == "car":
-        disc = ef.flags["disconnected"].all(axis=1) if ef.flags["disconnected"].size else None
-        ep = int(round(qc_cfg.epoch_s * fs))
-        start = int(round((ef.start_s - rec.offset_s) * fs))
-        x = common_average_masked(x, ef.clean, ep, start, base_exclude=disc)
-    prep = prepare_segments(x, fs, rec.ch_names, rec.offset_s, ef, windows, cfg)
-    res = embed_prepared(prep, embedder, qcs, cfg)
+    with stage(timers, "cbramod.filter"):
+        pre = PreprocessConfig(target_fs=FS, notch_hz=cfg.notch_hz, band=tuple(cfg.band))
+        x, fs = preprocess(rec.data, rec.fs, pre)
+        if cfg.reference == "car":
+            disc = ef.flags["disconnected"].all(axis=1) if ef.flags["disconnected"].size else None
+            ep = int(round(qc_cfg.epoch_s * fs))
+            start = int(round((ef.start_s - rec.offset_s) * fs))
+            x = common_average_masked(x, ef.clean, ep, start, base_exclude=disc)
+    with stage(timers, "cbramod.segments"):
+        prep = prepare_segments(x, fs, rec.ch_names, rec.offset_s, ef, windows, cfg)
+    del x
+    res = embed_prepared(prep, embedder, qcs, cfg, timers)
     res.channel_status = status
     return res

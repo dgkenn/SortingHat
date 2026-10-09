@@ -10,6 +10,11 @@ The two extractors read the same 19 canonical channels (``CBRAMOD_CHANNELS`` and
 order, and ``read_edf`` keeps file order), so one decoded ``Recording`` serves both. Rungs run one after the other and
 each makes its own working copies, which are freed before the next starts: peak memory is the recording plus the
 larger rung's working set. Timeout: ``timeout_s`` bounds the shared fetch and, separately, each rung's processing.
+
+Shared work (speed-up, outputs unchanged): channel selection / dead-channel removal and the window QC are computed once
+(``eeg.prep.RecordingPrep``, lazily, by whichever rung runs first) instead of once per rung. Models run ONCE per recording
+over the primary window's snippets / segments; the nested windows pool those same outputs. ``StreamResult.stage_s`` carries
+per-stage seconds (fetch, qc, cbramod.*, morgoth.*), aggregate timing only.
 """
 
 from __future__ import annotations
@@ -19,14 +24,16 @@ import time
 from dataclasses import replace
 
 from .eeg.io import EDFError
+from .eeg.prep import RecordingPrep
 from .eeg.io import CANONICAL_19
 from .eeg.pipeline import PAD_S
 from .eeg.stream import (CHUNK_BYTES, DEFAULT_MAX_ATTEMPTS, MAX_FETCH_BYTES, ONSET_MAX_SEARCH_S, ONSET_MIN_ACTIVE,
                          Deadline, FailureReason, FetchStats, RecordingTimeout, StreamResult, _StreamError, _type_name,
                          classify_edf_error, fetch_window, find_signal_onset)
-from .eeg.window import WindowSpec, all_windows
+from .eeg.window import QCConfig, WindowSpec, all_windows
 from .embed.cbramod import CBRAMOD_CHANNELS, EmbedConfig, Embedder, embed_recording
 from .morgoth.features import MorgothConfig, process_morgoth
+from .timing import StageTimers
 
 assert set(CBRAMOD_CHANNELS) == set(CANONICAL_19)          # one decoded Recording must serve both rungs
 
@@ -53,6 +60,19 @@ def _run_stage(res: StreamResult, fn, timeout_s, clock):
     finally:
         res.process_s = clock() - t0
     return None
+
+
+class _LazyPrep:
+    """``RecordingPrep`` built on first use (inside a rung's deadline and error handling), then shared."""
+
+    def __init__(self, rec, windows, timers):
+        self._args, self._prep = (rec, windows, timers), None
+
+    def get(self) -> RecordingPrep:
+        if self._prep is None:
+            rec, windows, timers = self._args
+            self._prep = RecordingPrep(rec, windows, QCConfig(), timers)
+        return self._prep
 
 
 def stream_rungs(s3, key: str, *, embedder: Embedder | None = None, backend=None, embed_cfg: EmbedConfig | None = None,
@@ -104,12 +124,21 @@ def stream_rungs(s3, key: str, *, embedder: Embedder | None = None, backend=None
     shared.bytes_fetched, shared.n_requests, shared.n_retries = stats.bytes_fetched, stats.n_requests, stats.n_retries
 
     fetch_elapsed = clock() - t_start
+    timers = StageTimers()
+    timers.s["fetch"] = fetch_elapsed
+    prep = None
+    if rec is not None and len(rungs) > 1 and morgoth_cfg.qc == QCConfig():
+        prep = _LazyPrep(rec, windows, timers)                  # built inside the first rung's deadline, shared by both
     out: dict[str, StreamResult] = {}
-    for name in rungs:
+    for i, name in enumerate(rungs):
         res = replace(shared)                                   # own copy: onset, fetch stats, shared failure (if any)
+        before = dict(timers.s)
+        if i == 0:
+            before.pop("fetch")                                 # the shared fetch is booked on the first rung only
         if rec is not None:
             if name == "cbramod":
-                er = _run_stage(res, lambda: embed_recording(rec, embedder, windows=windows, cfg=embed_cfg),
+                er = _run_stage(res, lambda: embed_recording(rec, embedder, windows=windows, cfg=embed_cfg,
+                                                             shared=prep.get() if prep else None, timers=timers),
                                 timeout_s, clock)
                 if er is not None:
                     res.rows, res.qc = er.rows, er.qc
@@ -120,7 +149,9 @@ def stream_rungs(s3, key: str, *, embedder: Embedder | None = None, backend=None
                     res.n_invalid_min = int(st.get("n_invalid_min", 0))
                     res.ok = True
             else:
-                mr = _run_stage(res, lambda: process_morgoth(rec, windows, backend, morgoth_cfg), timeout_s, clock)
+                mr = _run_stage(res, lambda: process_morgoth(rec, windows, backend, morgoth_cfg,
+                                                             prep=prep.get() if prep else None, timers=timers),
+                                timeout_s, clock)
                 if mr is not None:
                     rows, info = mr
                     res.rows = rows
@@ -128,6 +159,7 @@ def stream_rungs(s3, key: str, *, embedder: Embedder | None = None, backend=None
                     res.n_missing_min = int(info["n_missing_channels"])
                     res.ok = True
         res.elapsed_s = fetch_elapsed + res.process_s
+        res.stage_s = {k: v - before.get(k, 0.0) for k, v in timers.s.items() if v - before.get(k, 0.0) > 0.0}
         out[name] = res
-    rec = None                                                  # release the window before the caller moves on
+    rec = prep = None                                           # release the window before the caller moves on
     return out

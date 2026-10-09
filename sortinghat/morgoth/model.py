@@ -22,6 +22,10 @@ from . import weights
 from .heads import HEADS, MORGOTH_CHANNELS, STANDARD_1020_INDEX, HeadSpec
 
 PATCH = 200          # samples per patch (1 s at 200 Hz)
+# Snippets per forward pass. Measured on 1 CPU thread (190-token, 12-layer, width-200 backbone): 4-16 snippets are ~20%
+# faster than 32-64 because the activations (GELU / LayerNorm / attention working set) then stay in the 4 MB L2; larger
+# batches only add cache misses. Results are batch-size invariant to float rounding (< 1e-6 in probability).
+DEFAULT_BATCH = 8
 
 
 class Backend(Protocol):
@@ -113,15 +117,19 @@ def input_chans() -> list[int]:
 class TorchBackend:
     name = "morgoth"
 
-    def __init__(self, cache: Path | None = None, *, threads: int | None = None, batch_size: int = 64):
+    def __init__(self, cache: Path | None = None, *, threads: int | None = None, batch_size: int = DEFAULT_BATCH,
+                 heads=None):
+        """``heads``: names whose checkpoints are loaded now (once per process, not on the first recording)."""
         import torch
         if threads:
             torch.set_num_threads(int(threads))
         self.cache = cache
-        self.batch_size = batch_size
+        self.batch_size = int(batch_size)
         self._models: dict[str, object] = {}
         import_backbone(weights.code_dir(cache))
         self._chans = input_chans()
+        for name in heads or ():
+            self._model(HEADS[name])
 
     def _model(self, head: HeadSpec):
         if head.name not in self._models:
@@ -142,17 +150,19 @@ class TorchBackend:
     def predict(self, head: HeadSpec, x: np.ndarray) -> np.ndarray:
         import torch
         m = self._model(head)
-        out = []
-        with torch.no_grad():
+        x = np.ascontiguousarray(x, dtype=np.float32)
+        out = np.empty((len(x), head.n_out), np.float32)
+        with torch.inference_mode():
             for i in range(0, len(x), self.batch_size):
-                b = torch.from_numpy(np.ascontiguousarray(x[i:i + self.batch_size]))
+                b = torch.from_numpy(x[i:i + self.batch_size])
                 b = b.reshape(b.shape[0], b.shape[1], -1, PATCH)            # B N (A T) -> B N A T
                 z = m(b, input_chans=self._chans)
-                out.append(torch.sigmoid(z) if head.binary else torch.softmax(z, dim=1))
-        return torch.cat(out).float().numpy()
+                out[i:i + len(b)] = (torch.sigmoid(z) if head.binary else torch.softmax(z, dim=1)).numpy()
+        return out
 
 
-def make_backend(kind: str = "auto", *, cache: Path | None = None, heads=None, threads: int | None = None):
+def make_backend(kind: str = "auto", *, cache: Path | None = None, heads=None, threads: int | None = None,
+                 batch_size: int = DEFAULT_BATCH):
     """``stub`` | ``morgoth`` | ``auto`` (morgoth when code + weights are cached and torch imports, else stub is NOT
     chosen silently: ``auto`` raises so a real-data run never degrades to the stub)."""
     if kind == "stub":
@@ -161,5 +171,5 @@ def make_backend(kind: str = "auto", *, cache: Path | None = None, heads=None, t
         if not weights.available(heads, cache):
             raise FileNotFoundError("MORGOTH weights/code are not in the cache; run "
                                     "`python3 -m sortinghat.morgoth.weights --fetch` (docs/morgoth.md)")
-        return TorchBackend(cache, threads=threads)
+        return TorchBackend(cache, threads=threads, batch_size=batch_size, heads=heads)
     raise ValueError(f"unknown backend {kind!r}")
