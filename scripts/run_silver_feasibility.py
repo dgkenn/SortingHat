@@ -40,7 +40,10 @@ Design
     validation  (a) leave-one-site-out across the two sites, (b) late-calendar temporal holdout within site (D-120).
     labels used the SAME structured silver labels train, tune (20% development rows) and score. No gold exists.
     intervals   99% within-site bootstrap (D-095; evaluation_sample_size.md s8) + the every-site rule, 95% intervals co-reported.
-    controls    leakage probes, sedative-excluded subset, severity strata, shuffled-label and permuted-EEG negative controls.
+    controls    leakage probes (site, duration, channel count and, informationally, the t0 sedation flag), sedative-excluded subset,
+                severity strata, shuffled-label and permuted-EEG negative controls.
+    sedation    "Sedation confounding" section: Delta of the headline rung within sedated and non-sedated strata of the SAME held-out
+                predictions (no refit), their difference with a bootstrap CI, and whether Baselines A / C already carry sedation features.
     audit       circularity audit: held-out silver-trained predictions' agreement with EEG-report findings vs with silver labels.
 """
 from __future__ import annotations
@@ -68,6 +71,7 @@ from sortinghat.metrics.bootstrap import bootstrap_ci, paired_bootstrap_delta  #
 from sortinghat.metrics.calibration import per_label_report  # noqa: E402
 from sortinghat.metrics.hypotheses import h3_severity_stratified  # noqa: E402
 from sortinghat.metrics.labels import e7_eligible  # noqa: E402
+from sortinghat.metrics.sedation import MIN_STRATUM_N as SED_MIN_STRATUM_N, stratified_delta  # noqa: E402
 from sortinghat.metrics.splits import late_temporal_holdout  # noqa: E402
 from sortinghat.models import (CBRAMOD_FROZEN_RUNG, COMMERCIAL_RUNGS, DEFAULT_RUNGS, MORGOTH_FINDINGS_RUNG,  # noqa: E402
                                LadderConfig, ModelData, RungSpec, delta_concentration_by_site, leakage_probes,
@@ -948,6 +952,68 @@ def commercial_gap_block(res, A: Assembly, cfg: LadderConfig, baseline: str) -> 
     return out
 
 
+# ==================================================================================== sedation confounding
+SEDATION_READING = ("If the EEG gain were merely a sedation proxy (EEG detects the sedative effect and sedation correlates with the "
+                    "silver labels), Delta would be about 0 within the non-sedated stratum. A non-sedated Delta whose 99% interval "
+                    "lies below 0 argues against that; an interval that includes 0 is inconclusive, not exculpatory, because that "
+                    "stratum has fewer patients than the whole set. A clearly more negative Delta in the sedated stratum (the "
+                    "difference of Deltas) is the other signature of a sedation contribution.")
+SEDATION_CAVEATS = ("The flag is exposure recorded at t0 (Baseline A on_t0 flags and/or the silver e4b sedative hint, "
+                    "--sedation-source); sedation that left no recorded administration, a bolus that ended before t0 and the depth "
+                    "of sedation are invisible to it, so the non-sedated stratum can still hold sedated patients. Models are the "
+                    "ones fitted on all training rows; the strata only split the held-out rows, so this differs from the "
+                    "sedative-excluded rerun (which also removes sedated patients from training and keeps few patients).")
+SEDATION_INTERACTION = {"run": False, "reason": "not run; it needs a refitted model grid for every scheme x baseline x fold (the "
+                                                "stratified Delta answers the same question from the stored predictions)"}
+
+
+def baseline_sedation_columns(baseline_sets: dict) -> dict:
+    """Which baseline sets carry sedation features (column counts only): Baseline A is 'severity + sedation' and C contains A."""
+    out = {}
+    for b, cols in baseline_sets.items():
+        sc = [c for c in cols if str(c).startswith("sed__")]
+        out[b] = {"sedation_columns": len(sc),
+                  "has_on_t0_class_flags": all(c in sc for c in ("sed__sedative__on_t0", "sed__opioid__on_t0")),
+                  "has_dose_or_count_columns": any(("__qty_" in c) or ("__n_" in c) for c in sc)}
+    return out
+
+
+def sedation_block(A: Assembly, results: dict, cfg: LadderConfig, headline: str, source: str = "either") -> dict:
+    """Sedation confounding (aggregate-only): (1) headline-rung Delta within sedated and non-sedated strata for every scheme x
+    baseline, from the SAME held-out per-patient d_i (no refit), with within-site bootstrap CIs and the difference of Deltas;
+    (2) whether Baselines A / C already contain sedation features, i.e. whether Delta is already conditional on recorded sedation.
+    The sedation leakage probe is in ``controls.leakage_probes``."""
+    sed = np.asarray(A.covariates["sedated"], bool)
+    n, n_sed = len(sed), int(sed.sum())
+    seen = sedation_flag(A.baseline, pd.DataFrame(), "baseline")          # the part of the flag the baseline's own class flags see
+    bl = baseline_sedation_columns(A.baseline_sets)
+    out: dict = {
+        "headline_rung": headline, "flag_source": source,
+        "flag": {"n_sedated": suppress_count(n_sed), "prevalence": suppress_proportion(n_sed, n),
+                 "per_site": {A.site_labels[s_]: {"n_sedated": suppress_count(int((sed & (A.sites == s_)).sum())),
+                                                  "prevalence": suppress_proportion(int((sed & (A.sites == s_)).sum()),
+                                                                                    int((A.sites == s_).sum()))}
+                              for s_ in sorted(np.unique(A.sites))},
+                 "n_flagged_only_by_silver_hint": suppress_count(int((sed & ~seen).sum()))},
+        "baseline_sedation_features": bl,
+        "baseline_adjustment": ("Baselines " + " and ".join(b for b, v in bl.items() if v["sedation_columns"]) +
+                                " already contain sedation features (Baseline A = severity + sedation; C contains A), so Delta is "
+                                "already the EEG increment over recorded t0 sedation exposure"
+                                if any(v["sedation_columns"] for v in bl.values()) else
+                                "NO baseline set contains sedation features in this run: Delta is not adjusted for recorded sedation")
+                               + ". What remains is residual confounding: sedation the recorded features miss (see caveats).",
+        "sedation_interaction_variant": SEDATION_INTERACTION,
+        "min_stratum_n": SED_MIN_STRATUM_N, "reading": SEDATION_READING, "caveats": SEDATION_CAVEATS, "by_scheme": {}}
+    for split, res in results.items():
+        flag = sed[np.asarray(res.eval_idx)]
+        out["by_scheme"][split] = {}
+        for b in A.baseline_sets:
+            rr = res.get(headline, b)
+            out["by_scheme"][split][b] = stratified_delta(
+                rr.d, flag, res.eval_sites, res.site_labels, cfg.n_boot, cfg.seed, cfg.alpha_primary, cfg.alpha_secondary)
+    return clean(out)
+
+
 # ==================================================================================================== driver
 def run_analysis(A: Assembly, a, store=None) -> dict:
     cfg = LadderConfig(n_boot=a.n_boot, seed=a.seed, include_e7=A.include_e7, temporal_test_fraction=a.temporal_fraction)
@@ -967,7 +1033,7 @@ def run_analysis(A: Assembly, a, store=None) -> dict:
     if headline is None:
         raise SystemExit("no qeeg./conn. feature columns found")
     R: dict = {"banner": BANNER, "headline_rung": headline, "intended_use": None, "ladder": {}, "discrimination_calibration": {},
-               "commercial_clean_gap": {"available": False}, "controls": {}, "circularity_audit": None}
+               "commercial_clean_gap": {"available": False}, "sedation": None, "controls": {}, "circularity_audit": None}
     R["intended_use"] = run_intended_use(A, a, cfg, headline, splits)             # D-145: reported FIRST
     taps: dict = {}
     mds: dict = {}
@@ -991,24 +1057,25 @@ def run_analysis(A: Assembly, a, store=None) -> dict:
         sp: {b: [lab for lab, v in R["discrimination_calibration"][sp][b]["auroc"]["baseline_only"].items()
                  if isinstance(v["pooled"], float) and v["pooled"] >= ANCHOR_OVERLAP_AUROC] for b in A.baseline_sets}
         for sp in splits}
+    R["sedation"] = sedation_block(A, results, cfg, headline, a.sedation_source)       # reads the held-out d_i only: no refit, cheap, runs even with --skip-controls
     if a.skip_controls:
         R["controls"] = {"skipped": "--skip-controls was set: the mandatory controls were NOT run; do not interpret Delta"}
         R["circularity_audit"] = {"note": "skipped with --skip-controls"}
         return R
     first = mds[splits[0]]
-    probes = leakage_probes(first.eeg[eeg_only_cols], first.sites, A.covariates["duration_s"] if np.isfinite(A.covariates["duration_s"]).any() else None,
-                            A.covariates["n_channels"] if np.isfinite(A.covariates["n_channels"]).any() else None, seed=a.seed)
+    dur = A.covariates["duration_s"] if np.isfinite(A.covariates["duration_s"]).any() else None
+    nch = A.covariates["n_channels"] if np.isfinite(A.covariates["n_channels"]).any() else None
+    sed = A.covariates["sedated"]                    # the sedation probe: how much sedation the representation alone encodes
+    probes = leakage_probes(first.eeg[eeg_only_cols], first.sites, dur, nch, seed=a.seed, sedated=sed, site_labels=A.site_labels)
     R["controls"]["leakage_probes"] = clean(probes)
-    if has_emb:             # the embeddings can encode site / recording length too: probe them as their own rung
+    if has_emb:             # the embeddings can encode site / recording length / sedation too: probe them as their own rung
         emb_cols = [c for c in A.eeg.columns if str(c).startswith(CBRAMOD_PREFIX)]
         R["controls"]["leakage_probes_cbramod_frozen"] = clean(leakage_probes(
-            first.eeg[emb_cols], first.sites, A.covariates["duration_s"] if np.isfinite(A.covariates["duration_s"]).any() else None,
-            A.covariates["n_channels"] if np.isfinite(A.covariates["n_channels"]).any() else None, seed=a.seed))
+            first.eeg[emb_cols], first.sites, dur, nch, seed=a.seed, sedated=sed, site_labels=A.site_labels))
     if has_mg:
         mg_cols = [c for c in A.eeg.columns if str(c).startswith(MORGOTH_PREFIX)]
         R["controls"]["leakage_probes_morgoth_findings"] = clean(leakage_probes(
-            first.eeg[mg_cols], first.sites, A.covariates["duration_s"] if np.isfinite(A.covariates["duration_s"]).any() else None,
-            A.covariates["n_channels"] if np.isfinite(A.covariates["n_channels"]).any() else None, seed=a.seed))
+            first.eeg[mg_cols], first.sites, dur, nch, seed=a.seed, sedated=sed, site_labels=A.site_labels))
     R["controls"]["by_scheme"] = {}
     n_small = max(200, min(a.n_boot, 1000))
     for split in splits:
@@ -1072,18 +1139,71 @@ def _f(x, nd=4):
     return f"{x:.{nd}f}"
 
 
+def _probe_rows(probes: dict, suffix: str) -> list[str]:
+    rows = []
+    for nm, p in probes.get("probes", {}).items():
+        info = " (informational)" if p.get("informational") else ""
+        rows.append(f"| {nm}{info}{suffix} | {_f(p['auroc'])} | {p['flagged']} |")
+        for sl, q in p.get("per_site", {}).items():
+            rows.append(f"| {nm}, within {sl}{suffix} | {_f(q['auroc'])} | n/a |")
+    return rows
+
+
+def _sedation_markdown(sb: dict | None) -> list[str]:
+    """"Sedation confounding" section: stratified Delta, difference of Deltas, baseline adjustment."""
+    if not sb:
+        return []
+    fl = sb["flag"]
+    L = ["", "## Sedation confounding", "",
+         f"Does the EEG gain reflect sedation? Flag: t0 sedative/opioid exposure (--sedation-source {sb['flag_source']}); sedated patients {fl['n_sedated']} "
+         f"(prevalence {fl['prevalence']}); per site " + ", ".join(f"{k}: {v['n_sedated']} ({v['prevalence']})" for k, v in fl["per_site"].items())
+         + f"; flagged only by the silver sedative hint (not by the baseline's class flags) {fl['n_flagged_only_by_silver_hint']}.", "",
+         "### Is sedation already in the baseline?", "", sb["baseline_adjustment"], "",
+         "| Baseline | sedation columns | sedative/opioid on_t0 flags | dose or count columns |", "|---|---|---|---|"]
+    for b, v in sb["baseline_sedation_features"].items():
+        L.append(f"| {b} | {v['sedation_columns']} | {v['has_on_t0_class_flags']} | {v['has_dose_or_count_columns']} |")
+    L += ["", "Sedation x EEG interaction variant: " + sb["sedation_interaction_variant"]["reason"] + ".", "",
+          f"### Sedation-stratified Delta (headline rung `{sb['headline_rung']}`; same held-out predictions, no refit)", "",
+          sb["reading"], "", sb["caveats"], "",
+          f"A stratum under {sb['min_stratum_n']} patients is not estimable; counts under 11 (and the other stratum's count) are shown as <11. "
+          "Intervals: within-site patient bootstrap, both strata and their difference from the same resamples.", "",
+          "| Scheme | Baseline | Stratum | n | Delta | 99% CI | 95% CI | every site < 0 | per-site Delta (n) |", "|---|---|---|---|---|---|---|---|---|"]
+    for split, per in sb["by_scheme"].items():
+        for b, v in per.items():
+            for nm, st in v["strata"].items():
+                ps = ", ".join(f"{s_}: {_f(c[nm]['delta'])} (n={c[nm]['n']})" for s_, c in v["per_site"].items())
+                if not st["estimable"]:
+                    L.append(f"| {split} | {b} | {nm} | {st['n']} | not estimable: {st['not_estimable']} | | | | {ps} |")
+                    continue
+                c99, c95 = st.get("ci_99_within_site") or {}, st.get("ci_95_within_site") or {}
+                L.append(f"| {split} | {b} | {nm} | {st['n']} | {_f(st['delta'])} | [{_f(c99.get('lo'))}, {_f(c99.get('hi'))}] | "
+                         f"[{_f(c95.get('lo'))}, {_f(c95.get('hi'))}] | {st.get('all_sites_favorable')} | {ps} |")
+    L += ["", "### Difference of Deltas (sedated minus non-sedated; negative = the gain is larger in sedated patients)", "",
+          "| Scheme | Baseline | Difference | 99% CI | 95% CI | non-sedated gain persists (99% CI < 0) |", "|---|---|---|---|---|---|"]
+    for split, per in sb["by_scheme"].items():
+        for b, v in per.items():
+            df = v["difference_sedated_minus_non_sedated"]
+            if not df["estimable"]:
+                L.append(f"| {split} | {b} | not estimable: {df['not_estimable']} | | | {v['non_sedated_gain_persists_99']} |")
+                continue
+            c99, c95 = df.get("ci_99_within_site") or {}, df.get("ci_95_within_site") or {}
+            L.append(f"| {split} | {b} | {_f(df['delta'])} | [{_f(c99.get('lo'))}, {_f(c99.get('hi'))}] | "
+                     f"[{_f(c95.get('lo'))}, {_f(c95.get('hi'))}] | {v['non_sedated_gain_persists_99']} |")
+    return L
+
+
 def _controls_markdown(c: dict) -> list[str]:
     L = ["", "## Mandatory controls", ""]
     if "skipped" in c:
         return L + [c["skipped"]]
     L += ["### Leakage probes (cross-validated AUROC predicting the factor from EEG features alone; flag > 0.70, PLACEHOLDER)", "",
           "| Probe | AUROC | flagged |", "|---|---|---|"]
-    for nm, p in c["leakage_probes"]["probes"].items():
-        L.append(f"| {nm} | {_f(p['auroc'])} | {p['flagged']} |")
-    for nm, p in c.get("leakage_probes_cbramod_frozen", {}).get("probes", {}).items():
-        L.append(f"| {nm} (frozen CBraMod embedding alone) | {_f(p['auroc'])} | {p['flagged']} |")
-    for nm, p in c.get("leakage_probes_morgoth_findings", {}).get("probes", {}).items():
-        L.append(f"| {nm} (MORGOTH findings alone) | {_f(p['auroc'])} | {p['flagged']} |")
+    L += _probe_rows(c["leakage_probes"], "")
+    L += _probe_rows(c.get("leakage_probes_cbramod_frozen", {}), " (frozen CBraMod embedding alone)")
+    L += _probe_rows(c.get("leakage_probes_morgoth_findings", {}), " (MORGOTH findings alone)")
+    L += ["", "`sedation` is informational (not a pass/fail control; not in the site/duration/channel flags): AUROC of predicting the "
+          "t0 sedative/opioid flag from the EEG representation alone, pooled and within each site (the within-site rows cannot ride on "
+          "a site shift). See \"Sedation confounding\"."]
     L += ["", "### Site concentration, sedative-excluded subset, negative controls", "",
           "| Scheme | Baseline | top-site share of gain | carried by one site | site probe control failed | sedative-excluded Delta | 99% CI | every site < 0 | n excluded | shuffled-label mean Delta | reps with spurious gain | permuted-EEG Delta |", "|---|---|---|---|---|---|---|---|---|---|---|---|"]
     for split, per in c["by_scheme"].items():
@@ -1275,6 +1395,7 @@ def render_markdown(J: dict) -> str:
                     L.append(f"| {split} | {b} | {mdl} | {lab} | {v['n_events']} | {_f(v['observed_over_expected'], 3)} | "
                              f"{_f(v['calibration_in_the_large'], 3)} | {sl} | {_f(v['ece'], 3)} | {_f(v['brier'], 3)} |")
     L += _controls_markdown(J["controls"])
+    L += _sedation_markdown(J.get("sedation"))
     ca = J["circularity_audit"]
     L += ["", "## Circularity audit (leave-one-site-out predictions)", ""]
     if "per_model" in ca and ca["per_model"]:

@@ -25,7 +25,7 @@ from sklearn.preprocessing import StandardScaler
 
 from ..metrics.bootstrap import paired_bootstrap_delta
 from ..metrics.hypotheses import h3_severity_stratified
-from ..safe_output import suppress_count
+from ..safe_output import SUPPRESS_BELOW, suppress_count
 from .data import ModelData
 from .ladder import COMMERCIAL_RUNGS, DEFAULT_RUNGS, LadderConfig, LadderResult, RungSpec, run_ladder
 
@@ -58,10 +58,45 @@ def _binarise(x: np.ndarray) -> np.ndarray | None:
     return None
 
 
+def sedation_probe(eeg: pd.DataFrame, sedated, sites, threshold: float = LEAKAGE_AUROC_FLAG, n_splits: int = 5,
+                   seed: int = 0, site_labels: Mapping | None = None, min_cell: int = SUPPRESS_BELOW) -> dict:
+    """Cross-validated AUROC for predicting the t0 sedation flag from the EEG feature columns alone (the same pipeline and
+    folds as the site / duration probes). Pooled, and within each site (the pooled probe can ride on a site shift when
+    sedation prevalence differs by site; the within-site AUROCs cannot). A probe needs at least ``min_cell`` patients in each
+    class (pooled or within the site), else it is not estimable and its AUROC is NaN.
+
+    Informational, not a pass/fail control: sedatives change the EEG, so a high AUROC is expected. It measures how much of
+    sedation the representation encodes, which is what makes sedation a candidate explanation of Delta.
+    """
+    s = np.asarray(sedated).astype(int)
+    sites = np.asarray(sites)
+    labels = dict(site_labels or {})
+    uniq = sorted(str(u) for u in np.unique(sites))
+    for i, u in enumerate(uniq):
+        labels.setdefault(u, f"site_{i + 1}")
+
+    def one(mask):
+        t = s[mask]
+        if min(int(t.sum()), int((1 - t).sum())) < max(min_cell, n_splits):
+            return float("nan")
+        return _probe_auc(eeg.iloc[np.flatnonzero(mask)], t, False, n_splits, seed)
+
+    auc = one(np.ones(len(s), bool))
+    ok = not np.isnan(auc)
+    per_site = {}
+    for u in uniq:
+        a = one(sites.astype(str) == u)
+        per_site[labels[u]] = {"auroc": a, "estimable": not np.isnan(a)}
+    return {"auroc": auc, "flagged": bool(ok and auc > threshold), "estimable": ok, "n": suppress_count(len(s)),
+            "n_sedated": suppress_count(int(s.sum())), "informational": True, "per_site": per_site}
+
+
 def leakage_probes(eeg: pd.DataFrame, sites, duration_s=None, n_channels=None, threshold: float = LEAKAGE_AUROC_FLAG,
-                   n_splits: int = 5, seed: int = 0) -> dict:
+                   n_splits: int = 5, seed: int = 0, sedated=None, site_labels: Mapping | None = None) -> dict:
     """Cross-validated AUROC for predicting site (macro one-vs-rest), long-vs-short recording (above median) and
     high-vs-low channel count from the EEG feature columns alone. ``flagged`` = AUROC > threshold.
+    With ``sedated`` (bool per patient) a ``sedation`` probe is added (see ``sedation_probe``); it is informational and does
+    not enter ``any_flagged``.
 
     A probe that is flagged is a warning that the features encode the factor; it fails the control only when
     Delta is also carried by it (see ``delta_concentration_by_site``).
@@ -85,6 +120,8 @@ def leakage_probes(eeg: pd.DataFrame, sites, duration_s=None, n_channels=None, t
         out["probes"][name] = {"auroc": auc, "flagged": bool(ok and auc > threshold), "estimable": ok,
                                "n": suppress_count(n)}
     out["any_flagged"] = any(p["flagged"] for p in out["probes"].values())
+    if sedated is not None:
+        out["probes"]["sedation"] = sedation_probe(eeg, sedated, sites, threshold, n_splits, seed, site_labels)
     return out
 
 

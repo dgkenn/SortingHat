@@ -118,12 +118,44 @@ A / C comparisons below.
 
 | Control | How |
 |---|---|
-| Leakage probes | cross-validated AUROC predicting site, recording duration (above median) and usable channel count (10 minus missing/dead minimum-set electrodes) from the EEG features alone; flag > 0.70 (PLACEHOLDER) |
+| Leakage probes | cross-validated AUROC predicting site, recording duration (above median) and usable channel count (10 minus missing/dead minimum-set electrodes) from the EEG features alone; flag > 0.70 (PLACEHOLDER). Also run on the frozen CBraMod embedding and the MORGOTH findings when those rungs ran. An informational **sedation** probe (the t0 sedation flag, pooled and within each site; needs >= 11 per class) is added to each block; it is not a pass/fail control |
 | Site concentration | share of the pooled gain from the largest site; a failed control = flagged site probe and > 60% from one site |
-| Sedative-excluded subset | ladder rerun without patients with t0 sedative/opioid exposure (Baseline A `on_t0` flags and/or the silver `e4b_sedative_exposure` hint, `--sedation-source`) |
+| Sedative-excluded subset | ladder rerun without patients with t0 sedative/opioid exposure (Baseline A `on_t0` flags and/or the silver `e4b_sedative_exposure` hint, `--sedation-source`); trains AND scores without sedated patients, so it is badly underpowered when sedation is common (kept unchanged for continuity; see sedation confounding below) |
 | Severity strata | Delta in three GCS-equivalent strata fixed here a priori (GCS <= 5, 6-8, >= 9; FOUR mapped as 3 + 0.75 x FOUR where no GCS exists); strata < 50 patients not estimable; patients with no score form an "unknown" group, never the top stratum |
 | Shuffled-label negative control | silver and evaluation labels permuted within site x role, `--null-reps` times; Delta ~ 0 expected |
 | Permuted-EEG negative control | EEG rows permuted within site; Delta ~ 0 expected |
+
+**Sedation confounding (report section "Sedation confounding").** The main worry is that part of the EEG gain is sedation: EEG sees
+sedative effects and sedation correlates with the silver labels. The sedative-excluded rerun is underpowered (it removes the sedated
+patients from training and scoring), so three further analyses are reported, none of which refits a model:
+
+1. *Sedation-stratified Delta.* The headline-rung per-patient differences d_i of each scheme x baseline (the very ones behind the
+   headline Delta) are split by the sedation flag (`cov["sedated"]`, i.e. `sedation_flag` with `--sedation-source`) and Delta is
+   re-estimated in the sedated and non-sedated strata, with 99% and 95% within-site patient bootstrap intervals, per-site Delta, and
+   stratum n (< 11 shown as `<11`; when either stratum is < 11 both counts are hidden). A stratum under 50 patients is *not
+   estimable* (no Delta, no interval; with LOSO about 20% of rows are development rows and the temporal scheme scores only the late
+   20%, so the sedated stratum is often the one that falls under 50). The *difference of Deltas* (sedated minus non-sedated) comes
+   from the same bootstrap replicates (patients resampled within site over both strata, both means computed on each resample), so it
+   is paired by bootstrap; it is estimable only when both strata are. Reading: if the gain were only a sedation proxy, Delta would
+   be about 0 in the non-sedated stratum; the report prints whether its 99% interval lies below 0 ("gain persists"). An interval
+   that includes 0 is inconclusive, not exculpatory (smaller stratum). Strata split the *held-out rows* only; the models are the
+   ones fitted on all training rows. Code: `sortinghat/metrics/sedation.py`.
+2. *Sedation-adjusted Delta.* Baseline A is "severity + sedation" (`sed__<agent>__on_t0`, `__qty_6h/24h`, `sed__<class>__on_t0` and
+   `__n_24h`, `sed__n_agents_24h`) and C contains A, so Delta is already the EEG increment over *recorded* t0 sedation exposure; the
+   report states this from the actual column sets of the run (column counts only) and flags the case where a set has no sedation
+   column. What stays confounded is sedation the recorded features miss (a bolus that ended before t0, no administration record, depth
+   of sedation, and patients flagged only by the silver `e4b` hint, whose count is reported). A sedation x EEG *interaction* variant
+   is **not run**: it needs a refitted grid for every scheme x baseline x fold.
+3. *Sedation leakage probe.* AUROC of predicting the sedation flag from the EEG representation alone (hand-crafted qEEG + connectivity,
+   frozen CBraMod, MORGOTH findings when present), pooled and within site, in the leakage-probe table. A high AUROC means the
+   representation encodes sedation and that sedation is a live explanation of Delta; a low one makes it less plausible. A pooled AUROC
+   can ride on a site shift when sedation prevalence differs by site; the within-site AUROCs cannot.
+
+**Checkpoints.** None of these adds a model fit: they read the stored `d_i` / predictions, so a resumed run reuses every cached fit
+(fit units are keyed by data, not code). No new command-line argument was added, so the step's argument digest is unchanged. The step key
+does contain the code version (`git HEAD` + hash of the uncommitted tracked diff), `--out` and the other arguments: a commit or edit
+of any tracked file, or a different `--out`, starts a fresh checkpoint directory and refits everything once. To reuse the fits of an
+earlier run across this change, relaunch with the same arguments and `SORTINGHAT_CODE_VERSION` set to the earlier run's code version string.
 
 **Circularity audit** (`labels.circularity_audit`, plan: "Silver labels: the circularity rules"). For every case, the
 leave-one-site-out prediction (the model never trained on that site) is compared, by AUROC, with (i) the EEG-report finding
@@ -220,7 +252,7 @@ the +1 h score window uses data charted after the EEG began (P only).
 ### How to read the report
 
 * Look first at the controls. A shuffled-label or permuted-EEG Delta away from 0, a flagged site/duration probe with the gain
-  concentrated in one site, or a sedative-excluded Delta that vanishes means the headline Delta is not interpretable.
+  concentrated in one site, or a sedative-excluded Delta that vanishes means the headline Delta is not interpretable. Then "Sedation confounding": a non-sedated-stratum Delta near 0 (99% interval including 0 while the sedated stratum is clearly negative), a difference of Deltas away from 0, or a high sedation-probe AUROC all point to sedation as part of the gain; a non-sedated Delta that stays negative with a 99% interval below 0 argues against sedation as the whole explanation (it cannot rule out sedation the baseline features miss).
 * Then the per-label table. A gain on E1/E2/E5 with no gain on E4a (no EEG signature expected) is the pattern the
   planted-signal test shows; a gain on every label equally suggests a recording-property proxy.
 * Then baseline-only AUROC (anchor overlap) and the circularity audit. A flag for the **baseline-only** model (which never
