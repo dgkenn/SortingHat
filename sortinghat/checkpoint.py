@@ -2,7 +2,7 @@
 
 The EEG extractors resume from ledgers and part files. This module gives every other long step the same property
 without changing what it computes: units of work (one parquet ROW GROUP of one OMOP part, one site's session frame, one
-classified table, one model fit) are written to a checkpoint directory as they finish, and a relaunched step with the
+classified-table row group, one model fit) are written to a checkpoint directory as they finish, and a relaunched step with the
 same arguments finds them and skips the work.
 
 Layout and safety

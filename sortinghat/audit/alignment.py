@@ -170,6 +170,23 @@ class NearestGaps:
         self.cov_off[p] = (t0.astype("datetime64[D]") - s.astype("datetime64[D]")).astype("int64")
         self.cov_len[p] = (e.astype("datetime64[D]") - s.astype("datetime64[D]")).astype("int64")
 
+    # -- snapshots (restart safety): the arrays one source owns, as plain copies. ``"visits"`` = visit start / end, the first
+    # visit gap and the covering-visit arrays (everything ``add_visits`` writes); any other name is an ``EVENT_SOURCES`` key.
+    def get_state(self, src: str) -> dict:
+        if src == "visits":
+            return {"best": {k: self.best[k].copy() for k in ("visit_start", "visit_end")},
+                    "first_visit_gap": self.first_visit_gap.copy(), "cov_gap": self.cov_gap.copy(),
+                    "cov_off": self.cov_off.copy(), "cov_len": self.cov_len.copy(), "order": list(self.order["visit_start"])}
+        return {"best": {src: self.best[src].copy()}, "order": list(self.order[src])}
+
+    def set_state(self, src: str, st: dict) -> None:
+        for k, v in st["best"].items():
+            self.best[k][:] = v
+        self.order["visit_start" if src == "visits" else src] = list(st["order"])
+        if src == "visits":
+            for k in ("first_visit_gap", "cov_gap", "cov_off", "cov_len"):
+                getattr(self, k)[:] = st[k]
+
     def frame(self) -> pd.DataFrame:
         """Per-candidate frame indexed by person_id: ``gap_h_<source>`` (signed hours), ``cov_off_days``,
         ``cov_len_days``, ``first_visit_gap_h``. Record-level: used in memory only, never written."""

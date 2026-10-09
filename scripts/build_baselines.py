@@ -292,57 +292,58 @@ def collect_events(src: StoreSources, index: pd.DataFrame, cfg: BaselineConfig, 
     cp = ck.active()
     unit_key = (index[["person_id", "t0"] + (["encounter_start"] if enc is not None else [])], cfg, prefilter, mm)
 
-    def staged(name: str, extra, build):
-        """One table's events as a restart unit: ``build(add, d)`` appends pruned event frames through ``add`` and counts into
-        ``d``; the frames and counts are stored when the table is done (the row groups are stored anyway, this also skips the
-        event building)."""
-        def run():
-            got: list[pd.DataFrame] = []
-            d = {"n_measurement_rows_unmapped": 0}
+    def stream(name: str, table: str, cols: list[str], extra, one):
+        """One table's events, ROW GROUP by row group: ``one(chunk) -> (pruned events | None, rows unmapped)``. With a store source
+        and an active checkpoint every row group's result is stored as soon as it is built and a relaunch resumes at the first
+        unfinished row group (aggregate progress lines ``<step>: <name> 120/654 row groups``). In-memory stand-ins without
+        ``iter_units`` are read in ``chunk_rows`` chunks, unchecked."""
+        if hasattr(src, "iter_units"):
+            results = (r for res in src.iter_units(f"baseline_events-{name}", (unit_key, extra), table, cols, ids, one,
+                                                   batch_rows=chunk_rows) for r in res)
+        else:
+            results = (one(chunk) for chunk in src.iter_rows(table, cols, ids, chunk_rows))
+        for ev, n_unmapped in results:
+            if ev is not None and len(ev):
+                parts.append(ev)
+            diag["n_measurement_rows_unmapped"] += n_unmapped
 
-            def add(ev: pd.DataFrame) -> None:
-                ev = prune_events(ev, t0, cfg, prefilter, enc)
-                if len(ev):
-                    got.append(ev)
-            build(add, d)
-            return got, d
-        got, d = run() if cp is None else cp.stage(f"baseline_events-{name}", (unit_key, extra), run)
-        parts.extend(got)
-        diag["n_measurement_rows_unmapped"] += d["n_measurement_rows_unmapped"]
+    def pruned(ev: pd.DataFrame):
+        ev = prune_events(ev, t0, cfg, prefilter, enc)
+        return ev if len(ev) else None
 
     def early(chunk, dt_col, date_col=None):
         chunk = remap_ids(chunk, mm)
         return prune_rows(chunk, t0, dt_col, date_col, cfg.presentation_score_after_h) if prefilter else chunk
 
-    def measurements(add, d):
-        for chunk in src.iter_rows("omop_measurement", MEAS_COLS, ids, chunk_rows):
-            dd: dict = {}
-            add(measurement_events({"omop_measurement": early(chunk, "measurement_datetime", "measurement_date")}, pids, cfg, dd))
-            d["n_measurement_rows_unmapped"] += dd.get("n_measurement_rows_unmapped", 0)
-            del chunk
-    staged("measurement", None, measurements)
-    concept = drug_concept_names(src.s3)
+    def measurements(chunk):
+        dd: dict = {}
+        ev = measurement_events({"omop_measurement": early(chunk, "measurement_datetime", "measurement_date")}, pids, cfg, dd)
+        return pruned(ev), dd.get("n_measurement_rows_unmapped", 0)
+    stream("measurement", "omop_measurement", MEAS_COLS, None, measurements)
+
+    def load_drug_concepts():
+        return drug_concept_names(src.s3)
+    concept = load_drug_concepts() if cp is None else cp.stage("baseline_drug_concepts", None, load_drug_concepts)
     hit_ids = set(concept["concept_id"].dropna().astype("int64"))
 
-    def drugs(add, d):
-        for chunk in src.iter_rows("omop_drug_exposure", DRUG_COLS, ids, chunk_rows):
-            txt = chunk["drug_source_value"].astype("string").fillna("")
-            hit = txt.str.contains(_DRUG_ANY, na=False).to_numpy(bool)
-            if "drug_concept_id" in chunk and hit_ids:
-                hit |= pd.to_numeric(chunk["drug_concept_id"], errors="coerce").isin(hit_ids).to_numpy(bool)
-            chunk = early(chunk[hit], "drug_exposure_start_datetime")
-            if len(chunk):
-                add(drug_events({"omop_drug_exposure": chunk, "omop_concept": concept}, pids, cfg))
-    staged("drug_exposure", concept, drugs)
+    def drugs(chunk):
+        txt = chunk["drug_source_value"].astype("string").fillna("")
+        hit = txt.str.contains(_DRUG_ANY, na=False).to_numpy(bool)
+        if "drug_concept_id" in chunk and hit_ids:
+            hit |= pd.to_numeric(chunk["drug_concept_id"], errors="coerce").isin(hit_ids).to_numpy(bool)
+        chunk = early(chunk[hit], "drug_exposure_start_datetime")
+        return (pruned(drug_events({"omop_drug_exposure": chunk, "omop_concept": concept}, pids, cfg)) if len(chunk) else None), 0
+    stream("drug_exposure", "omop_drug_exposure", DRUG_COLS, concept, drugs)
     for table, cols in (("omop_condition_occurrence", COND_COLS), ("omop_procedure_occurrence", PROC_COLS),
                         ("omop_observation", OBS_COLS)):
-        def history(add, d, table=table, cols=cols):
-            for chunk in src.iter_rows(table, cols, ids, chunk_rows):
-                chunk = remap_ids(chunk, mm)
-                add(history_events({table: chunk}, pids))                     # small tables: events pruned, rows kept
-                if table == "omop_condition_occurrence":
-                    add(label_dx_events({table: chunk}, pids))                # subgroup definition only (domain dxlab)
-        staged(table, None, history)
+        def history(chunk, table=table):
+            chunk = remap_ids(chunk, mm)
+            frames = [prune_events(history_events({table: chunk}, pids), t0, cfg, prefilter, enc)]    # small tables: events pruned, rows kept
+            if table == "omop_condition_occurrence":
+                frames.append(prune_events(label_dx_events({table: chunk}, pids), t0, cfg, prefilter, enc))   # subgroup definition only (domain dxlab)
+            frames = [f for f in frames if len(f)]
+            return (pd.concat(frames, ignore_index=True) if frames else None), 0
+        stream(table, table, cols, None, history)
     ev = pd.concat(parts, ignore_index=True) if parts else empty_events()
     if cfg.encounter_scope == "current":
         if enc is None:

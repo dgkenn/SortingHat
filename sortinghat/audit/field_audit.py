@@ -26,6 +26,7 @@ import difflib
 import math
 import re
 import sys
+import time
 from pathlib import Path
 
 import numpy as np
@@ -35,7 +36,7 @@ from .. import agent_safety, checkpoint as ck, data_io, schema
 from ..cohort import rules as cohort_rules
 from ..cohort.config import CohortConfig
 from . import alignment as al
-from ..cohort.sources import (StoreSources, concat_frames, iter_filtered_batches, remap_ids)
+from ..cohort.sources import (StoreSources, concat_frames, iter_filtered_batches, iter_filtered_units, remap_ids)
 from ..safe_output import (SUPPRESS_BELOW, SUPPRESSED, safe_print, safe_quantiles, safe_write_json,
                            safe_write_text, suppress_count, suppress_proportion,
                            write_local_only)
@@ -377,13 +378,37 @@ def _compact_notes(batch, remap) -> pd.DataFrame:
                          "note_datetime": _dt_us(d, "note_datetime").to_numpy()})
 
 
-def _collect(it, compact, like_cols: list[str]) -> pd.DataFrame:
-    """Stream Arrow tables through ``compact`` and concatenate column by column (peak = result + one column)."""
+def _collect(make, compact, like_cols: list[str], name: str | None = None, key_obj=None) -> pd.DataFrame:
+    """Stream a table through ``compact`` and concatenate column by column (peak = result + one column).
+
+    ``make(skip)`` returns the iterator of ``(unit_id, Arrow table | None | SKIPPED, total)`` (``iter_filtered_units``). With an
+    active checkpoint (and a ``name``) every row group's compact result is stored atomically as soon as it is computed and a
+    relaunch skips the stored row groups without reading them (``key_obj`` = everything ``compact`` depends on). Aggregate
+    progress lines: ``field_audit: <name> 120/654 row groups (resumed 100)``."""
+    from ..omop_cache import SKIPPED
+    cp = ck.active() if name else None
+    key = ck.digest("audit-unit-v1", name, like_cols, key_obj) if cp is not None else None
+    loaded: dict = {}
+
+    def have(uid: str) -> bool:
+        got = cp.get(f"audit:{key}:{uid}")
+        if got is ck.MISS:
+            return False
+        loaded[uid] = got
+        return True
+    prog = ck.UnitProgress("field_audit", name or "table", enabled=cp is not None)
     chunks = []
-    for b in it:
-        c = compact(b)
-        if len(c):
-            chunks.append(c)
+    for uid, tbl, total in make(have if cp is not None else None):
+        if tbl is SKIPPED:
+            chunks.extend(loaded.pop(uid))
+            prog.tick(True, total)
+            continue
+        res = [c] if tbl is not None and len(c := compact(tbl)) else []
+        if cp is not None:
+            cp.put(f"audit:{key}:{uid}", res)
+        chunks.extend(res)
+        prog.tick(False, total)
+    prog.emit(final=True)
     if not chunks:
         return pd.DataFrame(columns=like_cols)
     return concat_frames(chunks, chunks[0].iloc[0:0])
@@ -481,17 +506,25 @@ def load_audit_tables(s3, sites: list[str] | None = None, avail: dict | None = N
     result_cols = schema.COLUMN_ALIASES["measurement.result_datetime"]
     remap = mm or None
 
+    fetch_key = ck.digest(fetch_ids) if ck.active() is not None else None
+    remap_key = ck.digest(remap) if ck.active() is not None else None
+
     def drugs():
-        it = iter_filtered_batches(s3, "drug_exposure", fetch_ids, DRUG_COLS, text_col="drug_source_value",
-                                   pattern=SEDATION_RE.pattern)
-        return _collect(it, lambda b: _compact_drugs(b, remap), DRUG_COLS[:2] + DRUG_COLS[2:3] + ["drug_type_concept_id"])
+        def make(skip):
+            return iter_filtered_units(s3, "drug_exposure", fetch_ids, DRUG_COLS, text_col="drug_source_value",
+                                       pattern=SEDATION_RE.pattern, skip=skip)
+        return _collect(make, lambda b: _compact_drugs(b, remap),
+                        DRUG_COLS[:2] + DRUG_COLS[2:3] + ["drug_type_concept_id"], "drug_exposure",
+                        (fetch_key, remap_key, SEDATION_RE.pattern))
 
     def concepts():
         return load_concepts(s3, all_types=True)
 
     def notes():
-        it = iter_filtered_batches(s3, "note", fetch_ids, NOTE_COLS)
-        return _collect(it, lambda b: _compact_notes(b, remap), ["person_id", "note_datetime"])
+        def make(skip):
+            return iter_filtered_units(s3, "note", fetch_ids, NOTE_COLS, skip=skip)
+        return _collect(make, lambda b: _compact_notes(b, remap), ["person_id", "note_datetime"], "note",
+                        (fetch_key, remap_key))
 
     def imaging():
         spec = data_io.TABLES["imaging"]
@@ -507,18 +540,26 @@ def load_audit_tables(s3, sites: list[str] | None = None, avail: dict | None = N
         score_map, _ = concept_maps(concept_all)
         score_ids = list(score_map)
 
+        score_key = ck.digest(score_map) if ck.active() is not None else None
+
         def meas():
-            it = iter_filtered_batches(s3, "measurement", fetch_ids, MEAS_COLS + result_cols,
-                                       text_col="measurement_source_value", pattern=SCORE_RE.pattern + "|" + LAB_RE.pattern,
-                                       id_col="measurement_concept_id", ids=score_ids)
-            return _collect(it, lambda b: _compact_measurements(b, remap, score_map, result_cols),
-                            ["person_id", "measurement_datetime", "kind", "score_class"])
+            def make(skip):
+                return iter_filtered_units(s3, "measurement", fetch_ids, MEAS_COLS + result_cols,
+                                           text_col="measurement_source_value",
+                                           pattern=SCORE_RE.pattern + "|" + LAB_RE.pattern,
+                                           id_col="measurement_concept_id", ids=score_ids, skip=skip)
+            return _collect(make, lambda b: _compact_measurements(b, remap, score_map, result_cols),
+                            ["person_id", "measurement_datetime", "kind", "score_class"], "measurement",
+                            (fetch_key, remap_key, score_key, result_cols))
 
         def obs():
-            it = iter_filtered_batches(s3, "observation", fetch_ids, OBS_COLS, text_col="observation_source_value",
-                                       pattern=SCORE_RE.pattern, id_col="observation_concept_id", ids=score_ids)
-            return _collect(it, lambda b: _compact_observations(b, remap, score_map),
-                            ["person_id", "observation_datetime", "score_class"])
+            def make(skip):
+                return iter_filtered_units(s3, "observation", fetch_ids, OBS_COLS, text_col="observation_source_value",
+                                           pattern=SCORE_RE.pattern, id_col="observation_concept_id", ids=score_ids,
+                                           skip=skip)
+            return _collect(make, lambda b: _compact_observations(b, remap, score_map),
+                            ["person_id", "observation_datetime", "score_class"], "observation",
+                            (fetch_key, remap_key, score_key))
         f_meas, f_obs = pool.submit(meas), pool.submit(obs)
         out["omop_drug_exposure"] = f_drug.result()
         out["omop_measurement"] = f_meas.result()
@@ -546,18 +587,54 @@ def load_alignment(s3, eeg: pd.DataFrame, fetch_ids, remap, workers: int = 3) ->
 
     birth, dend = al.life_arrays(cands["person_id"], small("person", al.BIRTH_COLS), small("death", al.DEATH_COLS))
     acc = al.NearestGaps(cands, birth, dend)
+    cp = ck.active()
+    base_key = ck.digest("audit-align-v1", cands[["person_id", "t0"]], fetch_ids, remap) if cp is not None else None
+    SNAP_EVERY_N, SNAP_EVERY_S = 100, 60.0
+
+    def stream(src: str, table: str, cols: list[str], feed) -> None:
+        """Feed ``feed(arrow table)`` row group by row group. With an active checkpoint the accumulator arrays this source owns are
+        snapshotted every 100 row groups / 60 s together with the ids of the row groups they contain; a relaunch restores the
+        snapshot and skips those row groups without reading them (at most a minute of work is redone). Aggregate progress lines."""
+        from ..omop_cache import SKIPPED
+        name = f"stage:audit-align:{base_key}:{src}:{table}:{ck.digest(cols)}"
+        done: set = set()
+        if cp is not None:
+            got = cp.get(name)
+            if got is not ck.MISS:
+                done, state = got
+                acc.set_state(src, state)
+        prog = ck.UnitProgress("field_audit", f"alignment {src}", enabled=cp is not None)
+        last, since = time.monotonic(), 0
+        for uid, tbl, total in iter_filtered_units(s3, table, fetch_ids, cols, skip=(lambda u: u in done) if cp else None):
+            if tbl is SKIPPED:
+                prog.tick(True, total)
+                continue
+            if tbl is not None:
+                feed(tbl)
+            done.add(uid)
+            prog.tick(False, total)
+            since += 1
+            if cp is not None and (since >= SNAP_EVERY_N or time.monotonic() - last >= SNAP_EVERY_S):
+                cp.put(name, (set(done), acc.get_state(src)))
+                last, since = time.monotonic(), 0
+        if cp is not None:
+            cp.put(name, (set(done), acc.get_state(src)))
+        prog.emit(final=True)
 
     def events(src):
         tbl, dt, dd = al.EVENT_SOURCES[src]
-        for b in iter_filtered_batches(s3, tbl, fetch_ids, ["person_id", dt, dd]):
+
+        def feed(b):
             d = remap_ids(b.to_pandas(), remap)
             acc.add_events(src, d["person_id"].to_numpy("int64"), al.event_times(d, dt, dd))
+        stream(src, tbl, ["person_id", dt, dd], feed)
 
     def visits():
-        for b in iter_filtered_batches(s3, "visit_occurrence", fetch_ids, al.VISIT_COLS):
+        def feed(b):
             d = remap_ids(b.to_pandas(), remap)
             acc.add_visits(d["person_id"].to_numpy("int64"), al.event_times(d, "visit_start_datetime", "visit_start_date"),
                            al.event_times(d, "visit_end_datetime", "visit_end_date"))
+        stream("visits", "visit_occurrence", al.VISIT_COLS, feed)
 
     with ThreadPoolExecutor(max_workers=max(1, workers)) as pool:
         futs = [pool.submit(visits)] + [pool.submit(events, src) for src in al.EVENT_SOURCES]

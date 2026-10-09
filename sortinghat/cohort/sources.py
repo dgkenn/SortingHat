@@ -129,10 +129,19 @@ def concat_frames(chunks: list[pd.DataFrame], like: pd.DataFrame) -> pd.DataFram
     return pd.DataFrame(out)
 
 
-def iter_filtered_batches(s3, table: str, person_ids, columns: list[str], *, text_col: str | None = None,
-                          pattern: str | None = None, id_col: str | None = None, ids=None, prefix: str | None = None,
-                          retry=None):
-    """Yield pyarrow tables of ``table`` rows for ``person_ids`` that also satisfy a row predicate, reading each row
+def iter_filtered_batches(s3, table: str, person_ids, columns: list[str], **kw):
+    """Yield pyarrow tables of ``table`` rows for ``person_ids`` that also satisfy a row predicate (see
+    ``iter_filtered_units``, which this flattens: row groups with no surviving row yield nothing)."""
+    for _uid, tbl, _total in iter_filtered_units(s3, table, person_ids, columns, **kw):
+        if tbl is not None:
+            yield tbl
+
+
+def iter_filtered_units(s3, table: str, person_ids, columns: list[str], *, text_col: str | None = None,
+                        pattern: str | None = None, id_col: str | None = None, ids=None, prefix: str | None = None,
+                        retry=None, skip=None):
+    """Yield ``(unit_id, pyarrow table | None, total)`` ONCE PER ROW GROUP of ``table`` (``None`` = nothing survives): the
+    filtered rows for ``person_ids`` that also satisfy a row predicate, reading each row
     group in TWO stages so that most of a big table is never fetched:
 
     1. the row group is skipped when its ``person_id`` min/max statistics cannot contain any wanted id;
@@ -141,7 +150,12 @@ def iter_filtered_batches(s3, table: str, person_ids, columns: list[str], *, tex
     3. only if some row survives are the remaining ``columns`` read, and they are filtered by the mask.
     With no predicate (``pattern`` and ``ids`` both None) the mask is the person filter alone. A predicate whose
     columns do not exist in the file keeps nothing (as a missing column cannot match). Reads are retried
-    (``data_io.with_retries``)."""
+    (``data_io.with_retries``).
+
+    ``unit_id`` is stable across restarts. ``skip(unit_id)`` returning True marks a row group the caller already has a stored
+    result for: it is yielded as ``(unit_id, omop_cache.SKIPPED, total)`` and never read or fetched. ``total`` = number of row
+    groups when known (progress lines)."""
+    import hashlib
     import pyarrow as pa
     import pyarrow.compute as pc
     from .. import checkpoint as ck
@@ -162,11 +176,16 @@ def iter_filtered_batches(s3, table: str, person_ids, columns: list[str], *, tex
         shared = omop_cache.reader_for(cp, s3, bucket, table, columns=needed, ids=want, prefix=prefix, retry=retry,
                                        max_get_bytes=data_io.GET_CHUNK_BYTES)
         if shared is not None:                   # the shared cross-step cache serves this request (D-149)
-            for _key, _rg, cached in shared.iter_rowgroups(None):
-                tbl = shared.select_filtered(cached, columns, pid_arr, text_col, pattern, id_col, id_arr)
-                if tbl is not None:
-                    yield tbl
+            read_cols = list(dict.fromkeys(["person_id", *needed]))
+            for key, rg, cached in shared.iter_rowgroups(None, cols=read_cols, skip=skip):
+                uid = shared.unit_id(key, rg)
+                if cached is omop_cache.SKIPPED:
+                    yield uid, omop_cache.SKIPPED, shared.progress.total
+                    continue
+                yield uid, shared.select_filtered(cached, columns, pid_arr, text_col, pattern, id_col, id_arr), \
+                    shared.progress.total
             return
+    pmeta: dict = {}
     if cp is not None:
         parts, pmeta = data_io._checkpoint_parts(s3, table, prefix, bucket)
         cache = data_io.RowGroupCache(
@@ -233,6 +252,13 @@ def iter_filtered_batches(s3, table: str, person_ids, columns: list[str], *, tex
             if cache:
                 cache.set_manifest(key, n_rg)
         for rg in range(n_rg):
+            uid = hashlib.sha1(f"{key}|{pmeta.get(key)}".encode()).hexdigest()[:20] + f":{rg}"
+            if skip is not None and skip(uid):
+                from .. import omop_cache
+                if cache:
+                    cache.progress.tick(True)
+                yield uid, omop_cache.SKIPPED, cache.progress.total if cache else None
+                continue
             tbl, hit = None, False
             if cache:
                 got = cache.get(key, rg)
@@ -248,8 +274,7 @@ def iter_filtered_batches(s3, table: str, person_ids, columns: list[str], *, tex
                     cache.put(key, rg, tbl)
             if cache:
                 cache.progress.tick(hit)
-            if tbl is not None:
-                yield tbl
+            yield uid, tbl, cache.progress.total if cache else None
     if cache:
         cache.progress.emit(final=True)
 
@@ -462,9 +487,9 @@ class StoreSources:
         if buf:
             yield buf[0] if len(buf) == 1 else pd.concat(buf, ignore_index=True)
 
-    def iter_units(self, what: str, key_obj, table: str, columns: list[str], person_ids, fn):
-        """``fn(raw coerced chunk) -> frame | None`` applied to ``table`` row group by row group; yields the list of non-empty
-        results of each row group in order. With an active checkpoint every row group's result is stored atomically as soon as
+    def iter_units(self, what: str, key_obj, table: str, columns: list[str], person_ids, fn, batch_rows: int = 1 << 18):
+        """``fn(raw coerced chunk) -> picklable result | None`` applied to ``table`` row group by row group; yields the list of
+        the non-None results of each row group in order. With an active checkpoint every row group's result is stored atomically as soon as
         it is computed and a relaunch skips the stored ones WITHOUT reading them (``key_obj`` = everything ``fn`` depends on:
         ids, window / bounds, merge map ...). Progress is logged as aggregate lines (``cohort: visits 120/4174 row groups``)."""
         from .. import checkpoint as ck
@@ -483,7 +508,7 @@ class StoreSources:
             return True
         prog = ck.UnitProgress(cp.step if cp is not None else "cohort", what, enabled=cp is not None)
         for uid, batches, total in data_io.iter_omop_units(table[len("omop_"):], person_ids=pids, columns=columns, s3=self.s3,
-                                                           batch_rows=1 << 18, skip=have if cp is not None else None):
+                                                           batch_rows=batch_rows, skip=have if cp is not None else None):
             if batches is None:
                 res = loaded.pop(uid)
                 prog.tick(True, total)
@@ -491,7 +516,7 @@ class StoreSources:
                 res = []
                 for b in batches:
                     c = fn(schema.coerce_types(table, b.to_pandas()))
-                    if c is not None and len(c):
+                    if c is not None:
                         res.append(c)
                 if cp is not None:
                     cp.put(f"cohort:{key}:{uid}", res)
@@ -509,7 +534,7 @@ class StoreSources:
         def one(raw):
             return rules.prune_visits(remap_ids(rules.compact_visits(raw, dates_only=dates_only), remap), bounds, slack_h)
         chunks = [c for res in self.iter_units("visits", (person_ids, bounds, remap, slack_h, dates_only),
-                                               "omop_visit_occurrence", _VISIT_COLS, person_ids, one) for c in res]
+                                               "omop_visit_occurrence", _VISIT_COLS, person_ids, one) for c in res if len(c)]
         return concat_frames(chunks, rules.compact_visits(pd.DataFrame({
             "person_id": [1], "visit_start_datetime": [pd.Timestamp("2000-01-01")]})).iloc[0:0])
 
@@ -521,7 +546,7 @@ class StoreSources:
         def one(raw):
             return prune_window(remap_ids(rules.compact_scores(rules.filter_score_rows(raw)), remap), "t", window)
         chunks = [c for res in self.iter_units("scores", (person_ids, window, remap), "omop_measurement", _MEAS_COLS,
-                                               person_ids, one) for c in res]
+                                               person_ids, one) for c in res if len(c)]
         return concat_frames(chunks, rules.compact_scores(pd.DataFrame()))
 
     def conditions(self, person_ids, window=None, remap=None) -> pd.DataFrame:
@@ -537,7 +562,7 @@ class StoreSources:
                                                                          ).astype("datetime64[s]").to_numpy()})
             return prune_window(remap_ids(c, remap), "condition_start_datetime", window)
         chunks = [c for res in self.iter_units("conditions", (person_ids, window, remap), "omop_condition_occurrence",
-                                               _COND_COLS, person_ids, one) for c in res]
+                                               _COND_COLS, person_ids, one) for c in res if len(c)]
         like = pd.DataFrame({"person_id": np.zeros(0, "int64"),
                              "condition_start_datetime": np.zeros(0, "datetime64[s]")})
         return concat_frames(chunks, like)

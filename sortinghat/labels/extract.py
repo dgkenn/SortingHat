@@ -1269,8 +1269,8 @@ def main(argv: list[str] | None = None) -> int:
     store = data_io.open_store(args.data, profile=args.profile)       # S3 client refuses inside an agent session
     p = Path(args.cohort)
     cohort = pd.read_parquet(p) if p.suffix == ".parquet" else pd.read_csv(p)
-    # Restart safety: every OMOP row group read and every classified table is stored under
-    # out/local_only/checkpoints/silver_labels/<key>/ as it finishes; a relaunch with the same arguments skips them.
+    # Restart safety: the classified concept map (once) and every (table, row group) classification result are stored under
+    # out/local_only/checkpoints/silver_labels/<key>/ as they finish; a relaunch with the same arguments skips them.
     cp = ck.open_step("silver_labels", args, inputs=[p], store=store, no_resume=args.no_resume)
     with ck.use(cp):
         res = extract_silver(store, cohort, config=ExtractConfig(allow_name_fallback=not args.no_name_fallback))
