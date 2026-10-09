@@ -972,3 +972,9 @@ Entries below follow `docs/research/plan_compliance_2026-10-08.md`. Dates are 20
 - **Decision:** CBraMod + MORGOTH extraction (stage 3c) runs first on recordings in the strict cohort (primary or ±6 h sensitivity, 3,851 recordings), the population of the primary analyses; the broad cohort follows if time allows.
 - **Rationale:** CPU-only inference runs at ~330 recordings/h; the full 14.5k list would take ~44 h. Throughput only, no outcome information involved.
 - **Source:** `scripts/stage3c.sh`.
+
+### D-151 Feasibility analysis released on pre-review silver labels; rerun after label fixes
+- **Date:** 2026-10-09 · **Area:** labels · **Outcome data seen?** No
+- **Decision:** The exploratory silver feasibility analysis (D-143) runs now on the silver labels produced at 03:58 UTC, before the silver-yield review (E2 shock, E5/E6 component mapping, report suppression) completes; it is rerun on the corrected labels and both versions are reported, the corrected one as primary.
+- **Rationale:** Project lead asked to speed up all parts; the review fixes only mapping errors, so an early run is informative and the rerun is cheap (checkpoints keyed by the label file).
+- **Source:** Project lead instruction (2026-10-09); `out/logs/silver_final.ok`.
