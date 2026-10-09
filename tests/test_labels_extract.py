@@ -166,7 +166,8 @@ def test_profound_shock_needs_30_minutes_below_map_50():
     assert run([(m(i), 45) for i in range(0, 35, 5)])[2] == ["E2_shock"]                   # 0..30 min low
     assert not run([(m(i), 45) for i in range(0, 25, 5)])[1]                               # only 20 min
     assert not run([(m(0), 45), (m(10), 45), (m(15), 70), (m(20), 45), (m(30), 45)])[1]    # a normal reading breaks the run
-    assert not run([(m(0), 45), (m(40), 45)])[1]                                           # 40-min gap: not sustained
+    assert run([(m(0), 45), (m(40), 45)])[2] == ["E2_shock"]                              # 2 consecutive lows 40 min apart (<= 60-min charting gap)
+    assert not run([(m(0), 45), (m(70), 45)])[1]                                           # 70-min gap: not sustained
     assert not run([(m(i), 50) for i in range(0, 60, 5)])[1]                               # MAP 50 is not < 50
     assert not run([(m(i), 0) for i in range(0, 60, 5)])[1]                                # 0 = disconnected line, dropped
     assert not run([(m(i) - 80, 45) for i in range(0, 40, 5)])[1]                          # outside [-48, 0] h of t0

@@ -978,3 +978,9 @@ Entries below follow `docs/research/plan_compliance_2026-10-08.md`. Dates are 20
 - **Decision:** The exploratory silver feasibility analysis (D-143) runs now on the silver labels produced at 03:58 UTC, before the silver-yield review (E2 shock, E5/E6 component mapping, report suppression) completes; it is rerun on the corrected labels and both versions are reported, the corrected one as primary.
 - **Rationale:** Project lead asked to speed up all parts; the review fixes only mapping errors, so an early run is informative and the rerun is cheap (checkpoints keyed by the label file).
 - **Source:** Project lead instruction (2026-10-09); `out/logs/silver_final.ok`.
+
+### D-152 Silver-yield review: profound-shock operationalisation and mapping fixes (amends D-088)
+- **Date:** 2026-10-09 · **Area:** labels · **Outcome data seen?** No (anchor-firing counts only; no label-by-EEG summaries) · **Data-quality aggregates seen?** Yes
+- **Decision:** (1) `profound_shock` = MAP < 50 mmHg on consecutive readings with no normal reading between, successive low readings ≤ 60 min apart (was 15; matches charting cadence), first-to-last spanning ≥ 30 min, window [-48, 0] h; threshold and duration unchanged. MAP derived from SBP/DBP including combined "SBP/DBP" text rows. (2) Mapping fixes: combined BP text split; unit aliases "millimeter of mercury" and "@"; blank-unit BP rows kept. (3) Silver report: per-site prevalence suppressed whenever its count is suppressed, including complementary suppression. E5 and E6 components verified correct and left unchanged (strict by design; E6 capped at ~3.4% by blood-culture availability).
+- **Rationale:** No MAP rows matched before the fix; the 15-min gap was incompatible with hourly charting. Expected shock yield remains <11, so E2 rests on arrest/asphyxia anchors.
+- **Source:** `docs/research/silver_yield_review.md`.

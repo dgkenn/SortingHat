@@ -134,6 +134,7 @@ measurement_items:
     name_exclude: 'venous|\bvbg\b|capillary|end[- ]?tidal|etco2|total co2|tco2|bicarb|mixed'
     unit: "mmHg"
     plausible: [5, 250]
+    unit_optional: true
     conversions: {"mmHg": {mul: 1}, "kPa": {mul: 7.50062}}
   ph_arterial:
     codes: [{system: LOINC, code: "2744-1", unit: "pH"}]
@@ -263,6 +264,7 @@ support_items:
     name_exclude: 'pulmonary|\bpap\b|\bcpp\b|cerebral|perfusion|intracranial|\bicp\b|target|goal|set|alarm|limit|\bmap kinase'
     unit: "mmHg"
     plausible: [10, 300]
+    unit_optional: true       # BP is always mmHg; blank-unit rows (Epic) are kept, plausibility-guarded
     conversions: {"mmHg": {mul: 1}, "kPa": {mul: 7.50062}, "@": {mul: 1}}
   sbp:
     codes: [{system: LOINC, code: "8480-6", unit: "mmHg"}]
@@ -270,6 +272,7 @@ support_items:
     name_exclude: 'pulmonary|\bpap\b|target|goal|set|alarm|limit|home|orthostatic'
     unit: "mmHg"
     plausible: [20, 350]
+    unit_optional: true
     conversions: {"mmHg": {mul: 1}, "@": {mul: 1}}      # "@" = placeholder unit on the S-site LFA blood-pressure rows (plausibility-guarded)
   dbp:
     codes: [{system: LOINC, code: "8462-4", unit: "mmHg"}]
@@ -700,7 +703,7 @@ derived_items:
   profound_shock:
     map_lt: 50
     min_duration_min: 30      # first-to-last low reading in one run
-    max_gap_min: 15           # consecutive low readings further apart than this do not form a run
+    max_gap_min: 60           # consecutive low readings further apart than this do not form a run (BP charting cadence: median 30 min, q75 60 min, so a 15-min gap could never bridge two readings)
     event_time: run_onset
   creatinine_doubling: {ratio: 2.0, baseline: min_prior_in_encounter, exclude: esrd}
   bilirubin_doubling_ge2: {min_value_mgdl: 2.0, ratio: 2.0, baseline: min_prior_in_encounter}
