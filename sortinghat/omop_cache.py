@@ -62,6 +62,7 @@ ENV_WORKERS = "SORTINGHAT_FETCH_WORKERS"
 DEFAULT_WORKERS = 4
 DEFAULT_SUBDIR = Path("out") / "local_only" / "omop_cache"
 NO_PERSON_TABLES = frozenset({"concept"})             # vocabulary: cached with the superset columns, no person filter
+SKIPPED = object()                                    # yielded by ``iter_rowgroups`` for a unit the caller asked to skip
 
 
 # ------------------------------------------------------------------------------------------------ configuration
@@ -263,8 +264,13 @@ class SharedReader:
         return sum(c["n"] for c in counts) if all(c is not None for c in counts) else None
 
     # -- units
-    def _lookup(self, key: str, rg: int):
-        """(found, table | None). ``load=False`` (warm-up) only checks presence."""
+    def unit_id(self, key: str, rg: int) -> str:
+        """Stable id of one cached row group (part directory name + row group number), for callers that checkpoint per unit."""
+        return f"{self._part_dir(key).name}:{rg}"
+
+    def _lookup(self, key: str, rg: int, cols: list[str] | None = None):
+        """(found, table | None). ``load=False`` (warm-up) only checks presence. ``cols``: read only these columns (those the
+        cached file has) instead of the whole superset row group."""
         d = self._part_dir(key)
         if (d / f"rg-{rg:06d}.empty").exists():
             return True, None
@@ -275,7 +281,11 @@ class SharedReader:
             return True, None
         try:
             import pyarrow.parquet as pq
-            return True, pq.ParquetFile(p).read()
+            pf = pq.ParquetFile(p)
+            if cols is None:
+                return True, pf.read()
+            have = set(pf.schema_arrow.names)
+            return True, pf.read(columns=[c for c in cols if c in have])
         except Exception:  # noqa: BLE001 - unreadable (truncated by a kill / disk full): a miss, refetched and replaced
             return False, None
 
@@ -300,10 +310,10 @@ class SharedReader:
         self._tl.pf, self._tl.key = pf, key
         return pf
 
-    def _work(self, key: str, rg: int, use: list[str]):
+    def _work(self, key: str, rg: int, use: list[str], cols: list[str] | None = None):
         unit = str(self._part_dir(key) / f"rg-{rg:06d}")
         if not self.refresh or unit in self._fresh:
-            hit, tbl = self._lookup(key, rg)
+            hit, tbl = self._lookup(key, rg, cols)
             if hit:
                 return True, tbl
         pf = self._open(key)
@@ -333,7 +343,10 @@ class SharedReader:
             for rg in range(man["n"]):
                 yield key, rg, man["use"]
 
-    def iter_rowgroups(self, on_error: Callable[[str, Exception], None] | None = None):
+    def iter_rowgroups(self, on_error: Callable[[str, Exception], None] | None = None, cols: list[str] | None = None,
+                       skip: Callable[[str], bool] | None = None):
+        """``cols``: load only these columns of a cached row group. ``skip(unit_id)``: true for a unit the caller already has
+        (e.g. a stored result); it is yielded as ``SKIPPED`` without being loaded or fetched."""
         tasks = self._tasks(on_error)
         window: deque = deque()
         failed: set[str] = set()
@@ -347,11 +360,19 @@ class SharedReader:
                         exhausted = True
                         break
                     key, rg, use = nxt
-                    window.append((key, rg, pool.submit(self._work, key, rg, use)))
+                    if skip is not None and skip(self.unit_id(key, rg)):
+                        window.append((key, rg, None))
+                    else:
+                        window.append((key, rg, pool.submit(self._work, key, rg, use, cols)))
                     self.max_in_flight = max(self.max_in_flight, len(window))
                 if not window:
                     break
                 key, rg, fut = window.popleft()
+                if fut is None:
+                    if key not in failed:
+                        self.progress.tick(True)
+                        yield key, rg, SKIPPED
+                    continue
                 try:
                     hit, tbl = fut.result()
                 except Exception as exc:  # noqa: BLE001 - a part that still fails after the retries: reported, rest skipped

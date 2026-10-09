@@ -185,6 +185,13 @@ class ConceptMap:
         return self.unit_alias.get(c, c)
 
     # ------------------------------------------------------------------------------- unit conversion
+    def _unit_tokens(self, units) -> np.ndarray:
+        """``unit_token`` of every element, computed once per unique unit string (object array)."""
+        arr = np.asarray(units, dtype=object)
+        codes, uniq = pd.factorize(arr)
+        tab = np.array([self.unit_token(u) for u in uniq] + [""], dtype=object)       # last slot: missing (code -1)
+        return tab[codes]
+
     def convert_value(self, item: str, value: float, unit, default_unit: str = "") -> tuple[float, str]:
         """Convert one value to the item's canonical unit. Returns ``(value, status)``; status is ``ok``,
         ``unit_missing``, ``unit_unrecognised`` or ``implausible`` (value is NaN unless ``ok``)."""
@@ -198,9 +205,9 @@ class ConceptMap:
         unit; a blank unit with no default is dropped unless the item is ``unit_optional`` (pH)."""
         sp = self.specs[item]
         v = pd.to_numeric(values, errors="coerce").astype(float).to_numpy()
-        tok = np.array([self.unit_token(u) for u in units], dtype=object)
+        tok = self._unit_tokens(units)
         if default_units is not None:
-            dft = np.array([self.unit_token(u) for u in default_units], dtype=object)
+            dft = self._unit_tokens(default_units)
             tok = np.where(tok == "", dft, tok)
         out = np.full(len(v), np.nan)
         status = np.empty(len(v), dtype=object)
@@ -285,14 +292,35 @@ class ConceptMap:
         return "unknown"
 
     # ---------------------------------------------------------------------------- code-event helpers
+    def _prefix_index(self, prefix: list):
+        """Prefix rules indexed by (system, prefix text) with the distinct prefix lengths per system, so a code is tested with
+        one dict lookup per length instead of one ``startswith`` per rule. Cached per rule list."""
+        cache = self.__dict__.setdefault("_pidx", {})
+        got = cache.get(id(prefix))
+        if got is not None and got[0] is prefix and got[1] == len(prefix):
+            return got[2], got[3]
+        by: dict = {}
+        lens: dict = {}
+        for pos, (s, p, it, ex) in enumerate(prefix):
+            by.setdefault((s, p), []).append((pos, it, ex))
+            lens.setdefault(s, set()).add(len(p))
+        lens = {s: sorted(v) for s, v in lens.items()}
+        cache[id(prefix)] = (prefix, len(prefix), by, lens)
+        return by, lens
+
     def _code_hits(self, system_codes: Iterable[tuple[str, str]], exact, prefix) -> tuple[str, ...]:
         hits: list[str] = []
+        by, lens = self._prefix_index(prefix)
         for system, code in system_codes:
             for it in exact.get((system, code), ()):
                 if it not in hits:
                     hits.append(it)
-            for s, p, it, ex in prefix:
-                if s == system and code.startswith(p) and not (ex is not None and ex.search(code)) and it not in hits:
+            found = []
+            for n in lens.get(system, ()):
+                if n <= len(code):
+                    found.extend(by.get((system, code[:n]), ()))
+            for _pos, it, ex in sorted(found, key=lambda x: x[0]):
+                if not (ex is not None and ex.search(code)) and it not in hits:
                     hits.append(it)
         return tuple(hits)
 
@@ -374,60 +402,147 @@ class ConceptIndex:
         self.n_ingested = 0
         self._vocabs = set(self.cm.raw.get("vocabularies", []))
 
-    def ingest(self, df: pd.DataFrame) -> None:
-        """Add one batch of ``omop_concept`` rows (columns ``CONCEPT_COLUMNS``; extra columns ignored)."""
-        if df is None or len(df) == 0:
+    # -- state (checkpointed once per run: the classified concept map)
+    def state(self) -> dict:
+        return {"meas": self.meas, "cond": self.cond, "proc": self.proc, "drug": self.drug, "unit_code": self.unit_code,
+                "value_name": self.value_name, "n_ingested": self.n_ingested}
+
+    def load_state(self, st: dict) -> None:
+        for k, v in st.items():
+            setattr(self, k, v)
+
+    # -- vectorised ingest
+    def _prepare(self) -> None:
+        """Lookup structures for the vectorised mask (built once): exact codes per vocabulary, prefix rules, RxNorm codes."""
+        if getattr(self, "_prep", None) is not None:
             return
+        cm = self.cm
+        exact: dict[str, list[str]] = {}
+        for v, c in list(cm.meas_code) + list(cm.cond_exact) + list(cm.proc_exact):
+            exact.setdefault(v, []).append(c)
+        pats = [rxp.pattern for _, _, rxp, _, _ in cm.drugs]
+        self._prep = {"exact": exact, "prefix": list(cm.cond_prefix) + list(cm.proc_prefix),
+                      "rxcodes": list(cm.rxnorm_code),
+                      "any_rx_re2": "|".join(f"(?:{p})" for p in pats) if pats else None}
+
+    def _as_arrow(self, df):
+        """Concept rows as an Arrow table: ``concept_id`` int64 without nulls, the four text columns as non-null strings."""
+        import pyarrow as pa
+        import pyarrow.compute as pc
+        if isinstance(df, pa.RecordBatch):
+            df = pa.Table.from_batches([df])
+        if isinstance(df, pa.Table) and "concept_id" in df.column_names and pa.types.is_integer(df.schema.field("concept_id").type):
+            cols = [c for c in self.CONCEPT_COLUMNS if c in df.column_names]
+            t = df.select(cols)
+            t = t.filter(pc.is_valid(t.column("concept_id")))
+            data = {"concept_id": pc.cast(t.column("concept_id"), pa.int64())}
+            for c in ("concept_name", "domain_id", "vocabulary_id", "concept_code"):
+                if c in t.column_names:
+                    data[c] = pc.fill_null(pc.cast(t.column(c), pa.string()), "")
+                else:
+                    data[c] = pa.array([""] * t.num_rows, type=pa.string())
+            return pa.table(data)
+        if isinstance(df, pa.Table):
+            df = df.to_pandas()
         d = df[[c for c in self.CONCEPT_COLUMNS if c in df.columns]].copy()
         for c in ("concept_name", "domain_id", "vocabulary_id", "concept_code"):
             d[c] = d[c].astype(object).where(d[c].notna(), "").astype(str) if c in d else ""
         d["concept_id"] = pd.to_numeric(d["concept_id"], errors="coerce")
         d = d[d["concept_id"].notna()]
-        self.n_ingested += len(d)
-        ucum = d[d["vocabulary_id"] == "UCUM"]
-        for cid, code in zip(ucum["concept_id"].astype("int64"), ucum["concept_code"]):
-            self.unit_code[int(cid)] = code
-        mv = d[d["domain_id"] == "Meas Value"]
-        for cid, nm in zip(mv["concept_id"].astype("int64"), mv["concept_name"]):
-            self.value_name[int(cid)] = nm
-        d = d[d["vocabulary_id"].isin(self._vocabs)]
-        if d.empty:
+        d["concept_id"] = d["concept_id"].astype("int64")
+        return pa.table({"concept_id": pa.array(d["concept_id"].to_numpy(), type=pa.int64()),
+                         **{c: pa.array(d[c].astype(object).tolist(), type=pa.string())
+                            for c in ("concept_name", "domain_id", "vocabulary_id", "concept_code")}})
+
+    def ingest(self, df) -> None:
+        """Add one batch of ``omop_concept`` rows (a DataFrame, Arrow table or record batch with columns ``CONCEPT_COLUMNS``;
+        extra columns ignored). Vectorised in Arrow (vocabulary / code / regex masks, RE2 name prefilter), so only the few rows
+        that can match reach Python. (Restricting to the concept ids that occur in the cohort's fact tables was measured and
+        rejected: scanning the id columns of the cached fact tables costs more than classifying the whole vocabulary.)"""
+        import pyarrow as pa
+        import pyarrow.compute as pc
+        if df is None or len(df) == 0:
             return
-        norm = pd.Series([normalize_code(v, c) for v, c in zip(d["vocabulary_id"], d["concept_code"])], index=d.index)
-        cm = self.cm
-        exact = {k for k in list(cm.meas_code) + list(cm.cond_exact) + list(cm.proc_exact)}
-        keys = list(zip(d["vocabulary_id"], norm))
-        mask = pd.Series([k in exact for k in keys], index=d.index)
-        for s, p, _, _ in cm.cond_prefix + cm.proc_prefix:
-            mask |= (d["vocabulary_id"] == s) & norm.str.startswith(p)
-        mask |= (d["vocabulary_id"] == "RxNorm") & d["concept_code"].isin(list(cm.rxnorm_code))
-        for cid, vocab, code in zip(d.loc[mask, "concept_id"].astype("int64"), d.loc[mask, "vocabulary_id"],
-                                    norm[mask]):
+        t = self._as_arrow(df)
+        self.n_ingested += t.num_rows
+        if t.num_rows == 0:
+            return
+        vocab, domain = t.column("vocabulary_id"), t.column("domain_id")
+        ucum = t.filter(pc.equal(vocab, "UCUM"))
+        for cid, code in zip(ucum.column("concept_id").to_pylist(), ucum.column("concept_code").to_pylist()):
+            self.unit_code[int(cid)] = code
+        mv = t.filter(pc.equal(domain, "Meas Value"))
+        for cid, nm in zip(mv.column("concept_id").to_pylist(), mv.column("concept_name").to_pylist()):
+            self.value_name[int(cid)] = nm
+        d = t.filter(pc.is_in(vocab, value_set=pa.array(sorted(self._vocabs), type=pa.string())))
+        if d.num_rows == 0:
+            return
+        self._prepare()
+        prep, cm = self._prep, self.cm
+        vocab, code = d.column("vocabulary_id"), d.column("concept_code")
+        stripped = pc.utf8_trim_whitespace(code)
+        is_icd = pc.is_in(vocab, value_set=pa.array(ICD_SYSTEMS, type=pa.string()))
+        is_up = pc.is_in(vocab, value_set=pa.array(["CPT4", "HCPCS"], type=pa.string()))
+        norm = pc.if_else(is_icd, pc.utf8_upper(pc.replace_substring_regex(stripped, r"[^A-Za-z0-9]", "")),
+                          pc.if_else(is_up, pc.utf8_upper(stripped), stripped))
+        mask = pa.array([False] * d.num_rows)
+        for v, codes in prep["exact"].items():
+            mask = pc.or_(mask, pc.and_(pc.equal(vocab, v), pc.is_in(norm, value_set=pa.array(codes, type=pa.string()))))
+        for s, p, _, _ in prep["prefix"]:
+            mask = pc.or_(mask, pc.and_(pc.equal(vocab, s), pc.starts_with(norm, pattern=p)))
+        if prep["rxcodes"]:
+            mask = pc.or_(mask, pc.and_(pc.equal(vocab, "RxNorm"),
+                                        pc.is_in(code, value_set=pa.array(prep["rxcodes"], type=pa.string()))))
+        mask = pc.fill_null(mask, False)
+        sel_id = d.column("concept_id").filter(mask).to_pylist()
+        sel_v = vocab.filter(mask).to_pylist()
+        sel_n = norm.filter(mask).to_pylist()
+        for cid, v, c in zip(sel_id, sel_v, sel_n):
             cid = int(cid)
-            if (vocab, code) in cm.meas_code:
-                self.meas.setdefault(cid, []).extend(cm.meas_code[(vocab, code)])
-            ch = cm._code_hits([(vocab, code)], cm.cond_exact, cm.cond_prefix)
+            if (v, c) in cm.meas_code:
+                self.meas.setdefault(cid, []).extend(cm.meas_code[(v, c)])
+            ch = cm._code_hits([(v, c)], cm.cond_exact, cm.cond_prefix)
             if ch:
                 self.cond[cid] = tuple(dict.fromkeys(self.cond.get(cid, ()) + ch))
-            ph = cm._code_hits([(vocab, code)], cm.proc_exact, cm.proc_prefix)
+            ph = cm._code_hits([(v, c)], cm.proc_exact, cm.proc_prefix)
             if ph:
                 self.proc[cid] = tuple(dict.fromkeys(self.proc.get(cid, ()) + ph))
         # drugs: RxNorm ingredient codes + concept-name regex over RxNorm / RxNorm Extension drug concepts
-        rx = d[d["vocabulary_id"].isin(RXNORM_VOCABS)]
-        for cid, code, vocab in zip(rx["concept_id"].astype("int64"), rx["concept_code"], rx["vocabulary_id"]):
-            if vocab == "RxNorm" and code in cm.rxnorm_code:
-                self.drug[int(cid)] = tuple(dict.fromkeys(self.drug.get(int(cid), ()) + tuple(cm.rxnorm_code[code])))
-        if len(rx):
-            low = rx["concept_name"].str.lower()
-            any_rx = re.compile("|".join(f"(?:{rxp.pattern})" for _, _, rxp, _, _ in cm.drugs), re.I)
-            surv = low[[bool(any_rx.search(x)) for x in low]]            # one pass; per-ingredient work on survivors
-            for g, ing, rxp, ex, _ in cm.drugs:
-                for cid, nm in zip(surv.index, surv):
-                    if rxp.search(nm) and not (ex is not None and ex.search(nm)):
-                        c = int(rx.at[cid, "concept_id"])
-                        cur = self.drug.get(c, ())
-                        if (g, ing) not in cur:
-                            self.drug[c] = cur + ((g, ing),)
+        rx = d.filter(pc.is_in(vocab, value_set=pa.array(RXNORM_VOCABS, type=pa.string())))
+        if rx.num_rows == 0:
+            return
+        rx_cid, rx_code, rx_voc = (rx.column(c).to_pylist() for c in ("concept_id", "concept_code", "vocabulary_id"))
+        rxm = pc.fill_null(pc.and_(pc.equal(rx.column("vocabulary_id"), "RxNorm"),
+                                   pc.is_in(rx.column("concept_code"),
+                                            value_set=pa.array(prep["rxcodes"], type=pa.string()))), False)
+        for i in np.flatnonzero(rxm.to_numpy(zero_copy_only=False)):
+            c = int(rx_cid[i])
+            self.drug[c] = tuple(dict.fromkeys(self.drug.get(c, ()) + tuple(cm.rxnorm_code[rx_code[i]])))
+        if prep["any_rx_re2"] is None:
+            return
+        names = rx.column("concept_name")
+        low = pc.utf8_lower(names)
+        try:           # RE2 prefilter (a superset of what Python's re accepts for these patterns); exact check follows
+            pre = pc.fill_null(pc.match_substring_regex(low, prep["any_rx_re2"], ignore_case=True), True)
+            cand = np.flatnonzero(pre.to_numpy(zero_copy_only=False))
+        except pa.ArrowInvalid:
+            cand = np.arange(rx.num_rows)
+        low_c = low.take(pa.array(cand))
+        low_l = low_c.to_pylist()
+        surv = [(int(c), nm) for c, nm in zip(cand, low_l)]
+        for g, ing, rxp, ex, _ in cm.drugs:           # per ingredient: RE2 prefilter, then the exact Python check on its hits
+            try:
+                hit = np.flatnonzero(pc.fill_null(pc.match_substring_regex(low_c, rxp.pattern, ignore_case=True),
+                                                  True).to_numpy(zero_copy_only=False))
+            except pa.ArrowInvalid:
+                hit = range(len(surv))
+            for j in hit:
+                i, nm = surv[j]
+                if rxp.search(nm) and not (ex is not None and ex.search(nm)):
+                    c = int(rx_cid[i])
+                    cur = self.drug.get(c, ())
+                    if (g, ing) not in cur:
+                        self.drug[c] = cur + ((g, ing),)
 
     # ------------------------------------------------------------------------------------------ lookups
     def n_resolved(self) -> dict[str, int]:

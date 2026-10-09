@@ -27,6 +27,7 @@ from __future__ import annotations
 
 import argparse
 import re
+import time
 from collections import Counter
 from dataclasses import dataclass, field
 from pathlib import Path
@@ -95,7 +96,7 @@ class _Ctx:
         self.hi = (g.max() + pd.Timedelta(days=pf["forward_days"])).astype("datetime64[us]")
         self.pids = set(int(p) for p in self.lo.index)
         self.diag: Counter = Counter()
-        self.visit_start: dict[int, pd.Timestamp] = {}
+        self.visit_start: pd.Series = pd.Series(dtype="datetime64[us]", index=pd.Index([], dtype="int64"))   # visit_id -> start
 
     def count(self, key: str, n: int = 1) -> None:
         if n:
@@ -135,6 +136,31 @@ def _num(d: pd.DataFrame, col: str) -> pd.Series:
 
 def _txt(d: pd.DataFrame, col: str) -> pd.Series:
     return d[col].astype(object) if col in d else pd.Series(None, index=d.index, dtype=object)
+
+
+def _isna(a) -> np.ndarray:
+    """Boolean missing-mask of an object array / Series (``None`` and NaN, not lists)."""
+    return np.asarray(pd.isna(np.asarray(a, dtype=object)), dtype=bool)
+
+
+def _gather(per_unique: list, codes: np.ndarray) -> np.ndarray:
+    """Object array ``out[i] = per_unique[codes[i]]`` (``None`` where ``codes[i] == -1``); values are stored as they are
+    (no numpy broadcasting of tuples / lists)."""
+    arr = np.empty(len(per_unique) + 1, dtype=object)
+    for j, v in enumerate(per_unique):
+        arr[j] = v
+    arr[-1] = None
+    return arr[codes]
+
+
+def _id_hits(ids: pd.Series, mapping: Mapping) -> np.ndarray:
+    """``ids.map(mapping)`` as an object array (``None`` where the id is missing / not in ``mapping``), one dict lookup per UNIQUE id."""
+    codes, uniq = pd.factorize(ids)
+    vals = []
+    for u in uniq:
+        f = float(u)
+        vals.append(mapping.get(int(f)) if f.is_integer() and mapping else None)
+    return _gather(vals, codes)
 
 
 def _times(d: pd.DataFrame, dt_col: str, date_col: str | None = None, time_col: str | None = None):
@@ -199,7 +225,10 @@ def classify_visits(d: pd.DataFrame, ctx: _Ctx) -> pd.DataFrame:
 
 
 def classify_measurements(d: pd.DataFrame, ctx: _Ctx) -> pd.DataFrame:
-    """Rows of ``omop_measurement`` matched to anchor / support items, with converted values and result status."""
+    """Rows of ``omop_measurement`` matched to anchor / support items, with converted values and result status.
+
+    Vectorised: names, concept ids and units are resolved once per UNIQUE value and gathered back to the rows; only the rows
+    that matched an item (or a tox agent) reach Python loops."""
     cm, ix, cfg = ctx.cm, ctx.index, ctx.cfg
     d = _restrict(d, ctx)
     if d.empty:
@@ -211,25 +240,25 @@ def classify_measurements(d: pd.DataFrame, ctx: _Ctx) -> pd.DataFrame:
     if d.empty:
         return _empty(MEAS_COLS)
     names = _txt(d, "measurement_source_value")
-    r1 = _num(d, "measurement_concept_id").map(ix.meas)
-    r2 = _num(d, "measurement_source_concept_id").map(ix.meas)
+    ncodes, nuniq = pd.factorize(names)
+    r1 = _id_hits(_num(d, "measurement_concept_id"), ix.meas)
+    r2 = _id_hits(_num(d, "measurement_source_concept_id"), ix.meas)
     loinc = {c: v for (s, c), v in cm.meas_code.items() if s == "LOINC"}
-    r3 = names.map(lambda x: loinc.get(str(x).strip()) if x is not None and x == x else None)
-    hit, basis = r1.copy(), pd.Series(np.where(r1.notna(), "concept", ""), index=d.index, dtype=object)
+    r3 = _gather([loinc.get(str(u).strip()) for u in nuniq], ncodes)
+    hit = r1.copy()
+    basis = np.where(~_isna(r1), "concept", "").astype(object)
     routes = [(r2, "source_concept"), (r3, "source_code")]
     if cfg.allow_name_fallback:
-        uniq = {u: cm.classify_measurement_name(u) for u in names.dropna().unique()}
-        r4 = names.map(lambda x: [(k, "") for k in uniq[x]] if x in uniq and uniq[x] else None)
+        r4 = _gather([[(k, "") for k in cm.classify_measurement_name(u)] or None for u in nuniq], ncodes)
         routes.append((r4, "name"))
     for r, b in routes:
-        m = hit.isna() & r.notna()
-        hit = hit.where(~m, r)
-        basis = basis.where(~m, b)
-    rows = []
-    for i in hit.index[hit.notna()]:
-        for item, unit in hit.at[i]:
-            rows.append((i, item, unit, basis.at[i]))
+        m = _isna(hit) & ~_isna(r)
+        hit[m] = r[m]
+        basis[m] = b
+    matched_pos = np.flatnonzero(~_isna(hit))
+    rows = [(int(i), item, unit, basis[i]) for i in matched_pos for item, unit in hit[i]]
     out = []
+    m = None
     if rows:
         m = pd.DataFrame(rows, columns=["i", "item", "unit_default", "basis"])
         ctx.count("meas_rows_matched", len(m))
@@ -239,10 +268,22 @@ def classify_measurements(d: pd.DataFrame, ctx: _Ctx) -> pd.DataFrame:
         unit = _txt(d, "unit_source_value")
         blank = unit.isna() | (unit.astype(str).str.strip() == "")
         if "unit_concept_id" in d:
-            unit = unit.where(~blank, _num(d, "unit_concept_id").map(ix.unit_code))
-        vname = _num(d, "value_as_concept_id").map(ix.value_name) if "value_as_concept_id" in d else \
-            pd.Series(None, index=d.index, dtype=object)
-        vtext = _txt(d, "value_source_value")
+            unit = pd.Series(np.where(blank.to_numpy(), _id_hits(_num(d, "unit_concept_id"), ix.unit_code),
+                                      unit.to_numpy(dtype=object)), index=d.index, dtype=object)
+        vname = _id_hits(_num(d, "value_as_concept_id"), ix.value_name) if "value_as_concept_id" in d else \
+            np.full(len(d), None, dtype=object)
+        vtext = _txt(d, "value_source_value").to_numpy(dtype=object)
+        valn = val.to_numpy(dtype=float)
+        status_memo: dict = {}
+
+        def status(item: str, j: int) -> str:
+            tx, vn, nu = vtext[j], vname[j], valn[j]
+            key = (item, None if tx is None or tx != tx else tx, None if vn is None or vn != vn else vn,
+                   None if nu != nu else nu)
+            got = status_memo.get(key)
+            if got is None:
+                got = status_memo[key] = cm.result_status(item, tx, vn, nu)
+            return got
         for item, g in m.groupby("item", sort=False):
             sp = cm.specs[item]
             ii = g["i"].to_numpy()
@@ -262,7 +303,7 @@ def classify_measurements(d: pd.DataFrame, ctx: _Ctx) -> pd.DataFrame:
                         "status": "ok", "src_text": names.iloc[ii[ok]].to_numpy(),
                         "approx": approx.iloc[ii[ok]].to_numpy()}))
             else:                                                       # qualitative
-                sts = [cm.result_status(item, vtext.iat[j], vname.iat[j], val.iat[j]) for j in ii]
+                sts = [status(item, j) for j in ii]
                 for s_, n in Counter(sts).items():
                     ctx.count(f"qual_{item}_{s_}", n)
                 out.append(pd.DataFrame({
@@ -270,18 +311,29 @@ def classify_measurements(d: pd.DataFrame, ctx: _Ctx) -> pd.DataFrame:
                     "basis": g["basis"].to_numpy(), "value": np.nan, "status": sts,
                     "src_text": names.iloc[ii].to_numpy(), "approx": approx.iloc[ii].to_numpy()}))
     # tox screens: rows that no item claimed
-    matched = set(m["i"]) if rows else set()
-    free = [i for i in range(len(d)) if i not in matched]
-    if free:
-        tox = {u: cm.classify_tox_name(u) for u in names.iloc[free].dropna().unique()}
+    tox_u = [cm.classify_tox_name(u) for u in nuniq]
+    tox_flag = np.array([bool(x) for x in tox_u] + [False], dtype=bool)      # last slot: missing name (code -1)
+    cand = np.flatnonzero(tox_flag[ncodes])
+    if rows:
+        taken = np.zeros(len(d), dtype=bool)
+        taken[m["i"].to_numpy()] = True
+        cand = cand[~taken[cand]]
+    if len(cand):
+        vtext = _txt(d, "value_source_value").to_numpy(dtype=object)
+        vname = _id_hits(_num(d, "value_as_concept_id"), ix.value_name) if "value_as_concept_id" in d else \
+            np.full(len(d), None, dtype=object)
+        valn = _num(d, "value_as_number").to_numpy(dtype=float)
+        memo: dict = {}
         trows = []
-        vtext = _txt(d, "value_source_value")
-        vname = _num(d, "value_as_concept_id").map(ix.value_name) if "value_as_concept_id" in d else \
-            pd.Series(None, index=d.index, dtype=object)
-        val = _num(d, "value_as_number")
-        for i in free:
-            for ag in tox.get(names.iat[i], ()):
-                trows.append((i, ag, cm.result_status(f"tox:{ag}", vtext.iat[i], vname.iat[i], val.iat[i])))
+        for i in cand:
+            for ag in tox_u[ncodes[i]]:
+                tx, vn, nu = vtext[i], vname[i], valn[i]
+                key = (ag, None if tx is None or tx != tx else tx, None if vn is None or vn != vn else vn,
+                       None if nu != nu else nu)
+                got = memo.get(key)
+                if got is None:
+                    got = memo[key] = cm.result_status(f"tox:{ag}", tx, vn, nu)
+                trows.append((int(i), ag, got))
         if trows:
             tr = pd.DataFrame(trows, columns=["i", "agent", "st"])
             ctx.count("tox_rows_matched", len(tr))
@@ -296,37 +348,48 @@ def classify_measurements(d: pd.DataFrame, ctx: _Ctx) -> pd.DataFrame:
 def _code_event_rows(d: pd.DataFrame, ctx: _Ctx, *, table: str, dt_col: str, date_col: str, src_col: str,
                      cid_col: str, scid_col: str | None, id_map: Mapping, src_hits: Callable, text_col: str | None
                      ) -> pd.DataFrame:
-    """Shared logic for conditions and procedures: concept ids, then source concept ids, then code text, then wording."""
+    """Shared logic for conditions and procedures: concept ids, then source concept ids, then code text, then wording.
+    Vectorised: code / wording lookups run once per UNIQUE source value; only rows with a hit reach the Python loop."""
     cm = ctx.cm
     d = _restrict(d, ctx)
     if d.empty:
         return _empty(COND_COLS)
     t, approx = _times(d, dt_col, date_col)
-    if table == "condition" and "visit_occurrence_id" in d:                  # diagnosis timing: visit-start fallback
-        fb = _num(d, "visit_occurrence_id").map(ctx.visit_start)
+    if table == "condition" and "visit_occurrence_id" in d and len(ctx.visit_start):    # diagnosis timing: visit-start fallback
+        vid = _num(d, "visit_occurrence_id")
+        pos = ctx.visit_start.index.get_indexer(vid.fillna(-1).astype("int64"))
+        pos = np.where(vid.notna().to_numpy(), pos, -1)
+        fb = pd.Series(ctx.visit_start.to_numpy()[np.where(pos < 0, 0, pos)], index=d.index)
+        fb = fb.where(pos >= 0, pd.NaT)
         use = t.isna() & fb.notna()
         t = t.where(~use, pd.to_datetime(fb).astype("datetime64[us]")).astype("datetime64[us]")
         approx = approx | use
         ctx.count("dx_time_from_visit_start", int(use.sum()))
     src = _txt(d, src_col)
-    h1 = _num(d, cid_col).map(id_map) if cid_col in d else pd.Series(None, index=d.index, dtype=object)
-    h2 = _num(d, scid_col).map(id_map) if scid_col and scid_col in d else pd.Series(None, index=d.index, dtype=object)
-    uniq = {u: src_hits(u) for u in src.dropna().unique()}
-    h3 = src.map(lambda x: uniq.get(x) or None if x is not None and x == x else None)
+    scodes, suniq = pd.factorize(src)
+    none_arr = np.full(len(d), None, dtype=object)
+    h1 = _id_hits(_num(d, cid_col), id_map) if cid_col in d else none_arr
+    h2 = _id_hits(_num(d, scid_col), id_map) if scid_col and scid_col in d else none_arr
+    h3 = _gather([src_hits(u) or None for u in suniq], scodes)
+    has = ~_isna(h1) | ~_isna(h2) | ~_isna(h3)
+    text_rows: dict[int, tuple] = {}
+    if text_col:
+        th = [cm.text_hits(table, u) for u in suniq]
+        flag = np.array([bool(x) for x in th] + [False], dtype=bool)
+        for i in np.flatnonzero(flag[scodes] & ~has):
+            text_rows[int(i)] = th[scodes[i]]
     rows = []
-    has = (h1.notna() | h2.notna() | h3.notna()).to_numpy()
-    text_cache: dict = {}
-    for i in range(len(d)):
+    cand = np.flatnonzero(has)
+    if text_rows:
+        cand = np.union1d(cand, np.fromiter(text_rows, dtype="int64"))
+    for i in cand:
         if has[i]:
-            for h, b in ((h1.iat[i], "concept"), (h2.iat[i], "source_concept"), (h3.iat[i], "source_code")):
+            for h, b in ((h1[i], "concept"), (h2[i], "source_concept"), (h3[i], "source_code")):
                 if isinstance(h, (tuple, list)) and len(h):
-                    rows += [(i, it, b) for it in h]
+                    rows += [(int(i), it, b) for it in h]
                     break
-        elif text_col:
-            v = src.iat[i]
-            if v not in text_cache:
-                text_cache[v] = cm.text_hits(table, v)
-            rows += [(i, it, "name") for it in text_cache[v]]
+        else:
+            rows += [(int(i), it, "name") for it in text_rows[int(i)]]
     if not rows:
         return _empty(COND_COLS)
     r = pd.DataFrame(rows, columns=["i", "item", "basis"])
@@ -368,16 +431,18 @@ def classify_observations(d: pd.DataFrame, ctx: _Ctx) -> pd.DataFrame:
         return _empty(COND_COLS)
     t, approx = _times(d, "observation_datetime", "observation_date")
     src, val = _txt(d, "observation_source_value"), _txt(d, "value_as_string")
+    scodes, suniq = pd.factorize(src)
+    th = [cm.text_hits("observation", u) for u in suniq]
+    flag = np.array([bool(x) for x in th] + [False], dtype=bool)
+    valv = val.to_numpy(dtype=object)
     rows = []
-    for i in range(len(d)):
-        hits = cm.text_hits("observation", src.iat[i])
-        if not hits:
-            continue
-        v = val.iat[i]
+    for i in np.flatnonzero(flag[scodes]):
+        hits = th[scodes[i]]
+        v = valv[i]
         if v is not None and v == v and (_OBS_NEG.search(str(v)) or cm.result_re["negative"].search(str(v).strip().lower())):
             ctx.count("obs_negated")
             continue
-        rows += [(i, it) for it in hits]
+        rows += [(int(i), it) for it in hits]
     if not rows:
         return _empty(COND_COLS)
     r = pd.DataFrame(rows, columns=["i", "item"])
@@ -404,22 +469,26 @@ def classify_drugs(d: pd.DataFrame, ctx: _Ctx) -> pd.DataFrame:
     if d.empty:
         return _empty(DRUG_COLS)
     src, route = _txt(d, "drug_source_value"), _txt(d, "route_source_value")
-    c_hits = _num(d, "drug_concept_id").map(ix.drug)
-    uniq = {u: cm.drug_text_hits(u) for u in src.dropna().unique()}
+    c_hits = _id_hits(_num(d, "drug_concept_id"), ix.drug)
+    scodes, suniq = pd.factorize(src)
+    th = [cm.drug_text_hits(u) for u in suniq]
+    flag = np.array([bool(x) for x in th] + [False], dtype=bool)
+    cand = np.flatnonzero(np.array([isinstance(c, tuple) for c in c_hits], dtype=bool) | flag[scodes])
+    srcv, routev = src.to_numpy(dtype=object), route.to_numpy(dtype=object)
     rows = []
-    for i in range(len(d)):
+    for i in cand:
         seen: dict = {}
-        ch = c_hits.iat[i]
+        ch = c_hits[i]
         if isinstance(ch, tuple):
             for g, ing in ch:
                 seen[(g, ing)] = "concept"
-        for g, ing in uniq.get(src.iat[i], ()) if src.iat[i] == src.iat[i] and src.iat[i] is not None else ():
+        for g, ing in th[scodes[i]] if scodes[i] >= 0 else ():
             seen.setdefault((g, ing), "name")
         for (g, ing), b in seen.items():
-            if g == "antimicrobial" and not cm.abx_route_ok(ing, route.iat[i], src.iat[i]):
+            if g == "antimicrobial" and not cm.abx_route_ok(ing, routev[i], srcv[i]):
                 ctx.count("abx_rows_route_rejected")
                 continue
-            rows.append((i, g, ing, b))
+            rows.append((int(i), g, ing, b))
     if not rows:
         return _empty(DRUG_COLS)
     r = pd.DataFrame(rows, columns=["i", "group", "ingredient", "basis"])
@@ -468,58 +537,118 @@ def classify_tables(tables: Mapping[str, pd.DataFrame], ctx: _Ctx) -> Classified
 
 
 def _set_visit_starts(visits: pd.DataFrame, ctx: _Ctx) -> None:
+    """``ctx.visit_start``: visit_id -> start (a Series with a unique int64 index; the last row wins, like the old dict)."""
     v = visits[visits["visit_id"].notna() & visits["v_start"].notna()]
-    ctx.visit_start = dict(zip(v["visit_id"].astype("int64"), v["v_start"]))
+    s = pd.Series(v["v_start"].astype("datetime64[us]").to_numpy(), index=pd.Index(v["visit_id"].astype("int64").to_numpy()))
+    ctx.visit_start = s[~s.index.duplicated(keep="last")]
+
+
+PROGRESS_EVERY_S = 30.0          # a progress line at least this often (and one per 25 units)
+
+
+class _UnitProgress:
+    """Aggregate progress of one table: ``silver_labels: measurement 120/551 row groups (resumed 100)``. Throttled by time and
+    count, plus a line at the end; no ids, no rows."""
+
+    def __init__(self, label: str):
+        self.label, self.done, self.resumed, self.total = label, 0, 0, None
+        self._t, self._n = time.monotonic(), 0
+
+    def tick(self, resumed: bool, total) -> None:
+        self.done += 1
+        self.resumed += int(resumed)
+        self.total = total if total is not None else self.total
+        if self.done - self._n >= 25 or time.monotonic() - self._t >= PROGRESS_EVERY_S:
+            self.emit()
+
+    def emit(self, final: bool = False) -> None:
+        self._t, self._n = time.monotonic(), self.done
+        tot = f"/{self.total}" if self.total is not None else ""
+        ck.log(f"silver_labels: {self.label} {self.done}{tot} row groups (resumed {self.resumed})" + (" done" if final else ""))
 
 
 def classify_store(store, ctx: _Ctx, on_error: Callable | None = None) -> Classified:
-    """Streaming path: each table is read in column-pruned, cohort-filtered Arrow batches and classified batch by batch,
-    so only matched rows are held in memory. ``store`` is a ``data_io.LocalStore`` or the S3 client (human-run only)."""
+    """Streaming path: each table is read in column-pruned, cohort-filtered Arrow batches and classified ROW GROUP by row group,
+    so only matched rows are held in memory. ``store`` is a ``data_io.LocalStore`` or the S3 client (human-run only).
+
+    Restart safety (active checkpoint): the classified concept map is stored once (``stage:concept-index``), then every
+    (table, row group) result, i.e. its matched anchor-event rows plus the diagnostic counts it added, is stored atomically
+    as soon as it is classified. A relaunch skips every stored unit WITHOUT reading it, so it resumes at the first unfinished
+    row group. Unit keys carry the cohort, config, concept map, concept index, the column list and (conditions) the visit starts.
+    A part that could not be read (``on_error``) is simply not stored and is retried on the next run."""
     pids = sorted(ctx.pids)
     cp = ck.active()
 
-    def stream(table: str, fn: Callable, cols: list[str], person_filter: bool = True) -> pd.DataFrame:
-        def run() -> tuple[pd.DataFrame, bool]:
-            failed = []
-            handler = on_error if on_error is None else (lambda k, e: (failed.append(k), on_error(k, e)))
-            parts = []
-            for b in data_io.iter_omop_batches(table, person_ids=pids if person_filter else None, columns=cols, s3=store,
-                                               on_error=handler):
-                parts.append(fn(b.to_pandas(), ctx))
-            return _concat(parts, []), not failed
-        if cp is None:
-            return run()[0]
-        # Whole-table unit (restart safety): the classified frame plus the diagnostic counts it added to ``ctx``. Keyed by the
-        # cohort, config, concept map, the visit starts later tables depend on and the column list. A table read with a
-        # skipped part (``on_error``) is never stored: an incomplete result must be recomputed.
-        unit = "stage:classified-%s:%s" % (table, ck.digest(cols, person_filter, ctx.cases, ctx.cfg, ctx.cm.raw,
-                                                           ctx.visit_start, ctx.index.n_ingested, fn.__name__))
-        hit = cp.get(unit)
-        if hit is not ck.MISS:
-            res, delta = hit
-            ctx.diag.update(delta)
-            ck.log(f"silver_labels: {table} classified table loaded from checkpoint")
-            return res
-        before = Counter(ctx.diag)
-        res, complete = run()
-        if complete:
-            cp.put(unit, (res, dict(Counter(ctx.diag) - before)))
-            ck.log(f"silver_labels: {table} classified table done")
-        return res
-    for batch in data_io.iter_omop_batches("concept", columns=COLUMNS["concept"], s3=store, on_error=on_error):
-        ctx.index.ingest(batch.to_pandas())
-    visits = stream("visit_occurrence", classify_visits, COLUMNS["visit_occurrence"])
+    def units(table: str, fn: Callable, cols: list[str], extra=None, label: str | None = None) -> pd.DataFrame:
+        prog = _UnitProgress(label or table)
+        key = ck.digest("silver-unit-v2", table, fn.__name__, cols, ctx.cases, ctx.cfg, ctx.cm.raw, ck.digest(ctx.index.state()),
+                        extra) if cp is not None else None
+        loaded: dict = {}
+
+        def have(uid: str) -> bool:
+            if cp is None:
+                return False
+            got = cp.get(f"silver:{key}:{uid}")
+            if got is ck.MISS:
+                return False
+            loaded[uid] = got
+            return True
+        frames = []
+        for uid, batches, total in data_io.iter_omop_units(table, person_ids=pids, columns=cols, s3=store, on_error=on_error,
+                                                           batch_rows=1 << 18, skip=have if cp is not None else None):
+            if batches is None:                                   # stored result: replay its frame and diagnostic counts
+                res, delta = loaded.pop(uid)
+                ctx.diag.update(delta)
+                frames.append(res)
+                prog.tick(True, total)
+                continue
+            before = Counter(ctx.diag)
+            res = _concat([fn(b.to_pandas(), ctx) for b in batches], [])
+            if cp is not None:
+                cp.put(f"silver:{key}:{uid}", (res, dict(Counter(ctx.diag) - before)))
+            frames.append(res)
+            prog.tick(False, total)
+        prog.emit(final=True)
+        return _concat(frames, [])
+
+    ctx.index = _concept_index(store, ctx, on_error, cp)
+    visits = units("visit_occurrence", classify_visits, COLUMNS["visit_occurrence"])
     if visits.empty:
         visits = _empty(VISIT_COLS)
     _set_visit_starts(visits, ctx)
     return Classified(visits,
-                      _or_empty(stream("measurement", classify_measurements, COLUMNS["measurement"]), MEAS_COLS),
-                      _or_empty(stream("condition_occurrence", classify_conditions, COLUMNS["condition_occurrence"]),
+                      _or_empty(units("measurement", classify_measurements, COLUMNS["measurement"]), MEAS_COLS),
+                      _or_empty(units("condition_occurrence", classify_conditions, COLUMNS["condition_occurrence"],
+                                      extra=ctx.visit_start), COND_COLS),
+                      _or_empty(units("procedure_occurrence", classify_procedures, COLUMNS["procedure_occurrence"]),
                                 COND_COLS),
-                      _or_empty(stream("procedure_occurrence", classify_procedures, COLUMNS["procedure_occurrence"]),
-                                COND_COLS),
-                      _or_empty(stream("observation", classify_observations, COLUMNS["observation"]), COND_COLS),
-                      _or_empty(stream("drug_exposure", classify_drugs, COLUMNS["drug_exposure"]), DRUG_COLS))
+                      _or_empty(units("observation", classify_observations, COLUMNS["observation"]), COND_COLS),
+                      _or_empty(units("drug_exposure", classify_drugs, COLUMNS["drug_exposure"]), DRUG_COLS))
+
+
+def _concept_index(store, ctx: _Ctx, on_error: Callable | None, cp) -> ConceptIndex:
+    """The classified concept map, built once: omop_concept is streamed row group by row group into ``ConceptIndex.ingest``
+    (vectorised) and the resulting index is stored as one checkpoint unit. A restart loads it in a moment."""
+    name = "stage:concept-index:" + ck.digest("v2", ctx.cm.raw) if cp is not None else None
+    if cp is not None:
+        got = cp.get(name)
+        if got is not ck.MISS:
+            ctx.index.load_state(got)
+            ck.log("silver_labels: concept map loaded from checkpoint")
+            return ctx.index
+    failed = []
+    handler = on_error if on_error is None else (lambda k, e: (failed.append(k), on_error(k, e)))
+    prog = _UnitProgress("concept")
+    for _uid, batches, total in data_io.iter_omop_units("concept", columns=COLUMNS["concept"], s3=store, on_error=handler,
+                                                       batch_rows=1 << 20):
+        for b in batches:
+            ctx.index.ingest(b)
+        prog.tick(False, total)
+    prog.emit(final=True)
+    if cp is not None and not failed:
+        cp.put(name, ctx.index.state())
+        ck.log("silver_labels: concept map done")
+    return ctx.index
 
 
 def _or_empty(df: pd.DataFrame, cols: list[str]) -> pd.DataFrame:

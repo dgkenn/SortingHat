@@ -895,6 +895,24 @@ def iter_omop_batches(table: str, *, person_ids: Iterable[int] | None = None,
     With an active checkpoint (``sortinghat.checkpoint.use``) every row group's result is stored as it is produced and a
     relaunched read replays the stored ones without touching the store (see ``RowGroupCache``); the batches yielded are the same.
     """
+    for _uid, batches, _total in iter_omop_units(table, person_ids=person_ids, columns=columns, s3=s3, profile=profile,
+                                                 batch_rows=batch_rows, prefix=prefix, on_error=on_error, retry=retry,
+                                                 max_get_bytes=max_get_bytes, buffer_size=buffer_size):
+        yield from batches
+
+
+def iter_omop_units(table: str, *, person_ids: Iterable[int] | None = None,
+                    columns: list[str] | None = None, s3=None, profile: str | None = None,
+                    batch_rows: int = 65536, prefix: str | None = None,
+                    on_error: Callable[[str, Exception], None] | None = None,
+                    retry: RetryPolicy | None = None, max_get_bytes: int = GET_CHUNK_BYTES,
+                    buffer_size: int = 1 << 20, skip: Callable[[str], bool] | None = None) -> Iterator[tuple]:
+    """``iter_omop_batches`` grouped by ROW GROUP: yields ``(unit_id, batches, total)`` once per row group, in order, even for a
+    row group with no surviving rows (``batches == []``), so a caller can checkpoint every unit of work it derives from them.
+
+    ``unit_id`` is stable across restarts (part key + size + ETag + row-group number). ``skip(unit_id)`` returning True
+    marks a unit the caller already has (a stored result): it is yielded with ``batches is None`` and never read or fetched.
+    ``total`` is the number of row groups of the table when every part's footer count is known, else None (progress lines)."""
     import pyarrow as pa
     import pyarrow.compute as pc
     from . import checkpoint as ck
@@ -912,15 +930,20 @@ def iter_omop_batches(table: str, *, person_ids: Iterable[int] | None = None,
         shared = omop_cache.reader_for(cp, s3, bucket, table, columns=want, ids=ids, prefix=prefix, retry=retry,
                                        max_get_bytes=max_get_bytes, buffer_size=buffer_size)
     if shared is not None:                       # the shared cross-step cache serves this request (D-149)
-        for _key, _rg, cached in shared.iter_rowgroups(on_error):
+        read_cols = list(dict.fromkeys((["person_id"] if ids is not None else []) + list(want)))
+        for key, rg, cached in shared.iter_rowgroups(on_error, cols=read_cols, skip=skip):
+            uid = shared.unit_id(key, rg)
+            if cached is omop_cache.SKIPPED:
+                yield uid, None, shared.progress.total
+                continue
             tbl = shared.select_request(cached, want, ids, pid_arr)
-            if tbl is not None:
-                for batch in tbl.to_batches(max_chunksize=batch_rows):
-                    if batch.num_rows:
-                        yield batch
+            yield uid, ([b for b in tbl.to_batches(max_chunksize=batch_rows) if b.num_rows] if tbl is not None else []), \
+                shared.progress.total
         return
+    meta: dict = {}
     if cp is not None:
         parts, pmeta = _checkpoint_parts(s3, table, prefix, bucket)
+        meta = pmeta
         cache = RowGroupCache(cp, f"omop_{table}" if not prefix else f"{table}", ("omop_batches", table, tuple(want), prefix,
                                                                                 ids_digest(ids)), parts, pmeta)
     else:
@@ -929,6 +952,9 @@ def iter_omop_batches(table: str, *, person_ids: Iterable[int] | None = None,
 
     def read_rg(pf, rg: int, use: list[str]):
         return read_rowgroup(pf, rg, use, ids, pid_arr, outer)
+
+    def unit_of(key: str, rg: int) -> str:
+        return hashlib.sha1(f"{key}|{meta.get(key)}".encode()).hexdigest()[:20] + f":{rg}"
 
     for key in parts:
         try:
@@ -945,6 +971,13 @@ def iter_omop_batches(table: str, *, person_ids: Iterable[int] | None = None,
                 if cache:
                     cache.set_manifest(key, n_rg)
             for rg in range(n_rg):
+                uid = unit_of(key, rg)
+                total = cache.progress.total if cache else None
+                if skip is not None and skip(uid):
+                    if cache:
+                        cache.progress.tick(True)
+                    yield uid, None, total
+                    continue
                 tbl, hit = None, False
                 if cache:
                     got = cache.get(key, rg)
@@ -962,10 +995,7 @@ def iter_omop_batches(table: str, *, person_ids: Iterable[int] | None = None,
                         cache.put(key, rg, tbl)
                 if cache:
                     cache.progress.tick(hit)
-                if tbl is not None:
-                    for batch in tbl.to_batches(max_chunksize=batch_rows):
-                        if batch.num_rows:
-                            yield batch
+                yield uid, ([b for b in tbl.to_batches(max_chunksize=batch_rows) if b.num_rows] if tbl is not None else []), total
         except Exception as exc:  # noqa: BLE001 - surfaced to the caller, never swallowed silently
             if on_error is None:
                 raise
