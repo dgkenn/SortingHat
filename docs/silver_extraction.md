@@ -172,6 +172,16 @@ either cell is < 11; if exactly one site cell of a row is suppressed while the t
 (complementary suppression). The report passes `assert_aggregate_only` (case ids as known ids) before it is returned, and `main()` writes it with
 `safe_write_json`. Anchors that never fired are listed as `"<11"`.
 
+### 7.1 Data-source availability (D-153)
+
+After the anchors are evaluated, `extract_silver` applies the label-level rules in `availability_rules` (`sortinghat/labels/availability.py`, spec in
+`docs/labels_spec.md` section 4): for E6, cases in a within-site t0-rank bin where under 10% of cases have any blood-culture row in [-72, +24] h are
+set to NaN (not assessable, reason `culture_source_absent`); E6 positives are never changed. `SilverResult.availability` holds the raw aggregate
+counts and `SilverResult.na_reason` the per-case reason (record-level, memory only); `silver_report` adds the suppressed `availability` block and
+reports prevalence over assessable cases (with `n_not_assessable`). `ExtractConfig(apply_availability_rules=False)` / `--no-availability-rules` give
+the legacy labels; `ExtractConfig(availability_overrides={"E6": {...}})` overrides the YAML. Changing the code changes the checkpoint key
+(`checkpoint.code_version`), so a rerun reclassifies the row groups (from the warm OMOP cache).
+
 ## 8. What cannot be computed from structured data
 
 | Item | Status |
@@ -199,4 +209,4 @@ either cell is < 11; if exactly one site cell of a row is suppressed while the t
 Synthetic only (hand-built OMOP fixtures in the test file; the generator has none of these items): unit conversions, the unit-drop rule, name and
 concept routes, every flag above, E4a/E4b split (tox and antidote), E1 dx / procedure / mass-effect gating / timing fallback, banned evidence,
 that `reports_findings`, notes and imaging never change the labels, the streaming path equals the in-memory path, a spy test that streaming reads
-only `STRUCTURED_TABLES`, report suppression and aggregate-only guard, the CLI `local_only/` rule, and a smoke run on generator output.
+only `STRUCTURED_TABLES`, report suppression and aggregate-only guard, the E6 culture-source availability rule (`tests/test_labels_availability.py`: culture-free early era is NaN, later era unchanged, positives never NaN), the CLI `local_only/` rule, and a smoke run on generator output.

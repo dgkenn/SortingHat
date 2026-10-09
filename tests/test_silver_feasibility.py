@@ -353,3 +353,14 @@ def test_data_flow_counts_follow_the_inputs(sig):
     assert st["cohort rows (sites and cohort definition applied)"]["n_total"] == n_cohort
     assert st["primary window passing QC"]["n_total"] < st["with a primary-window EEG feature row"]["n_total"]
     assert sig.J["n_analysed"] == st["with >= 1 assessable analysed label"]["n_total"]
+
+
+def test_report_has_the_label_drift_screen(sig):
+    d = sig.J["label_drift"]
+    assert d["scheme"] == "temporal" and d["flag_ratio"] == 3.0 and set(d["labels"]) == set(sig.J["labels"]["analysed"])
+    for blk in d["labels"].values():
+        assert "pooled" in blk["per_site"] or set(blk["per_site"]) == {"site_1", "site_2"}
+        assert set(blk["pooled"]) >= {"train", "test", "ratio_test_over_train", "flag"}
+    md = (sig.d / "out" / "report.md").read_text()
+    assert "## Label drift screen" in md
+    assert_aggregate_only(d)

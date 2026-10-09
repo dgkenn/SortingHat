@@ -114,6 +114,27 @@ Rule details:
   `hours_from_t0` as the `csf_wbc` row (same tap); otherwise the uncorrected count is used. `csf_rbc` has no
   LOINC in the YAML (26455-6 is a candidate, not verified).
 
+**Data-source availability (D-153; `availability.py`, `availability_rules` in the YAML).** A label whose source table is nearly empty for part
+of a site's record period cannot fire there, and coding those cases as confident negatives makes the label drift with the data feed (E6 and blood
+cultures: a ~14x temporal observed/expected, `docs/research/e6_drift_2026-10-09.md`). The rule makes such cases NOT ASSESSABLE (NaN, never 0),
+reason `culture_source_absent`. E6 today:
+
+1. A case has the source when it has >= 1 `blood_culture_drawn` row in the E6 culture window ([-72, +24] h, the label's own leaf; configurable).
+2. Within each site, cases are ordered by t0 (rank only) and cut into `round(1 / bin_fraction)` equal bins (default 10 bins of ~10% of the site).
+3. A bin whose share of cases with the source is below `min_share` (default 10%) is source-absent; all its cases are not assessable. Contiguous
+   source-absent bins form the "culture-free era" of the site. A site with fewer than 2 x `min_bin_cases` (default 50) cases is not evaluated.
+4. A positive is never made not assessable (asserted in code and tested); by default the rest of an absent bin is NA, including negatives that
+   happen to have a culture row (`keep_cases_with_source: true` keeps those, which keeps both classes but selects the sicker cases in the era).
+
+The rule uses only structured data availability and the within-site t0 rank. It reads no outcome label (except to protect positives), no EEG feature
+and no EEG report, so it is EEG-blind. It is label-level (applied after the anchors are evaluated): `extract_silver` returns NaN in `labels`, the
+labels CSV holds an empty cell, `run_silver_feasibility.load_silver` reads that as not assessable and the masked losses skip it. The silver report
+adds `availability.<label>` (per site: bins, source-absent bins, not-assessable count and share, positives kept, per-bin source share; all suppressed)
+and `n_not_assessable` / assessable-based prevalence in `per_label`. `--no-availability-rules` on `python -m sortinghat.labels.extract` reproduces
+the legacy labels. Limits: the threshold is a data-driven heuristic; a bin that is source-absent for a reason other than the feed (a genuinely
+low-culture period) is also marked; the first and last bins can mix eras; culture timestamps that carry result time rather than collection time
+(not yet verified by a human) make the early era look more absent than it is.
+
 E4a note: toxicology positivity for a drug given in hospital is E4b, not E4a; the extractor must drop in-hospital
 agents. `silver_anchor_table(events)` returns a boolean case-by-label table; fired anchor ids are kept in
 `.attrs['fired']` for local audit only.

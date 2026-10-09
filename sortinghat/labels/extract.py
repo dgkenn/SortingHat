@@ -39,6 +39,7 @@ from .. import checkpoint as ck, data_io, schema
 from ..safe_output import (SUPPRESSED, SUPPRESS_BELOW, assert_aggregate_only, safe_write_json, suppress_count,
                            suppress_proportion, write_local_only)
 from .anchors import EVENT_COLUMNS, load_anchor_config, silver_anchor_table
+from .availability import apply_availability, report_block as availability_report_block
 from .banned_evidence import EvidenceSource, classify_evidence
 from .concepts import (ConceptIndex, ConceptMap, STATUS_UNAVAILABLE, anchor_item_status, anchor_leaf_status,
                        label_status, load_concept_map, normalize_code, normalize_source_code,
@@ -82,6 +83,8 @@ class ExtractConfig:
     exposure_lookback_days: float = 0.0       # drugs given before the encounter start still explain a tox screen
     anchor_config_path: str | None = None
     concept_config_path: str | None = None
+    apply_availability_rules: bool = True     # D-153: label-level data-source availability (E6 culture source); False = legacy labels
+    availability_overrides: dict | None = None  # label -> partial rule dict merged over ``availability_rules`` in the anchor YAML
 
 
 # ============================================================================================ context
@@ -1102,6 +1105,8 @@ class SilverResult:
     anchor_status: dict                      # anchor leaf id -> full | proxy | unavailable
     gaps: list = field(default_factory=list)
     diagnostics: dict = field(default_factory=dict)
+    availability: dict = field(default_factory=dict)     # label -> raw aggregate counts of the data-source availability rule (D-153)
+    na_reason: pd.Series | None = None                   # case_id -> reason a label was made not assessable (RECORD-LEVEL, memory only)
 
 
 def extract_silver(source, cohort: pd.DataFrame, *, config: ExtractConfig | None = None,
@@ -1135,10 +1140,15 @@ def extract_silver(source, cohort: pd.DataFrame, *, config: ExtractConfig | None
     for lab, st in lstat.items():
         if st == "unavailable" and lab in labels:
             labels[lab] = pd.array([pd.NA] * len(labels), dtype="boolean")
+    avail = None
+    if config.apply_availability_rules:            # D-153: not-assessable (NaN) where a label's data source cannot fire
+        avail = apply_availability(labels, cases, ev, anchor_cfg, config.availability_overrides)
+        labels = avail.labels
     labels = labels.join(ae.covariates.astype(bool))
     labels.index.name = "case_id"
     return SilverResult(labels=labels, events=ev, cases=cases, fired=table.attrs.get("fired", {}), label_status=lstat,
-                        anchor_status=anchor_leaf_status(cm, anchor_cfg), gaps=ae.gaps, diagnostics=ae.diagnostics)
+                        anchor_status=anchor_leaf_status(cm, anchor_cfg), gaps=ae.gaps, diagnostics=ae.diagnostics,
+                        availability=avail.info if avail else {}, na_reason=avail.reason if avail else None)
 
 
 # ============================================================================================== reporting
@@ -1172,10 +1182,18 @@ def silver_report(res: SilverResult, *, site_col: str = "SiteID") -> dict:
             continue
         pos_by_site = {s: int(col[site == s].fillna(False).sum()) for s in sites}
         total_pos = int(col.fillna(False).sum())
+        den_by_site = {s: int(col[site == s].notna().sum()) for s in sites}      # prevalence is over ASSESSABLE cases (D-153)
+        total_den = int(col.notna().sum())
         rep["per_label"][lab] = {
-            "n_positive": suppress_count(total_pos), "prevalence": suppress_proportion(total_pos, len(col)),
-            "per_site": {s: {"n_positive": None, "prevalence": suppress_proportion(pos_by_site[s], n_by_site[s])}
+            "n_positive": suppress_count(total_pos), "prevalence": suppress_proportion(total_pos, total_den),
+            "per_site": {s: {"n_positive": None, "prevalence": suppress_proportion(pos_by_site[s], den_by_site[s])}
                          for s in sites}}
+        if total_den != len(col):                                     # some cases not assessable: say so (suppressed)
+            na_total = len(col) - total_den
+            na_sup = _suppress_group({s: n_by_site[s] - den_by_site[s] for s in sites}, na_total)
+            rep["per_label"][lab]["n_not_assessable"] = suppress_count(na_total)
+            for s in sites:
+                rep["per_label"][lab]["per_site"][s]["n_not_assessable"] = na_sup[s]
         sup = _suppress_group(pos_by_site, total_pos)
         for s in sites:
             rep["per_label"][lab]["per_site"][s]["n_positive"] = sup[s]
@@ -1197,6 +1215,7 @@ def silver_report(res: SilverResult, *, site_col: str = "SiteID") -> dict:
         for aid in sorted(k for k in res.anchor_status if k.startswith(lab + "_")):
             rep["anchor_firing"].setdefault(lab, {}).setdefault(aid, {"n_cases": SUPPRESSED, "per_site": SUPPRESSED})
     rep["diagnostics"] = {k: suppress_count(v) for k, v in sorted(res.diagnostics.items())}
+    rep["availability"] = availability_report_block(res.availability, _suppress_group, suppress_count, suppress_proportion)
     assert_aggregate_only(rep, known_ids=set(res.labels.index.astype(str)))
     return rep
 
@@ -1277,6 +1296,8 @@ def main(argv: list[str] | None = None) -> int:
     ap.add_argument("--out", default="out/silver", help="directory for the aggregate report JSON")
     ap.add_argument("--labels-out", help="record-level silver labels CSV; the path must contain a local_only/ directory")
     ap.add_argument("--no-name-fallback", action="store_true")
+    ap.add_argument("--no-availability-rules", action="store_true",
+                    help="legacy labels: do NOT mark labels not assessable where their data source cannot fire (D-153)")
     ap.add_argument("--profile")
     ck.add_arguments(ap)
     args = ap.parse_args(argv)
@@ -1292,7 +1313,8 @@ def main(argv: list[str] | None = None) -> int:
     # out/local_only/checkpoints/silver_labels/<key>/ as they finish; a relaunch with the same arguments skips them.
     cp = ck.open_step("silver_labels", args, inputs=[p], store=store, no_resume=args.no_resume)
     with ck.use(cp):
-        res = extract_silver(store, cohort, config=ExtractConfig(allow_name_fallback=not args.no_name_fallback))
+        res = extract_silver(store, cohort, config=ExtractConfig(allow_name_fallback=not args.no_name_fallback,
+                                                        apply_availability_rules=not args.no_availability_rules))
     rep = silver_report(res)
     safe_write_json(Path(args.out) / "silver_report.json", rep)
     if args.labels_out:

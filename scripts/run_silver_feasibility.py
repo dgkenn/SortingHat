@@ -79,7 +79,7 @@ from sortinghat.models import (CBRAMOD_FROZEN_RUNG, COMMERCIAL_RUNGS, DEFAULT_RU
 from sortinghat.models import ladder as ladder_mod  # noqa: E402
 from sortinghat.models.controls import control_failed  # noqa: E402
 from sortinghat.models.report import clean  # noqa: E402
-from sortinghat.safe_output import (SUPPRESSED, safe_print, safe_write_json, safe_write_text,  # noqa: E402
+from sortinghat.safe_output import (SUPPRESSED, SUPPRESS_BELOW, safe_print, safe_write_json, safe_write_text,  # noqa: E402
                                     suppress_count, suppress_proportion)
 
 BANNER = "EXPLORATORY — silver-label feasibility; not a test of preregistered hypotheses"
@@ -1015,6 +1015,67 @@ def sedation_block(A: Assembly, results: dict, cfg: LadderConfig, headline: str,
 
 
 # ==================================================================================================== driver
+DRIFT_RATIO = 3.0                      # flag a label when test / train prevalence is > this or < 1 / this
+
+
+def _drift_kinds(y: np.ndarray, m: np.ndarray, tr: np.ndarray, te: np.ndarray) -> dict:
+    """Raw assessable and positive counts of one label in one population, train and test rows (memory only)."""
+    a, p = m, m & y
+    return {"train_n": int((a & tr).sum()), "train_pos": int((p & tr).sum()),
+            "test_n": int((a & te).sum()), "test_pos": int((p & te).sum())}
+
+
+def label_drift_screen(A: Assembly, temporal_fraction: float, ratio: float = DRIFT_RATIO) -> dict:
+    """Label drift screen (aggregate-only). In the temporal scheme (``late_temporal_holdout``: within site the latest
+    ``temporal_fraction`` of t0 is test, the rest train) compare each analysed label's prevalence among ASSESSABLE test vs train
+    rows, per site and pooled; flag test/train prevalence ratio > ``ratio`` or < 1/``ratio``. A ratio far from 1 means the label
+    itself moved over the record period (data availability, coding, case mix), which a temporal evaluation would read as
+    miscalibration. Every count < 11 is shown "<11"; a prevalence needs both of its cells (positives, negatives) >= 11; the ratio
+    is shown only when both prevalences are, so no suppressed count can be recovered from it; a pooled count is hidden when
+    exactly one per-site count of the same kind is hidden. A label not estimable is reported as such, never as stable."""
+    ts = late_temporal_holdout(A.sites, A.times, temporal_fraction)
+    n = len(A.sites)
+    tr, te = np.zeros(n, bool), np.zeros(n, bool)
+    tr[ts.train_idx], te[ts.test_idx] = True, True
+    site_ids = sorted(np.unique(A.sites).tolist())
+    lo = 1.0 / ratio
+    out: dict = {"scheme": "temporal", "test_fraction": temporal_fraction, "flag_ratio": ratio,
+                 "rule": f"test/train prevalence among assessable rows > {ratio:g} or < {lo:.3g}",
+                 "labels": {}, "flagged": []}
+
+    def cell(c: dict, hide: dict | None = None) -> dict:
+        hide = hide or {}
+        res = {}
+        for side in ("train", "test"):
+            nn, pp = c[f"{side}_n"], c[f"{side}_pos"]
+            hn, hp = hide.get(f"{side}_n", False), hide.get(f"{side}_pos", False)
+            prev = SUPPRESSED if (hn or hp or nn < SUPPRESS_BELOW or pp < SUPPRESS_BELOW) else suppress_proportion(pp, nn)
+            res[side] = {"n_assessable": SUPPRESSED if hn else suppress_count(nn),
+                         "n_positive": SUPPRESSED if hp else suppress_count(pp), "prevalence": prev}
+        a, b = res["train"]["prevalence"], res["test"]["prevalence"]
+        if isinstance(a, float) and isinstance(b, float) and a > 0:
+            r = b / a
+            res["ratio_test_over_train"], res["flag"] = round(r, 3), bool(r > ratio or r < lo)
+        else:
+            res["ratio_test_over_train"], res["flag"] = "not estimable (a cell < 11)", None
+        return res
+
+    for j, lab in enumerate(A.label_names):
+        y, m = A.y[:, j] > 0.5, A.m[:, j].astype(bool)
+        per = {s: _drift_kinds(y, m, tr & (A.sites == s), te & (A.sites == s)) for s in site_ids}
+        pooled = _drift_kinds(y, m, tr, te)
+        hide = {k: (len(site_ids) > 1 and sum(per[s][k] < SUPPRESS_BELOW for s in site_ids) == 1) for k in pooled}
+        blk = {"pooled": cell(pooled, hide), "per_site": {A.site_labels.get(s, s): cell(per[s]) for s in site_ids}}
+        flagged_in = [w for w, c in (("pooled", blk["pooled"]), *blk["per_site"].items()) if c["flag"]]
+        blk["flagged_in"] = flagged_in
+        out["labels"][lab] = blk
+        out["flagged"] += [{"label": lab, "where": w, "ratio": (blk["pooled"] if w == "pooled" else blk["per_site"][w])["ratio_test_over_train"]}
+                           for w in flagged_in]
+    out["flagged_total"] = len(out["flagged"])
+    out["labels_flagged"] = sorted({f["label"] for f in out["flagged"]})
+    return out
+
+
 def run_analysis(A: Assembly, a, store=None) -> dict:
     cfg = LadderConfig(n_boot=a.n_boot, seed=a.seed, include_e7=A.include_e7, temporal_test_fraction=a.temporal_fraction)
     rungs = list(BASE_RUNGS)
@@ -1033,7 +1094,8 @@ def run_analysis(A: Assembly, a, store=None) -> dict:
     if headline is None:
         raise SystemExit("no qeeg./conn. feature columns found")
     R: dict = {"banner": BANNER, "headline_rung": headline, "intended_use": None, "ladder": {}, "discrimination_calibration": {},
-               "commercial_clean_gap": {"available": False}, "sedation": None, "controls": {}, "circularity_audit": None}
+               "commercial_clean_gap": {"available": False}, "sedation": None, "controls": {}, "circularity_audit": None,
+               "label_drift": label_drift_screen(A, a.temporal_fraction, getattr(a, "drift_ratio", DRIFT_RATIO))}
     R["intended_use"] = run_intended_use(A, a, cfg, headline, splits)             # D-145: reported FIRST
     taps: dict = {}
     mds: dict = {}
@@ -1278,6 +1340,28 @@ def _iu_markdown(iu: dict) -> list[str]:
     return L
 
 
+def _drift_markdown(d: dict | None) -> list[str]:
+    if not d:
+        return []
+    L = ["", "## Label drift screen", "",
+         f"Temporal scheme (within site the latest {d['test_fraction']:g} of t0 is test, the rest train). Prevalence among ASSESSABLE rows; "
+         f"flag when the test/train prevalence ratio is > {d['flag_ratio']:g} or < {1.0 / d['flag_ratio']:.3g}. "
+         "A flagged label moved over the record period (data availability, coding or case mix), so temporal-holdout "
+         "calibration and Delta for it reflect that drift, not the model. Counts < 11 are shown <11; a ratio needs both prevalences.", "",
+         "| Label | Where | train n (pos) | train prev | test n (pos) | test prev | test/train | flag |", "|---|---|---|---|---|---|---|---|"]
+    for lab, b in d["labels"].items():
+        for where, c in (("pooled", b["pooled"]), *b["per_site"].items()):
+            tr, te = c["train"], c["test"]
+            fl = "FLAG" if c["flag"] else ("n/e" if c["flag"] is None else "")
+            L.append(f"| {lab} | {where} | {tr['n_assessable']} ({tr['n_positive']}) | {tr['prevalence']} | {te['n_assessable']} ({te['n_positive']}) | "
+                     f"{te['prevalence']} | {c['ratio_test_over_train']} | {fl} |")
+    fl_txt = ", ".join("%s (%s, ratio %s)" % (f["label"], f["where"], f["ratio"]) for f in d["flagged"])
+    L += ["", (f"Flagged: {fl_txt}. Do not interpret the temporal "
+               "O/E, Delta or AUROC of these labels as model performance." if d["flagged"] else
+               "No estimable label is flagged. (n/e = not estimable because a cell is < 11; that is not evidence of stability.)")]
+    return L
+
+
 def _gap_markdown(g: dict | None) -> list[str]:
     """"Commercial-clean gap" section; empty unless both cbramod_frozen and morgoth_findings ran."""
     if not g or not g.get("available"):
@@ -1346,6 +1430,7 @@ def render_markdown(J: dict) -> str:
         ps = ", ".join(f"{k}: {v['n_positive']}" for k, v in d.get("per_site", {}).items())
         L.append(f"| {lab} | {d.get('n_assessable', '')} | {d.get('n_positive', '')} | {d.get('prevalence', '')} | {ps} | "
                  f"{d.get('excluded_reason', d.get('role', ''))} |")
+    L += _drift_markdown(J.get("label_drift"))
     L += ["", "## Headline Delta: masked log loss, baseline + EEG minus baseline (negative = EEG helps)", "",
           f"Top available rung: `{J['headline_rung']}`. 'Pattern' = 99% within-site CI upper bound < 0 and Delta < 0 at every site "
           "(the H1/H2 decision pattern, descriptive here).", "",
@@ -1438,6 +1523,8 @@ def build_parser() -> argparse.ArgumentParser:
     ap.add_argument("--n-boot", type=int, default=4000, help="bootstrap replicates for Delta intervals (D-141 uses 10000 for final analyses)")
     ap.add_argument("--auc-boot", type=int, default=1000)
     ap.add_argument("--null-reps", type=int, default=3, help="shuffled-label negative-control repetitions")
+    ap.add_argument("--drift-ratio", type=float, default=DRIFT_RATIO,
+                    help="label drift screen: flag a label whose test/train prevalence ratio (temporal scheme) is > this or < 1/this (default 3)")
     ap.add_argument("--dev-frac", type=float, default=0.2)
     ap.add_argument("--temporal-fraction", type=float, default=0.2)
     ap.add_argument("--sedation-source", choices=["baseline", "e4b", "either"], default="either")

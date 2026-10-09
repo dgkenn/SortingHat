@@ -172,3 +172,24 @@ labels:
               - {id: E7_csf_glucose, item: csf_glucose, test: lab_threshold, op: lt, threshold: 40,  unit: "mg/dL", window_hours: [-72, 72]}
               - {id: E7_blood_culture, item: blood_culture_pos, test: event, window_hours: [-72, 72]}
     note: "CSF WBC threshold applies to the RBC-corrected count (traumatic taps inflate WBC). Antibiotic pre-treatment still needs clinician rules at the co-investigator re-review."
+
+# Label-level DATA-SOURCE availability (D-153; sortinghat/labels/availability.py; docs/labels_spec.md).
+# A label whose source table is (almost) empty for part of a site's record period cannot fire there, so those cases are
+# NOT ASSESSABLE (NaN), never a confident negative. Data-driven and EEG-blind: it reads only the presence of anchor-event
+# rows and the within-site t0 RANK, never an outcome label (other than to protect positives), an EEG feature or an EEG report.
+#   source_item   anchor item whose presence defines "the source exists for this case"
+#   window_hours  null = the window of the label's own leaf on that item (E6_blood_culture: [-72, 24])
+#   bin_fraction  each site's cases, ordered by t0, are cut into round(1/bin_fraction) bins of equal size (0.10 = ten bins)
+#   min_share     a bin whose share of cases with >= 1 source row is BELOW this is source-absent; all its cases are not assessable
+#   min_bin_cases a site with fewer than 2 * min_bin_cases cases is not evaluated; a small site gets cases // min_bin_cases bins
+#   keep_cases_with_source  false: whole source-absent bin is NA except positives; true: negatives that have a source row stay too
+# A POSITIVE is never made not assessable (asserted). Disable all rules with `--no-availability-rules` (legacy labels).
+availability_rules:
+  E6:
+    source_item: blood_culture_drawn
+    window_hours: null
+    bin_fraction: 0.10
+    min_share: 0.10
+    min_bin_cases: 50
+    keep_cases_with_source: false
+    reason: culture_source_absent

@@ -163,6 +163,18 @@ mapped to the label (E1 <- foc slowing/LPD/LRDA; E2 <- BS/low voltage; E5 <- GPD
 EEG-clinician sign-off) and (ii) the silver label. The silver label stands where the plan's audit uses gold. It is run for the
 baseline-only and the headline EEG model of each baseline. `reports_findings` is read only here and never produces a label.
 
+### 2.2.1 Label drift screen (D-153)
+
+For every analysed label, in the temporal scheme (`late_temporal_holdout`: within site the latest `--temporal-fraction` of t0 is test), the report
+compares prevalence among ASSESSABLE test rows with assessable train rows, per site and pooled, and flags a test/train ratio above `--drift-ratio`
+(default 3) or below its inverse. Section "Label drift screen" in `report.md`, key `label_drift` in `report.json`: counts and prevalences per side,
+the ratio, the flag (`null` = not estimable). A flagged label moved over the record period (data availability, coding or case mix), so its temporal
+O/E, Delta and AUROC describe that drift and not the model; read it under leave-one-site-out. Counts < 11 are `<11`; a prevalence needs both of its
+cells (positives and negatives) >= 11 and the ratio needs both prevalences, so a suppressed count cannot be recovered; a pooled count is hidden when
+exactly one per-site count of the same kind is hidden. Not estimable is not stable: a label whose test positives fall below 11 is reported as such.
+The screen reads labels only; it does not change model fitting. With the E6 availability rule (`docs/labels_spec.md` section 4) the culture-free early
+era is not assessable, so E6 should no longer be flagged by the data feed.
+
 ### 2.3 Intended-use analyses (D-145)
 
 The intended use is undifferentiated altered mental status or unexplained unconsciousness in the ED, with little or no history:
@@ -248,6 +260,11 @@ the +1 h score window uses data charted after the EEG began (P only).
    analysed. QC failure is related to sedation, agitation and electrode problems, so the analysed set is not the cohort.
 9. **Multiplicity.** Many rungs, labels, baselines and schemes are reported with no correction; a single interval below 0 in
    a table of 100 is expected by chance.
+
+10. **Label availability over time (D-153).** A label can only be ascertained where its source data exist. E6 rests on blood-culture rows, which are
+   nearly absent early in each site's record period; those cases are now not assessable (NaN) instead of negative, and the label drift screen flags any
+   label whose prevalence moves more than 3-fold between train and test. A silver run made before D-153 codes that era as negative: its temporal E6
+   O/E (~14), Delta and AUROC are feed-era artefacts.
 
 ### How to read the report
 
