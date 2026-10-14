@@ -31,7 +31,7 @@ def _run(find_rows, sess_rows, case_rows, **kw):
 
 
 def test_config_columns_are_the_confirmed_real_header_names():
-    assert CFG.status == "ASSUMED_VALUES"
+    assert CFG.status == "VOCAB_OBSERVED_0C"
     assert list(CFG.findings_columns.values()) == [
         "BDSPPatientID", "Session_id", "ShiftedDateOfBirth", "ShiftedStudyDate", "Counts", "Abnormality", "Brain", "FindingID",
         "PresentPrior", "Change", "Name", "General Name", "Location", "Brain-related", "Magnitude", "Acute/Chronic", "Test",
@@ -153,3 +153,46 @@ def test_concordance_suppresses_small_cells_and_computes_large_ones():
     masked = img.copy(); masked[:50] = pd.NA
     assert bind.concordance(silver, masked)["n_both_assessable"] == 150
     assert_aggregate_only(c)
+
+
+# ---- value vocabulary adapted in plan step 0c (D-160): the categories below are strings OBSERVED in the real Level2 / Acute-Chronic
+# columns (copied as value strings only; no record, count or id). Acuity values observed: acute | subacute | chronic | unknown.
+def _classify(name, acute="acute", level2="", brain="yes", null="No"):
+    row = pd.DataFrame([_f("1", "s1", "2020-01-01", name, acute, brain=brain, null=null, level2=level2)], columns=F_COLS)
+    f = bind.classify_findings(bind.normalise_findings(row, CFG), CFG)
+    return {c: bool(f[f"pos_{c}"].iloc[0]) for c in CFG.class_names()}
+
+
+@pytest.mark.parametrize("text,cls", [
+    ("infarct", "infarct"), ("lacunar infarct", "infarct"), ("small vessel ischemic infarction", "infarct"),
+    ("to early sub infarct", "infarct"), ("ischemic stroke", "infarct"), ("cva / ischemic stroke", "infarct"),
+    ("hemorrhage", "ich"), ("parenchymal hemorrhage", "ich"), ("intracranial hemorrhage", "ich"),
+    ("subdural hematoma", "sdh_edh"), ("epidural hematoma", "sdh_edh"), ("subarachnoid hemorrhage", "sah"),
+    ("traumatic brain injury (tbi)", "tbi_contusion"), ("diffuse axonal injury", "tbi_contusion"), ("contusion", "tbi_contusion"),
+    ("midline shift", "mass_effect"), ("herniation", "mass_effect"), ("tumor related edema", "mass_effect"), ("edema", "mass_effect"),
+    ("hydrocephalus", "hydrocephalus"), ("ventriculomegaly", "hydrocephalus")])
+def test_observed_lesion_names_map_to_their_class_when_acute(text, cls):
+    got = _classify(text)
+    assert got[cls], (text, got)
+
+
+@pytest.mark.parametrize("text", [
+    "no infarct", "infarction absent", "no evidence of ischemia", "no midline shift or brain herniation",       # negated findings exist as rows
+    "small vessel ischemic change", "microvascular ischemic changes", "ischemic changes", "ischemic leukoencephalopathy",
+    "hypoxic ischemic injury", "hypoxic-ischemic encephalopathy", "spinal cord infarct", "ischemic optic neuropathy",
+    "microhemorrhage", "microbleeds", "old hematoma", "subgaleal hemorrhage", "intraventricular hemorrhage",
+    "subarachnoid cyst", "subarachnoid space prominence", "subdural hygroma", "subdural effusion",
+    "nontraumatic", "post-traumatic changes", "traumatic encephalomalacia", "papilledema", "spinal cord edema", "edema/gliosis",
+    "normal pressure hydrocephalus", "sequela of remote infarction", "infarct sequelae"])
+def test_observed_non_qualifying_names_are_not_primary_positives(text):
+    got = _classify(text)
+    assert not any(got[c] for c in CFG.primary_classes), (text, got)
+
+
+def test_acuity_vocabulary_and_brain_related_unknown():
+    assert _classify("infarct", "subacute")["infarct"] and _classify("infarct", "acute")["infarct"]
+    assert not _classify("infarct", "chronic")["infarct"] and not _classify("infarct", "unknown")["infarct"]
+    assert not _classify("infarct", "acute", brain="unknown")["infarct"] and not _classify("infarct", "acute", brain="no")["infarct"]
+    row = pd.DataFrame([_f("1", "s1", "2020-01-01", "infarct", "unknown")], columns=F_COLS)
+    f = bind.classify_findings(bind.normalise_findings(row, CFG), CFG)
+    assert bool(f["ind_infarct"].iloc[0]) and not bool(f["pos_infarct"].iloc[0])

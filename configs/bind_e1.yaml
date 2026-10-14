@@ -3,14 +3,16 @@
 #
 # Provenance of each block:
 #   columns / tables : CONFIRMED  (names-only header read of the BDSP credentialed access point, 2026-10-14).
-#   concept classes  : the clinical definition is fixed by the plan. The regex strings that implement it are ASSUMED:
-#                      no VALUE of any BIND column has been seen. Step 0c of the plan (a values-only vocabulary listing of the
-#                      categorical columns, no counts, no EEG linkage) may adapt the strings; the final file is hashed and
-#                      logged in DECISION_LOG before the first label is linked to an EEG case.
+#   concept classes  : the clinical definition is fixed by the plan. The regex strings that implement it were ADAPTED ONCE, in plan
+#                      step 0c (2026-10-14), to the observed value vocabulary (values-only listing, no counts, no EEG linkage;
+#                      DECISION_LOG D-160). Observed: Acute/Chronic in {acute, subacute, chronic, unknown}; Brain-related / Brain in
+#                      {yes, no, unknown}; Nullfinding in {No, Yes, + two concatenated forms}; Label_LLAMA_Level1 = comma-separated
+#                      overarching categories; Label_LLAMA_Level2 = a normalised finding name (far more distinct names than a short
+#                      category list, acuity words stripped, negated findings such as "no infarct" present). No further change is allowed after D-160.
 #   window           : fixed by the plan (calendar days, because the imaging date is date-only; see the plan).
 
 schema_version: 1
-status: ASSUMED_VALUES            # CONFIRMED columns, ASSUMED value vocabularies; change to VERIFIED only after step 0c
+status: VOCAB_OBSERVED_0C        # CONFIRMED columns; value vocabularies observed in plan step 0c (D-160); regexes adapted once, then frozen
 
 prefix: "Imaging/{site}/Clinical/"             # site-level tables only; never open Imaging/<site>/BIDS or Non-BIDS patient folders
 sites: [I0001, I0004]                          # I0001 = MGB (EEG-linked); I0004 = Stanford (PSG-linked, not in the EEG cohort)
@@ -65,33 +67,44 @@ window_days: [-1, 3]              # primary; ~[-24 h, +72 h] with day resolution
 primary_classes: [infarct, ich, sah, sdh_edh, tbi_contusion, mass_effect]
 secondary_classes: [hydrocephalus]
 classes:
+  # Level2 is a normalised finding name with the acuity words removed ("sub infarct" = subacute infarct); acuity comes from the
+  # Acute/Chronic column. Small-vessel / chronic-microangiopathy wording, global hypoxic-ischaemic injury (label E2, not E1),
+  # spinal and optic ischaemia are not "infarct" in the plan's definition.
   infarct:
-    include: "infarct|ischemi|ischaemi|stroke|restricted diffusion|diffusion restriction|diffusion abnormal"
-    exclude: "lacune|lacunar|microvascular|small vessel|chronic|encephalomalacia|gliosis|leukoaraiosis|white matter hyperintens"
+    include: "infarct|ischemi|ischaemi|stroke|\\bcva\\b|restricted diffusion|diffusion restriction|diffusion abnormal"
+    # lacunar / small-vessel / microvascular wording excludes only when the text does not itself say "infarct" (an acute lacunar
+    # infarct is an acute infarct; "small vessel ischemic change" is chronic microangiopathy)
+    exclude: "^(?!.*infarct).*(lacun|microvascular|micro-vascular|small[- ]vessel|microangiopath|periventricular|leukoencephalopath|white matter)|leukoaraiosis|gliosis|encephalomalacia|chronic|sequela|\\bremote\\b|\\bold\\b|hypox|anox|spinal cord|optic|ischemic (change|changes|disease|foci|focus)\\b"
+  # Level2 usually says only "hemorrhage" / "hematoma": an unspecified acute intracranial haemorrhage counts as ICH; the named
+  # compartments below are separate classes, so they are excluded here to keep the per-class flags apart.
   ich:
-    include: "intraparenchymal (hemorrhage|haemorrhage|hematoma|haematoma)|intracerebral|intracranial hemorrhage|parenchymal (hemorrhage|hematoma)|\\bich\\b|hemorrhagic (conversion|transformation)"
-    exclude: "microhemorrhage|microbleed|micro-hemorrhage|cavernous|cavernoma|hemosiderin|chronic|old"
+    include: "h(a)?emorrhag|h(a)?ematoma|intracerebral|intracranial bleed|\\bich\\b"
+    exclude: "microh(a)?emorrhag|microbleed|micro-h(a)?emorrhag|cavernous|cavernoma|hemosiderin|chronic|\\bold\\b|\\bremote\\b|subarachnoid|subdural|epidural|extradural|extra-axial|subgaleal|scalp|intraventricular|spinal"
   sah:
-    include: "subarachnoid|\\bsah\\b"
-    exclude: "chronic|old|hemosiderin|superficial siderosis"
+    include: "subarachnoid (h(a)?emorrhag|blood|h(a)?ematoma|bleed|clot)|\\bsah\\b|(h(a)?emorrhag|blood).{0,40}subarachnoid"
+    exclude: "chronic|\\bold\\b|hemosiderin|superficial siderosis|\\bremote\\b"
   sdh_edh:
-    include: "subdural|epidural|extra-axial (hemorrhage|hematoma|collection)"
-    exclude: "chronic|hygroma|effusion"
+    include: "subdural|epidural|extradural|extra-axial (h(a)?emorrhag|h(a)?ematoma|blood)|\\bsdh\\b|\\bedh\\b"
+    exclude: "chronic|hygroma|effusion|empyema|abscess|cyst|\\bold\\b|\\bremote\\b"
   tbi_contusion:
-    include: "contusion|diffuse axonal|traumatic brain|\\btbi\\b|intraparenchymal.*trauma"
-    exclude: "chronic|encephalomalacia|gliosis|remote"
+    include: "contusion|diffuse axonal|axonal injury|\\bdai\\b|\\btraumatic (brain|axonal|injur|contusion|h(a)?emorrhag|h(a)?ematoma)|\\btbi\\b|\\btrauma\\b"
+    exclude: "chronic|encephalomalacia|gliosis|\\bremote\\b|post-?traumatic|non-?traumatic|atraumatic|scalp|subgaleal"
   mass_effect:
-    include: "midline shift|herniation|mass effect|effacement of (the )?(basal cisterns|sulci)|tumou?r with (vasogenic )?edema|vasogenic edema|cerebral edema|brain edema"
-    exclude: "no mass effect|without mass effect|chronic"
+    include: "midline shift|herniation|mass effect|effacement of (the )?(basal cisterns|cisterns|sulci|subarachnoid spaces|ventricles?)|\\bedema\\b|\\boedema\\b"
+    exclude: "no mass effect|without mass effect|chronic|gliosis|papilledema|spinal cord|optic|orbital|scalp|soft tissue|mucosal"
   hydrocephalus:
     include: "hydrocephalus|ventriculomegaly|ventricular enlargement"
-    exclude: "ex vacuo|chronic|stable|shunt(ed)?"
+    exclude: "ex vacuo|chronic|stable|shunt(ed)?|normal pressure|\\bnph\\b|ventriculostomy"
 # a negated mention is not a finding (the extractor is asked for explicit findings only, but check anyway)
-negation_regex: "\\b(no|without|negative for|absence of|ruled out)\\b"
+negation_regex: "\\b(no|without|negative for|absence of|absent|ruled out)\\b"
 
 # ---- assessability ------------------------------------------------------------------------------------------------
 # A session is a BRAIN study (assessable) when it has >= 1 findings row with Brain-related (or Brain) true, or its report
-# Type matches `report_type_regex` (null = not used; the Type vocabulary is unknown).
+# Type matches `report_type_regex`.
+# Step 0c (D-160): the report Type column is NOT used (null). Observed: nearly every study of a typed MRI-brain report has a findings row,
+# i.e. a normal or non-contributory brain study leaves rows (Nullfinding / NORMAL category / non-qualifying findings), it is not absent;
+# the untyped ("not available") reports are not a brain-study catalogue and many have no rows. Counting a study with no findings row as a
+# brain study would turn extraction failures and non-brain studies into assessable negatives.
 session_assessable:
   from_findings_brain: true
   report_type_regex: null
