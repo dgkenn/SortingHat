@@ -1,0 +1,596 @@
+# TUEG report-keyword labels for the NEDC keyword-script service (frozen-model transport test, rank 1 of
+# docs/research/open_etiology_datasets_2026-10-14.md).  Method and stop rule: docs/tueg_count_query.md.
+#
+# STATUS: DRAFT for the project lead.  Per the survey, the keyword families, cue lists and section restriction must be fixed in a
+# dated amendment (A3-style) BEFORE the first scoring run.  Round-1 counts do not score anything, so this file may be revised
+# until the first round-1 request is sent; after that, changes are logged in DECISION_LOG.
+#
+# How this file is used: `python scripts/tueg_label_from_filelist.py emit-queries --config configs/tueg_keywords.yaml --out-dir <dir>`
+# turns it into standard-library-only Python scripts of the form NEDC accepts (input: a file listing report filenames;
+# output: the filenames that match).  No report text is ever seen by us; NEDC returns file names (or, in profile mode, counts).
+#
+# Verified (2026-10-14, NEDC pages) vs unverified:
+#   [V] NEDC runs a user-supplied standard-library Python script over the anonymized reports and returns matching filenames
+#       (https://isip.piconepress.com/projects/nedc/html/tuh_eeg/ ; template query.tar.gz on that page).
+#   [U] The exact section header strings inside the reports.  The LREC 2020 EEG-report paper figure shows CLINICAL HISTORY,
+#       MEDICATIONS, description, IMPRESSION, CLINICAL CORRELATION (survey, section 2.1); the corpus itself has not been read.  The
+#       profile script reports the number of reports with a recognised CLINICAL HISTORY / MEDICATIONS header so a census is
+#       part of round 1.  Add header aliases only after that census.
+#   [U] That the report for a session is a text file in the session folder (report path convention not documented on the NEDC pages).
+#       The engine takes whatever file names NEDC's list holds.
+#   [U] Whether TUEG reports mention the care setting at all.  Setting terms below are a weak proxy; "unknown" setting will be large.
+
+schema_version: 1
+as_of: "2026-10-14"
+
+# ---------------------------------------------------------------------------------------------------------------------------
+# Sections.  ONLY these two are searched.  IMPRESSION, CLINICAL CORRELATION and DESCRIPTION OF THE RECORD are written after reading
+# the EEG; using them would import exactly the circularity the plan bans (SAP A1.1, CLAUDE.md-level rule for labels).
+# INTRODUCTION is also not searched (it often restates history but is not guaranteed EEG-blind); sensitivity-only, see docs.
+sections:
+  use:                      # header text (upper case, followed by ":" or end of line) -> internal section name
+    "CLINICAL HISTORY": history
+    "MEDICATIONS": medications
+  never_search:             # documented for reviewers; the engine stops a section at any of these or at any other ALL-CAPS header
+    - IMPRESSION
+    - CLINICAL CORRELATION
+    - DESCRIPTION OF THE RECORD
+    - DESCRIPTION
+    - INTRODUCTION
+    - HEART RATE
+    - CORRELATION
+    - TECHNICAL DIFFICULTIES
+    - FINDINGS
+    - SUMMARY
+  default_scope: [history, medications]
+
+# ---------------------------------------------------------------------------------------------------------------------------
+# Context cues.  A mention of a term is dropped when a cue appears in the window of tokens before it (after the nearest scope breaker)
+# or, for post cues, in the next few tokens.  "w" is the window in tokens; default_window applies to plain strings.
+cues:
+  default_window: 6
+  breakers:                 # a cue before one of these does not reach a term after it
+    - ". "
+    - "; "
+    - ": "
+    - " but "
+    - " now "
+    - " currently "
+    - " presents "
+    - " presented "
+    - " presenting "
+    - " admitted "
+    - " found "
+    - " however "
+    - " after "
+    - " following "
+    - " s/p "
+    - " status post "
+    - " due to "
+    - " secondary to "
+  # Always applied (strict and loose): the mention is about absence, or about a relative, not about this patient.
+  negation:
+    - {p: "no", w: 3}
+    - {p: "not", w: 3}
+    - {p: "without", w: 4}
+    - {p: "denies", w: 4}
+    - {p: "denied", w: 4}
+    - "no evidence of"
+    - "no signs of"
+    - "no history of"
+    - "no known"
+    - "negative for"
+    - "neg for"
+    - "absence of"
+    - "free of"
+    - "ruled out for"
+  family:
+    - "family history of"
+    - "family hx"
+    - "fhx"
+    - {p: "mother", w: 4}
+    - {p: "father", w: 4}
+    - {p: "sister", w: 4}
+    - {p: "brother", w: 4}
+  post_negation:            # within the next 4 tokens after the term
+    - "ruled out"
+    - "rule out"
+    - "excluded"
+    - "negative"
+    - "not seen"
+    - "unlikely"
+    - "resolved"
+  post_uncertain:           # within the next 4 tokens after the term; applied only where the family policy excludes "uncertain"
+    - "vs"
+    - "versus"
+    - "?"
+    - "or"
+    - "possible"
+  post_remote:              # within the next 6 tokens after the term; applied only where the family policy excludes "remote"
+    - "years ago"
+    - "months ago"
+    - "in the past"
+    - "remote"
+    - "decades ago"
+  # Applied in the STRICT variant (and per label policy below); the LOOSE variant ignores these lists.
+  uncertain:
+    - "r/o"
+    - "rule out"
+    - "rule-out"
+    - "to rule out"
+    - "ruled out"
+    - "evaluate for"
+    - "eval for"
+    - "evaluation for"
+    - "assess for"
+    - "concern for"
+    - "concerning for"
+    - "possible"
+    - "possibly"
+    - "suspected"
+    - "suspicion of"
+    - "probable"
+    - "questionable"
+    - "query"
+    - "?"
+    - "vs"
+    - "versus"
+    - "differential"
+    - "screen for"
+  remote:
+    - "remote"
+    - "years ago"
+    - "months ago"
+    - "in the past"
+    - {p: "old", w: 1}          # "old infarct"; NOT "55 year old man with ..." (window 1)
+    - {p: "prior", w: 3}
+    - {p: "previous", w: 3}
+    - {p: "previously", w: 3}
+    - {p: "chronic", w: 2}
+    - "longstanding"
+    - "long-standing"
+  historical:
+    - "history of"
+    - "hx of"
+    - "h/o"
+    - "hx"
+    - "pmh"
+    - "pmhx"
+    - "past medical history"
+    - {p: "known", w: 2}
+
+# ---------------------------------------------------------------------------------------------------------------------------
+# Label families.  Each term is a phrase (case-insensitive; "*" = any word ending; space and hyphen are interchangeable) or a mapping
+# {t: term, cs: true (case-sensitive abbreviation), requires: regex that must also appear in the same clause}.
+# exclude_context: if the clause matches any of these the mention is ignored.  Policies (exclude|ignore) say whether the uncertain,
+# remote and historical cue lists apply to this family in the STRICT variant (negation/family always apply).
+labels:
+
+  E1:
+    role: primary
+    description: "Acute structural: stroke/infarct, intracranial hemorrhage, SAH, subdural, TBI, tumor/mass, hydrocephalus"
+    policy: {uncertain: exclude, remote: exclude, historical: exclude}
+    terms:
+      - stroke
+      - "ischemic stroke"
+      - "hemorrhagic stroke"
+      - "cerebral infarct*"
+      - infarct*
+      - "intracranial hemorrhage"
+      - "intracranial haemorrhage"
+      - "intracerebral hemorrhage"
+      - "intraparenchymal hemorrhage"
+      - "brain hemorrhage"
+      - "cerebral hemorrhage"
+      - "subarachnoid hemorrhage"
+      - "subarachnoid haemorrhage"
+      - subarachnoid
+      - subdural
+      - "epidural hematoma"
+      - "epidural hemorrhage"
+      - "intraventricular hemorrhage"
+      - "brain bleed"
+      - "head bleed"
+      - "ruptured aneurysm"
+      - "traumatic brain injury"
+      - "head trauma"
+      - "head injury"
+      - "closed head injury"
+      - "skull fracture"
+      - "brain tumor"
+      - "brain tumour"
+      - "cerebral tumor"
+      - glioma
+      - glioblastoma
+      - "brain metastas*"
+      - "cerebral metastas*"
+      - "brain mass"
+      - "cerebral mass"
+      - "intracranial mass"
+      - "frontal mass"
+      - "temporal mass"
+      - "parietal mass"
+      - "occipital mass"
+      - "cerebellar mass"
+      - "posterior fossa mass"
+      - "mass lesion"
+      - hydrocephalus
+      - {t: ICH, cs: true}
+      - {t: SAH, cs: true}
+      - {t: SDH, cs: true}
+      - {t: IVH, cs: true}
+      - {t: TBI, cs: true}
+      - {t: CVA, cs: true}
+    exclude_context:
+      - "heat stroke"
+      - "heatstroke"
+      - "sun stroke"
+      - "stroke volume"
+      - "stroke work"
+      - "myocardial infarct"
+      - "\\bmi\\b"
+      - "bowel infarct"
+      - "splenic infarct"
+      - "renal infarct"
+      - "pulmonary infarct"
+      - "normal pressure hydrocephalus"
+      - "\\bnph\\b"
+
+  E2:
+    role: primary
+    description: "Global hypoxic-ischemic: cardiac arrest, anoxic/hypoxic brain injury, post-arrest, PEA/VF, ROSC"
+    # "s/p cardiac arrest" and "history of cardiac arrest 3 days ago" are how recent arrests are written, so the historical list is
+    # ignored for E2 (the remote list still removes "years ago", "remote", "prior").  Precision cost stated in docs/tueg_count_query.md.
+    policy: {uncertain: exclude, remote: exclude, historical: ignore}
+    terms:
+      - "cardiac arrest"
+      - "cardiopulmonary arrest"
+      - "cardiorespiratory arrest"
+      - "cardio-respiratory arrest"
+      - "respiratory arrest"
+      - asystole
+      - "pulseless electrical activity"
+      - "ventricular fibrillation arrest"
+      - "return of spontaneous circulation"
+      - "anoxic*"
+      - "hypoxic ischemic"
+      - "hypoxic-ischemic"
+      - "hypoxic brain"
+      - "hypoxic injury"
+      - "hypoxic encephalopathy"
+      - "hypoxic insult"
+      - "anoxic brain"
+      - "post arrest"
+      - "post-arrest"
+      - "postarrest"
+      - "post cardiac arrest"
+      - "code blue"
+      - "targeted temperature management"
+      - "therapeutic hypothermia"
+      - "cooling protocol"
+      - "hypothermia protocol"
+      - asphyxia
+      - asphyxiation
+      - drowning
+      - "near drowning"
+      - "near-drowning"
+      - strangulation
+      - hanging
+      - {t: ROSC, cs: true}
+      - {t: PEA, cs: true, requires: "arrest|code|cpr|rosc|resuscitat|pulseless"}
+      - {t: VF, cs: true, requires: "arrest|code|cpr|rosc|resuscitat|shock|defibrillat"}
+      - {t: OHCA, cs: true}
+      - {t: IHCA, cs: true}
+      - {t: CPR, cs: true}
+      - "hypoxic"
+    exclude_context:
+      - "hypoxic respiratory failure"
+      - "hypoxemic respiratory failure"
+      - "hypoxic pulmonary"
+      - "hanging drop"
+      - "hanging up"
+      - "chronic hypox"
+      - "copd"
+
+  E5:
+    role: primary
+    description: "Metabolic: hepatic encephalopathy, hyperammonemia, uremia/ESRD, hyponatremia, hypoglycemia, hypercapnia, DKA, HHS"
+    # Chronic conditions (ESRD, cirrhosis) are often written as "history of ..."; the STRICT variant drops those, the LOOSE variant
+    # keeps them.  Both counts are requested for E5 (loose in round 2).
+    policy: {uncertain: exclude, remote: exclude, historical: exclude}
+    terms:
+      - "hepatic encephalopathy"
+      - "hepatic coma"
+      - "portosystemic encephalopathy"
+      - hyperammonemia
+      - hyperammonaemia
+      - "elevated ammonia"
+      - "high ammonia"
+      - "liver failure"
+      - "hepatic failure"
+      - "acute liver failure"
+      - uremia
+      - uremic
+      - uraemia
+      - "renal failure"
+      - "kidney failure"
+      - "end stage renal disease"
+      - "end-stage renal disease"
+      - "azotemia"
+      - hyponatremia
+      - hyponatraemia
+      - hypernatremia
+      - hypoglycemia
+      - hypoglycaemia
+      - hypercapnia
+      - hypercapnic
+      - "carbon dioxide narcosis"
+      - "co2 narcosis"
+      - "diabetic ketoacidosis"
+      - "hyperosmolar hyperglycemic"
+      - "hyperosmolar state"
+      - "hyperosmolar nonketotic"
+      - "hypercalcemia"
+      - "hypocalcemia"
+      - "hypomagnesemia"
+      - "electrolyte abnormalit*"
+      - "electrolyte imbalance"
+      - {t: ESRD, cs: true}
+      - {t: DKA, cs: true}
+      - {t: HHS, cs: true}
+      - {t: HHNK, cs: true}
+      - {t: AKI, cs: true}
+      - {t: BUN, cs: true, requires: "elevat|high|uremi|renal|azotem"}
+    exclude_context: []
+
+  # Nonspecific toxic/metabolic wording.  NOT part of E5 (precision), but its sessions are removed from the control set and reported.
+  E5_nonspecific:
+    role: indeterminate
+    description: "Nonspecific metabolic/toxic encephalopathy wording; excluded from positives and from controls"
+    policy: {uncertain: ignore, remote: exclude, historical: exclude}
+    terms:
+      - "metabolic encephalopathy"
+      - "toxic encephalopathy"
+      - "toxic metabolic"
+      - "toxic-metabolic"
+      - "toxic/metabolic"
+      - "metabolic derangement*"
+      - "septic encephalopathy"
+      - "delirium"
+    exclude_context: []
+
+  E3:
+    role: positive_control
+    description: "Status epilepticus / NCSE / acute seizure presentation (strict).  Positive control: EEG should show clear signal."
+    policy: {uncertain: exclude, remote: exclude, historical: exclude}
+    terms:
+      - "status epilepticus"
+      - "nonconvulsive status"
+      - "non-convulsive status"
+      - "convulsive status"
+      - "electrographic status"
+      - "nonconvulsive seizure*"
+      - "non-convulsive seizure*"
+      - "new onset seizure*"
+      - "new-onset seizure*"
+      - "first time seizure*"
+      - "first seizure"
+      - "breakthrough seizure*"
+      - "witnessed seizure"
+      - "seizure activity"
+      - "seizure cluster*"
+      - "recurrent seizure*"
+      - "refractory seizure*"
+      - "found seizing"
+      - "postictal"
+      - "post-ictal"
+      - {t: NCSE, cs: true}
+      - {t: SE, cs: true, requires: "status|refractory|nonconvuls|non-convuls"}
+    exclude_context: []
+
+  # Bare seizure/epilepsy words.  Reported (87% of 2016 reports contained "epilep"), never used as a positive-control set;
+  # its sessions are removed from the control set.
+  E3_broad:
+    role: indeterminate
+    description: "Any seizure / epilepsy / convulsion wording; excluded from controls, used only to size the epilepsy-heavy case mix"
+    policy: {uncertain: ignore, remote: ignore, historical: ignore}
+    terms:
+      - "seizure*"
+      - "epilep*"
+      - "convuls*"
+      - "ictal"
+      - "spell*"
+    exclude_context: []
+
+  # Secondary families from the survey.  Not requested by default (query: false); listed so the definitions are fixed with the rest.
+  E4a:
+    role: secondary_optional
+    query: false
+    description: "Toxic: overdose, ingestion, intoxication"
+    policy: {uncertain: exclude, remote: exclude, historical: exclude}
+    terms: [overdose, ingestion, intoxication, intoxicated, toxicity, poisoning, "drug overdose", "polysubstance", "benzodiazepine withdrawal", "alcohol withdrawal"]
+    exclude_context: []
+  E6:
+    role: secondary_optional
+    query: false
+    description: "Systemic infection: sepsis, bacteremia"
+    policy: {uncertain: exclude, remote: exclude, historical: exclude}
+    terms: [sepsis, septic, bacteremia, urosepsis, "septic shock"]
+    exclude_context: []
+  E7:
+    role: secondary_optional
+    query: false
+    description: "CNS infection / autoimmune: encephalitis, meningitis, anti-NMDA"
+    policy: {uncertain: exclude, remote: exclude, historical: exclude}
+    terms: [encephalitis, meningitis, meningoencephalitis, "autoimmune encephalitis", "anti-nmda*", "limbic encephalitis", {t: HSV, cs: true}, {t: PML, cs: true}]
+    exclude_context: []
+
+# ---------------------------------------------------------------------------------------------------------------------------
+# Control set (raw).  Local rule (scripts/tueg_label_from_filelist.py): a control session matches CTRL and NO label set above
+# (E1, E2, E3, E3_broad, E5, E5_nonspecific, and E4a/E6/E7 when those lists were obtained).
+controls:
+  CTRL:
+    role: control
+    description: "History mentions altered mental status / encephalopathy / unresponsiveness / coma"
+    policy: {uncertain: ignore, remote: exclude, historical: exclude}
+    terms:
+      - "altered mental status"
+      - "altered level of consciousness"
+      - "altered consciousness"
+      - "decreased level of consciousness"
+      - "depressed level of consciousness"
+      - "change in mental status"
+      - "mental status change*"
+      - "acute confusion"
+      - confusion
+      - confused
+      - encephalopathy
+      - unresponsive
+      - unresponsiveness
+      - obtunded
+      - obtundation
+      - lethargy
+      - lethargic
+      - stupor
+      - comatose
+      - coma
+      - {t: AMS, cs: true}
+      - {t: LOC, cs: true, requires: "alter|decreas|depress|change|loss of"}
+    exclude_context: []
+
+# ---------------------------------------------------------------------------------------------------------------------------
+# Setting proxies (care setting is not a field in the corpus; these are words in the history text).  Applied with negation/family
+# cues only.  Local rule: acute = ICU or ED or INPATIENT; outpatient / EMU kept apart; acute plus outpatient/EMU = "mixed".
+settings:
+  SETTING_ICU:
+    description: "ICU or ventilated"
+    terms:
+      - icu
+      - micu
+      - sicu
+      - ccu
+      - cicu
+      - nsicu
+      - nicu
+      - picu
+      - "neuro icu"
+      - "intensive care"
+      - "critical care"
+      - intubated
+      - intubation
+      - ventilator
+      - "mechanically ventilated"
+      - "on pressors"
+      - "vasopressor*"
+      - "code blue"
+  SETTING_ED:
+    description: "Emergency department"
+    terms:
+      - "emergency department"
+      - "emergency room"
+      - "emergency dept"
+      - {t: ED, cs: true}
+      - {t: ER, cs: true}
+      - "brought in by ems"
+      - "brought by ems"
+      - "ems"
+      - "found down"
+      - "rapid response"
+  SETTING_ADMIT:
+    description: "Inpatient admission wording"
+    terms:
+      - inpatient
+      - "in-patient"
+      - admitted
+      - admission
+      - "hospital day"
+      - hospitalized
+      - "hospitalised"
+      - "in the hospital"
+      - "transferred from"
+      - "transfer from"
+      - "post-op day"
+      - "postoperative day"
+  SETTING_CLINIC:
+    description: "Outpatient / clinic wording"
+    terms:
+      - outpatient
+      - "out-patient"
+      - clinic
+      - "office visit"
+      - "routine eeg"
+      - ambulatory
+      - "referred by"
+      - "referred for"
+      - "follow up"
+      - "follow-up"
+      - "pcp"
+      - "primary care"
+  SETTING_EMU:
+    description: "Epilepsy monitoring unit / video-EEG monitoring"
+    terms:
+      - emu
+      - "epilepsy monitoring"
+      - "video eeg monitoring"
+      - "video-eeg monitoring"
+      - "long term monitoring"
+      - "long-term monitoring"
+      - "presurgical"
+      - "pre-surgical"
+
+# ---------------------------------------------------------------------------------------------------------------------------
+# Matching covariates (round 2 only).  Age/sex are read from the history text; if the NEDC reports lack them they are simply absent.
+covariates:
+  MED_SEDATIVE:
+    description: "Sedative / anesthetic / opioid class (propofol, midazolam, lorazepam, dexmedetomidine, ketamine, barbiturates, fentanyl)"
+    terms: [propofol, diprivan, midazolam, versed, lorazepam, ativan, diazepam, valium, clonazepam, dexmedetomidine, precedex, ketamine, pentobarbital, phenobarbital, fentanyl, morphine, hydromorphone, dilaudid]
+  MED_ASM:
+    description: "Antiseizure medication class"
+    terms: [levetiracetam, keppra, phenytoin, dilantin, fosphenytoin, cerebyx, valproate, valproic, depakote, depakene, lacosamide, vimpat, carbamazepine, tegretol, lamotrigine, lamictal, topiramate, topamax, oxcarbazepine, trileptal, zonisamide, zonegran, brivaracetam, briviact, perampanel, clobazam, gabapentin, pregabalin]
+  SEX_F:
+    description: "Female wording"
+    terms: [female, woman, {t: F, cs: true, requires: "\\b\\d{1,3}\\b"}]
+  SEX_M:
+    description: "Male wording"
+    terms: [male, man, gentleman]
+  AGE_18_39: {description: "Age 18-39 stated in history", age: [18, 39]}
+  AGE_40_64: {description: "Age 40-64 stated in history", age: [40, 64]}
+  AGE_65_79: {description: "Age 65-79 stated in history", age: [65, 79]}
+  AGE_80P:   {description: "Age 80 or older stated in history", age: [80, 120]}
+
+# Universe sets: which reports contain a recognised section at all (denominators; unrecognised reports are NOT controls).
+universe:
+  UNIVERSE_HISTORY: {section: history}
+  UNIVERSE_MEDS: {section: medications}
+
+# ---------------------------------------------------------------------------------------------------------------------------
+# What is requested, in order.  Round 0 = one profile (counts only) script.  Round 1 = file lists for the gate sets.  Round 2 = only if
+# the stop rule passes: loose variants and matching covariates.  (See docs/tueg_count_query.md.)
+query_plan:
+  profile:                  # round 0: one script, counts only (strict variant)
+    labels: [E1, E2, E5, E3, E3_broad, E5_nonspecific]
+    controls: [CTRL]
+    cross_settings: [ACUTE, SETTING_ICU, SETTING_ED, SETTING_ADMIT, SETTING_CLINIC, SETTING_EMU, NONE]
+  round1:                   # file lists, strict variant
+    - UNIVERSE_HISTORY
+    - E1
+    - E2
+    - E5
+    - E3
+    - E3_broad
+    - E5_nonspecific
+    - CTRL
+    - SETTING_ICU
+    - SETTING_ED
+    - SETTING_ADMIT
+    - SETTING_CLINIC
+    - SETTING_EMU
+  round2_strict: [UNIVERSE_MEDS, MED_SEDATIVE, MED_ASM, SEX_F, SEX_M, AGE_18_39, AGE_40_64, AGE_65_79, AGE_80P]
+  round2_loose: [E1, E2, E5]
+
+# Stop rule (docs/tueg_count_query.md section 2).  Counts are sessions with exactly one primary label and acute context.
+stop_rule:
+  min_positives_acute: 50
+  min_controls_per_positive: 3
+  primary_labels: [E1, E2, E5]
+  min_labels_passing: 2
