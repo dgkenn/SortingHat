@@ -260,6 +260,8 @@ or fewer than 11 at a site is "not estimable". Shuffled-label and permuted-EEG n
 the whole set. **EEG-derived information is never an input or label evidence:** no baseline, P or meta column is derived from EEG, the
 silver labels are EEG-blind (E3 and EEG-report flags excluded), and `reports_findings` feeds only the circularity audit.
 
+**Superseded (D-155):** the subgroup above conditions on label-family ICD codes, which share their evidence with the silver labels, so it has almost no positives; the presentation-based strata of section 2.4 replace it as the intended-use stratum and U0 is kept for continuity only.
+
 Reading it: (a) says whether the EEG carries etiologic signal at all; (b) and (c) say whether it adds to what is known at the door.
 The A and C comparisons that follow answer a different question (an EEG recorded after a workup) and stay as before. A favourable
 (a) with an unfavourable (c) means the presentation already carries what the EEG carries on these labels.
@@ -269,6 +271,50 @@ there (little coded workup by construction) and the labels that need the workup 
 sedative bolus with no recorded quantity that ended before t0 is invisible to the Baseline A sedation features; ICD codes are timed
 at their start date, which can precede the coding time; encounter starts are date-granular because visits are date-only (D-112);
 the +1 h score window uses data charted after the EEG began (P only).
+
+### 2.4 Presentation-based intended-use strata and transport weighting (D-155)
+
+The undifferentiated subgroup of section 2.3 (**U0**) requires no label-family ICD code before t0. The silver labels are built from those
+same code families, so U0 holds almost no positives by construction (`docs/research/intended_use_fit_2026-10-09.md`). U0 stays in the
+report, labelled "U0 (code-conditioned; superseded, see D-155)". The intended-use block now also reports two strata defined by
+PRESENTATION only, with no diagnosis-code, silver-label or EEG-derived condition (fixed in D-155 before any stratum-level Delta was
+computed on real data; code in `sortinghat/metrics/intended_use.py`):
+
+| Stratum | Definition |
+|---|---|
+| **IU-large** | t0 on encounter calendar day 0-1 (the visit start is date-only, so floor(hours / 24) in {0, 1}: up to about 48 h); no sedative or opioid continuous infusion running at t0; no ventilation proxy and no vasopressor proxy in the 24 h before t0; recording <= 12 h OR not a cEEG task folder |
+| **IU-small** | calendar day 0; every IU-large condition; not a cEEG task folder (PRN sedation allowed); a subset of IU-large |
+
+* *Infusion at t0*: any Baseline A `sed__{sedative,opioid}__on_t0` or named-agent `on_t0` flag (an administration with no stop recorded by t0,
+  or an order within 2 h of t0 when no administration is recorded; D-154). It is a proxy: the route and rate are not in the features, and a
+  PRN dose with no recorded stop can look like a running drug. A PRN dose with a recorded stop does not exclude.
+* *Ventilation and vasopressor proxies*: the diagnostic's free-text rules over OMOP measurement, procedure and drug rows in the 24 h before t0
+  (`scripts/diag_intended_use_fit.py` imports the same functions), read from the local OMOP cache only (`--omop-source cache`, the default;
+  `--omop-cache` to point elsewhere; `store` reads the `--data` / `--s3` store; `none` switches them off). The feature is optional: when the
+  cache is empty or absent, or loading fails, the strata are defined WITHOUT those two conditions and the report says so (the sources line
+  and the "missing" note). They are not chart-validated; order-time versus administration-time ambiguity remains.
+* A condition that cannot be established for a row counts as not met. If the visit start or the Baseline A sedation columns are missing
+  both strata are unavailable; without the cEEG task folder only IU-small is unavailable.
+* Reported (all suppressed, n < 11 as `<11`; a pooled count is hidden when one site count is): stratum sizes and the share of the analysed
+  set; how many rows meet each component alone; per-label assessable and positive counts, pooled and per site.
+* *Delta by comparison inside the strata*: the headline-rung Delta of a. EEG-only vs prior, b. EEG + age/sex vs age/sex, c. P + EEG vs P (the
+  whole-set fits of section 2.3), and Baselines A and C (the headline ladder), both schemes, scored by subsetting the SAME held-out
+  per-patient differences d_i to the stratum rows (no refit). 99% / 95% within-site patient bootstrap over the stratum rows, per-site Delta,
+  every-site rule. Fewer than 50 scored patients, or fewer than 11 at a site, is "not estimable".
+* *Transport (re-weighting toward IU-large)*: a domain classifier P(IU-large | age, sex, site, calendar-day timing, infusion / PRN-only /
+  none, ventilation, vasopressor, recording type) is fitted by cross-fitting (5 folds, stratified by site and class) on the analysed rows;
+  diagnosis codes, silver labels and EEG-derived quantities are not covariates. Non-IU rows get stabilised inverse-odds weights
+  w = [p / (1 - p)] / [pi / (1 - pi)] (pi = IU-large share), trimmed at the 1st / 99th percentile; IU rows weigh 1. The report gives the
+  effective sample size (all rows, non-IU rows), the cross-fitted AUC, the share of weight carried by the top 5% of non-IU rows, the
+  domain-probability and weight quantiles (n >= 11, no min / max) and standardised mean differences before and after weighting; then the
+  weighted Delta sum(w d) / sum(w) for the same sets and both schemes with a within-site bootstrap that holds the weights fixed (it does not
+  carry the uncertainty of the weight model).
+
+Reading it. IU-large is a deterministic rule on covariates the domain model sees, so the model separates the classes almost perfectly
+(AUC near 1) and many non-IU rows get weights near zero: read the effective sample size and the balance before the weighted Delta, and treat
+a low ESS as "the cohort holds too few IU-like rows to transport to". The weighting assumes the EEG increment depends on a row only
+through the domain covariates. Both strata approximate, not identify, the ED population (HEEDB has no ED flag), and the calendar-day
+timing is over-stated by 0-24 h. The old U0 rows are unchanged and remain a code-conditioned sensitivity.
 
 ## 3. Deviations from the plan
 

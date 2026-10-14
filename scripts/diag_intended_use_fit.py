@@ -52,18 +52,19 @@ import pandas as pd  # noqa: E402
 import build_baselines as bb  # noqa: E402
 import run_silver_feasibility as rsf  # noqa: E402
 from sortinghat import data_io, omop_cache  # noqa: E402
-from sortinghat.baselines import lexicon as lex  # noqa: E402
+from sortinghat.baselines import lexicon as lex  # noqa: E402,F401  (kept for importers of this module)
+from sortinghat.metrics.intended_use import (DRUG_ANY, DRUG_PREFILTER, DUR_LONG_S, DUR_SHORT_S, INFUSION_ONLY_AGENTS,  # noqa: E402,F401
+                                             INFUSION_TEXT, MEAS_PREFILTER, OMOP_FLAGS, PROC_PREFILTER, PROXY_WINDOW_H,
+                                             SED_WINDOW_H, VASO_EXCLUDE, VASOPRESSOR, VENT_MEASUREMENT, VENT_PROCEDURE,
+                                             _gt0, _has_time_of_day, _times, cache_files, iter_cache_frames,
+                                             iter_dict_frames, make_omop_readers, omop_proxies, sedation_features)
 from sortinghat.safe_output import (SUPPRESS_BELOW, SUPPRESSED, safe_print, safe_quantiles,  # noqa: E402
                                     safe_write_json, safe_write_text, suppress_count)
 
 BANNER = "EXPLORATORY DIAGNOSTIC — intended-use fit of the Study 1 cohort; aggregate-only; not a test of any hypothesis"
 K = SUPPRESS_BELOW
 POOLED = "all_sites"
-DUR_SHORT_S, DUR_LONG_S = 3600.0, 12 * 3600.0           # < 1 h routine / spot; 1-12 h; > 12 h continuous
 TIME_CUTS_H = (6.0, 24.0, 48.0)
-SED_WINDOW_H = 6.0                                      # sedation / infusion window before t0 (as the feasibility subgroup)
-PROXY_WINDOW_H = 24.0                                   # ventilation / vasopressor look-back before t0
-INFUSION_ONLY_AGENTS = ("propofol", "dexmedetomidine")  # given as continuous infusions in practice
 IU_MIN_SUBGROUP = rsf.IU_MIN_SUBGROUP                   # rows needed to estimate Delta in a subgroup (and >= 11 per site)
 LABELS = ("E1", "E2", "E4a", "E5", "E6", "E7")
 
@@ -74,23 +75,6 @@ SERVICE_CLASSES = (("icu", re.compile(r"\bN?[MSC]?ICU\b|INTENSIVE|\bCCU\b", re.I
                    ("hospital_ward", re.compile(r"INPATIENT|\bIP\b|HOSPITAL|FLOOR|WARD", re.I)),
                    ("routine", re.compile(r"ROUTINE|OUTPATIENT|AMBULATORY|\bSTAT\b", re.I)))
 SERVICE_NAMES = [n for n, _ in SERVICE_CLASSES] + ["other", "not_recorded"]
-
-# ---- OMOP text rules (Python regex over free text; classes only are kept)
-INFUSION_TEXT = re.compile(r"infus|\bdrip\b|continuous|premix|\bbag\b|\bpump\b|/\s?(?:hr|hour|min)\b|mcg/kg/min|mg/hr|"
-                           r"\bin (?:0\.9|d5|dextrose|sodium chloride|nacl|ns\b)", re.I)
-VASOPRESSOR = re.compile(r"norepinephrine|levophed|noradrenaline|vasopressin|vasostrict|phenylephrine|neo-?synephrine|"
-                         r"\bdopamine\b|angiotensin ii|giapreza", re.I)
-VASO_EXCLUDE = re.compile(r"ophth|otic|topical|cream|ointment|nasal|inhal|nebul|tablet|\btab\b|capsule|\bcap\b|patch|spray|"
-                          r"drops?\b|\bgel\b|lidocaine|midodrine|droxidopa|auto-?injector|epipen", re.I)
-VENT_MEASUREMENT = re.compile(r"ventilator|ventilation rate|\bvent\b|\bvent[ _]mode|\bpeep\b|tidal vol|\bvt\b|pressure support|\bpsv\b|\bsimv\b|"
-                              r"\bprvc\b|set (?:resp|rate)|\bett\b|endotracheal|\btrach(?:eostomy)?\b|mechanical vent|\bintubated\b|"
-                              r"airway.*(?:tube|ett)", re.I)       # not CMV (cytomegalovirus), not 'trachomatis'
-VENT_PROCEDURE = re.compile(r"5a19[345]5z|0bh1[78]ez|\b9400[2345]\b|\b31500\b|intubat|ventilat", re.I)
-DRUG_ANY = re.compile("|".join(rx for _n, _c, rx in lex._DRUG_RULES) + "|" + VASOPRESSOR.pattern, re.I)
-# Arrow (RE2) prefilter, a superset of the Python rules above (case-insensitive via utf8_lower of the column)
-DRUG_PREFILTER = DRUG_ANY.pattern.lower().replace(r"\b", "")
-MEAS_PREFILTER = r"vent|peep|tidal|\bvt\b|pressure support|psv|simv|prvc|cmv|set (resp|rate)|ett|endotracheal|trach|intubat|airway"
-PROC_PREFILTER = r"5a19|0bh1|9400|31500|intubat|ventilat"
 
 
 # ====================================================================================== suppression helpers
@@ -212,43 +196,6 @@ def dynamic_classes(values: pd.Series, top: int = 6) -> tuple[list, np.ndarray]:
     return names, code
 
 
-def _gt0(bl: pd.DataFrame, cols) -> np.ndarray:
-    out = np.zeros(len(bl), bool)
-    for c in cols:
-        if c in bl:
-            out |= pd.to_numeric(bl[c], errors="coerce").fillna(0).to_numpy(float) > 0
-    return out
-
-
-def sedation_features(bl: pd.DataFrame) -> dict | None:
-    """Baseline A sedation arrays (bool, n); None when the baselines carry no sed__ column."""
-    if not any(str(c).startswith("sed__") for c in bl.columns):
-        return None
-    ing = [i for i in lex.NAMED_INGREDIENTS]
-    cls = lex.DRUG_CLASS
-    on = {i: _gt0(bl, [f"sed__{i}__on_t0"]) for i in ing}
-    q6 = {i: _gt0(bl, [f"sed__{i}__qty_6h"]) for i in ing}
-    q24 = {i: _gt0(bl, [f"sed__{i}__qty_24h"]) for i in ing}
-    sed_cls_on = _gt0(bl, ["sed__sedative__on_t0"])
-    opi_cls_on = _gt0(bl, ["sed__opioid__on_t0"])
-    infusion_agent = np.zeros(len(bl), bool)
-    for i in INFUSION_ONLY_AGENTS:
-        infusion_agent |= on.get(i, False)
-    any_on = sed_cls_on | opi_cls_on
-    for i in ing:
-        any_on |= on[i]
-    q6_cols = [c for c in bl.columns if str(c).startswith("sed__") and str(c).endswith("__qty_6h")]
-    any_q6 = _gt0(bl, q6_cols)
-    any_recent24 = _gt0(bl, [c for c in bl.columns if str(c).startswith("sed__") and (str(c).endswith("__qty_24h") or str(c).endswith("_24h"))])
-    sedative_6h = sed_cls_on | np.logical_or.reduce([on[i] | q6[i] for i in ing if cls.get(i) == lex.SEDATIVE] or [np.zeros(len(bl), bool)])
-    opioid_6h = opi_cls_on | np.logical_or.reduce([on[i] | q6[i] for i in ing if cls.get(i) == lex.OPIOID] or [np.zeros(len(bl), bool)])
-    any_6h = rsf.sedation_6h_flag(bl)
-    any_6h = np.asarray(any_6h, bool) if any_6h is not None else (any_on | any_q6)
-    return {"any_on_t0": any_on, "infusion_agent_on_t0": infusion_agent, "any_6h": any_6h | sedative_6h | opioid_6h,
-            "sedative_6h": sedative_6h, "opioid_6h": opioid_6h, "any_recent24": any_recent24 | any_q6 | any_on,
-            "sedative_on_t0": sed_cls_on, "opioid_on_t0": opi_cls_on}
-
-
 @dataclass
 class Feat:
     """Per-row measures of one population (RECORD-LEVEL, memory only)."""
@@ -308,208 +255,15 @@ def build_features(frame: pd.DataFrame, bl: pd.DataFrame, sedated: np.ndarray | 
                 vc and (vc[0], vc[1]), ab and (ab[0], ab[1]), dx, sed, abg, arrest, omop_d, sedated_any, Y)
 
 
+
+
+
 # ============================================================================================= OMOP proxies
-OMOP_FLAGS = ("sed_row_6h", "sed_inf_6h", "opioid_row_6h", "opioid_inf_6h", "sedative_row_6h", "sedative_inf_6h",
-              "vasopressor_24h", "vent_24h")
-
-
-def cache_files(table: str, root: Path) -> tuple[list, dict]:
-    """Parquet files of one cached OMOP table (the profile with the most complete parts) and coverage counts. Reads nothing."""
-    base = Path(root) / table
-    best, best_key = [], (-1, -1)
-    cov = {"parts": 0, "complete_parts": 0}
-    if not base.is_dir():
-        return [], cov
-    for prof in sorted(p for p in base.iterdir() if p.is_dir()):
-        files, parts, complete = [], 0, 0
-        for part in sorted(p for p in prof.iterdir() if p.is_dir()):
-            man = part / "manifest.json"
-            if not man.exists():
-                continue
-            import json
-            try:
-                expect = int(json.loads(man.read_text()).get("n", 0))
-            except (OSError, ValueError):
-                continue
-            pq_files = sorted(part.glob("rg-*.parquet"))
-            empties = len(list(part.glob("rg-*.empty")))
-            parts += 1
-            complete += int(len(pq_files) + empties >= expect)
-            files.extend(pq_files)
-        if (complete, parts) > best_key:
-            best, best_key, cov = files, (complete, parts), {"parts": parts, "complete_parts": complete}
-    return best, cov
-
-
-def iter_cache_frames(table: str, root: Path, columns: list, ids: np.ndarray, text_col: str | None, prefilter: str | None):
-    """Cached row groups as pandas frames, filtered inside Arrow to ``ids`` and (optionally) a RE2 regex over ``text_col``."""
-    import pyarrow as pa
-    import pyarrow.compute as pc
-    import pyarrow.parquet as pq
-    files, _cov = cache_files(table, root)
-    want = pa.array(np.asarray(ids, dtype="int64"), type=pa.int64())
-    for f in files:
-        try:
-            pf = pq.ParquetFile(f)
-            have = set(pf.schema_arrow.names)
-            if "person_id" not in have:
-                continue
-            t = pf.read(columns=[c for c in columns if c in have])
-        except Exception:                                    # noqa: BLE001 - unreadable file: skipped (counted nowhere, aggregate-only)
-            continue
-        if not t.num_rows:
-            continue
-        m = pc.is_in(t["person_id"].cast(pa.int64()), value_set=want)
-        if text_col and prefilter and text_col in t.column_names:
-            m = pc.and_(m, pc.fill_null(pc.match_substring_regex(pc.utf8_lower(t[text_col].cast(pa.string())), prefilter), False))
-        t = t.filter(pc.fill_null(m, False))
-        if t.num_rows:
-            yield t.to_pandas()
-
-
-def iter_dict_frames(tables: dict, table: str, ids: np.ndarray):
-    df = tables.get(f"omop_{table}")
-    if df is not None and len(df):
-        yield df[df["person_id"].isin(set(int(i) for i in ids))]
-
-
-def _times(df: pd.DataFrame, dt: str, dd: str) -> pd.Series:
-    t = pd.to_datetime(df[dt], errors="coerce") if dt in df else pd.Series(pd.NaT, index=df.index)
-    if dd in df:
-        t = t.where(t.notna(), pd.to_datetime(df[dd], errors="coerce"))
-    if getattr(t.dt, "tz", None) is not None:
-        t = t.dt.tz_localize(None)
-    return t
-
-
-def _has_time_of_day(t: pd.Series) -> pd.Series:
-    return t.notna() & ((t.dt.hour != 0) | (t.dt.minute != 0) | (t.dt.second != 0))
-
-
-def omop_proxies(cohort: pd.DataFrame, readers: dict, remap: dict | None = None) -> tuple[pd.DataFrame, dict]:
-    """Per cohort row (aligned to ``cohort``): bool columns OMOP_FLAGS from the OMOP rows, chunk by chunk (only small flag arrays are kept).
-    ``readers[table](ids, columns, text_col, prefilter)`` yields pandas chunks; ``remap`` retired id -> surviving id.
-
-    sed_* / opioid_* / sedative_*: a sedative/opioid (any / opioid class / sedative class) drug row in the 6 h before t0 (start <= t0 and
-    end >= t0 - 6 h; end = start when absent) ``_row_6h``, and the subset that is a continuous infusion (an infusion-only agent, an
-    infusion-like text, or an administered interval >= 1 h with a time of day) ``_inf_6h``.  vasopressor_24h: a vasopressor row in
-    [t0 - 24 h, t0].  vent_24h: a ventilator / intubation measurement or procedure row in [t0 - 24 h, t0] (a date-only row counts when its
-    date is the date of t0 or of t0 - 24 h)."""
-    pids = cohort["person_id"].to_numpy("int64")
-    t0 = pd.to_datetime(cohort["t0"]).to_numpy("datetime64[ns]")
-    pos = pd.Series(np.arange(len(pids)), index=pids)
-    pos = pos[~pos.index.duplicated()]
-    src = pd.to_numeric(cohort.get("person_id_source", cohort["person_id"]), errors="coerce")
-    to_surv = {int(s): int(p) for s, p in zip(src.dropna(), cohort.loc[src.notna(), "person_id"]) if int(s) != int(p)}
-    if remap:
-        to_surv.update({int(o): int(n) for o, n in remap.items() if int(n) in pos.index})
-    ids = np.array(sorted(set(pids.tolist()) | set(to_surv)), dtype="int64")
-    out = {k: np.zeros(len(pids), bool) for k in OMOP_FLAGS}
-    cov: dict = {}
-
-    surv = pd.Series(to_surv, dtype="int64") if to_surv else pd.Series(dtype="int64")
-
-    def locate(df: pd.DataFrame):
-        p = pd.to_numeric(df["person_id"], errors="coerce")
-        p = p.map(surv).fillna(p) if len(surv) else p
-        ix = p.map(pos)
-        ok = ix.notna().to_numpy()
-        return ok, ix.fillna(-1).astype(int).to_numpy()
-
-    # ---- drugs: sedatives / opioids / vasopressors
-    ncls: dict = {}
-    for ch in readers["drug_exposure"](ids, ["person_id", "drug_exposure_start_datetime", "drug_exposure_end_datetime",
-                                            "drug_exposure_start_date", "drug_exposure_end_date", "drug_source_value"],
-                                       "drug_source_value", DRUG_PREFILTER):
-        ok, ix = locate(ch)
-        ch = ch[ok].reset_index(drop=True)
-        ix = ix[ok]
-        if not len(ch):
-            continue
-        ts = _times(ch, "drug_exposure_start_datetime", "drug_exposure_start_date")
-        te = _times(ch, "drug_exposure_end_datetime", "drug_exposure_end_date")
-        te = te.where(te.notna() & (te >= ts), ts)
-        t0c = t0[ix]
-        start_h = (ts.to_numpy("datetime64[ns]") - t0c) / np.timedelta64(1, "h")
-        end_h = (te.to_numpy("datetime64[ns]") - t0c) / np.timedelta64(1, "h")
-        keep = (start_h <= 0) & (end_h >= -PROXY_WINDOW_H)
-        if not keep.any():
-            continue
-        ch, ix, start_h, end_h = ch[keep].reset_index(drop=True), ix[keep], start_h[keep], end_h[keep]
-        ts, te = ts[keep].reset_index(drop=True), te[keep].reset_index(drop=True)
-        codes, uniq = pd.factorize(ch["drug_source_value"].astype("string").fillna(""))
-        rows = []
-        for u in uniq:
-            ings = lex.match_ingredients(u)
-            klass = {lex.DRUG_CLASS[i] for i in ings}
-            rows.append((lex.SEDATIVE in klass, lex.OPIOID in klass, any(i in INFUSION_ONLY_AGENTS for i in ings),
-                         bool(INFUSION_TEXT.search(u)), bool(VASOPRESSOR.search(u)) and not VASO_EXCLUDE.search(u)))
-        arr = np.array(rows, dtype=bool).reshape(-1, 5)[codes]
-        is_sed, is_opi, inf_agent, inf_text, is_vaso = (arr[:, j] for j in range(5))
-        timed = (_has_time_of_day(ts) & _has_time_of_day(te)).to_numpy(bool)
-        long_iv = timed & ((end_h - start_h) >= 1.0)
-        infusion = inf_agent | inf_text | long_iv
-        in6 = end_h >= -SED_WINDOW_H
-        for name, sel in (("sed", is_sed | is_opi), ("opioid", is_opi), ("sedative", is_sed)):
-            r = sel & in6
-            out[f"{name}_row_6h"][ix[r]] = True
-            out[f"{name}_inf_6h"][ix[r & infusion]] = True
-        out["vasopressor_24h"][ix[is_vaso]] = True
-        ncls["drug_rows_kept"] = ncls.get("drug_rows_kept", 0) + len(ch)
-    # ---- ventilation: measurements and procedures
-    for table, tcols, text_col, rx, pre in (
-            ("measurement", ["person_id", "measurement_datetime", "measurement_date", "measurement_source_value"],
-             "measurement_source_value", VENT_MEASUREMENT, MEAS_PREFILTER),
-            ("procedure_occurrence", ["person_id", "procedure_datetime", "procedure_date", "procedure_source_value"],
-             "procedure_source_value", VENT_PROCEDURE, PROC_PREFILTER)):
-        dt, dd = tcols[1], tcols[2]
-        for ch in readers[table](ids, tcols, text_col, pre):
-            ok, ix = locate(ch)
-            ch = ch[ok].reset_index(drop=True)
-            ix = ix[ok]
-            if not len(ch):
-                continue
-            txt = ch[text_col].astype("string").fillna("")
-            hit_u = {u: bool(rx.search(u)) for u in txt.unique()}
-            hit = txt.map(hit_u).to_numpy(bool)
-            if not hit.any():
-                continue
-            t = _times(ch, dt, dd)[hit]
-            ixh, t0h = ix[hit], t0[ix[hit]]
-            h = (t.to_numpy("datetime64[ns]") - t0h) / np.timedelta64(1, "h")
-            dated = ~_has_time_of_day(t).to_numpy(bool)
-            day_h = (t.dt.normalize().to_numpy("datetime64[ns]") - pd.Series(t0h).dt.normalize().to_numpy("datetime64[ns]")) / np.timedelta64(1, "h")
-            inw = np.where(dated, (day_h >= -PROXY_WINDOW_H) & (day_h <= 0), (h >= -PROXY_WINDOW_H) & (h <= 0))
-            out["vent_24h"][ixh[inw]] = True
-            ncls[f"{table}_vent_rows"] = ncls.get(f"{table}_vent_rows", 0) + int(inw.sum())
-    return pd.DataFrame(out), ncls
-
-
+# The proxy rules, the cached readers and `omop_proxies` live in sortinghat/metrics/intended_use.py (shared with the feasibility
+# script's presentation strata, D-155); imported above under their original names.
 def make_readers(a, source) -> tuple[dict | None, dict]:
     """(readers per OMOP table, coverage notes); None when the OMOP proxies are switched off or unavailable."""
-    mode = a.omop_source
-    if mode == "none":
-        return None, {"omop_source": "none"}
-    tables = ("drug_exposure", "measurement", "procedure_occurrence")
-    if mode == "cache":
-        root = Path(a.omop_cache) if a.omop_cache else omop_cache.cache_root()
-        cov = {t: cache_files(t, root)[1] for t in tables}
-        if not any(c["parts"] for c in cov.values()):
-            return None, {"omop_source": "cache (empty or absent)"}
-        return ({t: (lambda ids, cols, tc, pre, _t=t: iter_cache_frames(_t, root, cols, ids, tc, pre)) for t in tables},
-                {"omop_source": "local OMOP cache (no new streaming)", "coverage": cov})
-    if isinstance(source, dict):
-        return ({t: (lambda ids, cols, tc, pre, _t=t: iter_dict_frames(source, _t, ids)) for t in tables}, {"omop_source": "in-memory tables"})
-    if source is None:
-        return None, {"omop_source": "store requested but no --data / --s3"}
-
-    def from_store(t):                                      # a local mirror / store (the tests' synthetic layout)
-        def gen(ids, cols, tc, pre):
-            for _u, batches, _tbl in data_io.iter_omop_units(t, person_ids=[int(i) for i in ids], columns=cols, s3=source):
-                for b in batches:
-                    yield b.to_pandas()
-        return gen
-    return {t: from_store(t) for t in tables}, {"omop_source": "store"}
+    return make_omop_readers(a.omop_source, a.omop_cache, source)
 
 
 # ====================================================================================== populations
@@ -909,10 +663,7 @@ def build_parser() -> argparse.ArgumentParser:
     ap.set_defaults(out="out/diag")
     ap.add_argument("--diag-out", default="out/diag/intended_use_fit.json", help="aggregate JSON (must not be under local_only/)")
     ap.add_argument("--diag-md", default="out/diag/intended_use_fit.md", help="aggregate markdown (must not be under local_only/)")
-    ap.add_argument("--omop-source", choices=["cache", "store", "none"], default="cache",
-                    help="OMOP rows for the ventilation / vasopressor / infusion proxies: the local cache (default; never streams), the store "
-                         "given by --data / --s3, or none (those measures are then omitted)")
-    ap.add_argument("--omop-cache", default=None, help="root of the local OMOP cache (default: the pipeline's out/local_only/omop_cache)")
+    # --omop-source {cache (default), store, none} and --omop-cache are inherited from run_silver_feasibility.build_parser (D-155)
     return ap
 
 

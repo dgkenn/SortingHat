@@ -15,6 +15,11 @@ the ED with little or nothing known: (a) EEG-only vs the prevalence prior, (b) E
 primary-label-family ICD code recorded before t0, no sedative/opioid exposure in the 6 h before t0). The baselines use the
 current encounter only unless build_baselines.py was run with --with-history (then the report says "with history"). EEG-derived
 information is never an input or label evidence. The existing Baseline A / C comparisons follow.
+D-155 supersedes that subgroup (U0 conditions on label-family ICD codes, which are the silver labels' own evidence, so it holds almost no
+positives): the same block now also reports PRESENTATION-based strata IU-large / IU-small (calendar day 0-1 / 0, no running sedative or
+opioid infusion at t0, no ventilation or vasopressor proxy in the prior 24 h from the local OMOP cache when present, not a long cEEG
+recording; no diagnosis-code condition), the Delta by comparison inside them from the SAME held-out predictions (no refit), and
+transport weights toward IU-large (sortinghat/metrics/intended_use.py). U0 stays, labelled superseded.
 
 Inputs (record-level, all under local_only/, never printed)
     --cohort     out/local_only/cohort_study1.csv       (SiteID, person_id, SessionID, BidsFolder, EEGFolder, t0, in_strict*, gcs_*, four_*, duration_s)
@@ -71,6 +76,7 @@ from sortinghat.labels.circularity_audit import run_circularity_audit  # noqa: E
 from sortinghat.labels.extract import eeg_impression_comparator, load_reports_findings  # noqa: E402
 from sortinghat.metrics.bootstrap import bootstrap_ci, paired_bootstrap_delta  # noqa: E402
 from sortinghat.metrics.calibration import per_label_report  # noqa: E402
+from sortinghat.metrics import intended_use as iu_mod  # noqa: E402
 from sortinghat.metrics.hypotheses import h3_severity_stratified  # noqa: E402
 from sortinghat.metrics.labels import e7_eligible  # noqa: E402
 from sortinghat.metrics.sedation import (MIN_STRATUM_N as SED_MIN_STRATUM_N, GRADES as SED_GRADES, GRADE_SPEC as SED_GRADE_SPEC,  # noqa: E402
@@ -113,6 +119,8 @@ IU_COMPARISONS = (("prior", "a. EEG-only vs prevalence prior"), ("agesex", "b. E
 UNDIFF_MAX_H = 36.0                              # EEG on encounter day 0-1: t0 within 36 h of the encounter start
 UNDIFF_SEDATION_H = 6.0                          # no sedative / opioid exposure in the 6 h before t0 (Baseline A sedation features)
 IU_MIN_SUBGROUP = 50                             # evaluation rows needed to estimate Delta in the subgroup (and >= 11 per site)
+U0_LABEL = "U0 (code-conditioned; superseded, see D-155)"     # the original undifferentiated subgroup, kept for continuity
+POP_LABELS = {"all_analysed": "all analysed", "undifferentiated": U0_LABEL}
 UNKNOWN_SCOPE = "not recorded (baselines built before D-145; prior-encounter data may be included)"
 LIMITATIONS = (
     "Silver labels train, tune AND score the models: agreement with the label source is not accuracy against a clinical truth.",
@@ -127,6 +135,11 @@ LIMITATIONS = (
     "Development rows (20%) are drawn from the same silver labels; selection and recalibration therefore tune to silver noise.",
     "Delta compares models fitted with identical heads; a nonzero Delta can reflect EEG features that proxy for the "
     "silver-label ascertainment process (for example sedation, ICU monitoring intensity), see the controls.",
+    "The presentation-based intended-use strata (D-155) rest on proxies: the visit start is date-only (calendar-day timing is over-stated "
+    "by 0-24 h), a running infusion at t0 is read from Baseline A on_t0 flags, and the ventilation / vasopressor conditions are free-text "
+    "rules over the local OMOP cache (not chart-validated; absent when the cache is). No ED flag exists in HEEDB, so IU-large and IU-small "
+    "approximate, not identify, the ED population; the transport weights assume the EEG increment depends on the rows only through the "
+    "domain covariates and their interval ignores the uncertainty of the weight model.",
     "No result here tests H1-H6 or moves any gate; it is an early look at whether EEG carries signal worth adjudicating.",
 )
 
@@ -341,6 +354,10 @@ class Assembly:
     embedding_info: dict = field(default_factory=dict)   # aggregate, suppressed: frozen-CBraMod coverage (empty = rung skipped)
     morgoth_info: dict = field(default_factory=dict)     # aggregate, suppressed: MORGOTH-findings coverage (empty = rung skipped)
     morgoth_exposure: dict = field(default_factory=dict)  # {"flag": float (n,) 1/0/NaN (RECORD-LEVEL, memory only), "basis": str} or {}
+    hours: np.ndarray | None = None                       # hours from the (date-only) visit start to t0, NaN unknown (RECORD-LEVEL, memory only)
+    hours_src: str = "unavailable"
+    omop: pd.DataFrame | None = None                      # D-155 bool proxy columns (vent_24h, vasopressor_24h, ...) aligned to frame; None = not loaded
+    omop_info: dict = field(default_factory=dict)         # aggregate, suppressed: where the proxies came from / why they are missing
 
 
 def gcs_equivalent(gcs: pd.Series, four: pd.Series) -> pd.Series:
@@ -362,19 +379,8 @@ def sedation_flag(bl: pd.DataFrame, hints: pd.DataFrame, source: str) -> np.ndar
     return {"baseline": from_bl, "e4b": from_e4b, "either": from_bl | from_e4b}[source]
 
 
-def sedation_6h_flag(bl: pd.DataFrame) -> np.ndarray | None:
-    """Sedative / opioid exposure in the 6 h before t0 from the Baseline A sedation features: a sedative or opioid running at t0
-    (``sed__{sedative,opioid}__on_t0``) or a recorded quantity attributable to the 6 h window (``sed__<agent>__qty_6h`` > 0).
-    None when the frame has no such column (the exposure cannot be established). A bolus with no recorded quantity that ended
-    before t0 is invisible to these features; that limitation is stated in docs/silver_feasibility.md."""
-    cols = [c for c in ("sed__sedative__on_t0", "sed__opioid__on_t0") if c in bl] + \
-           [c for c in bl.columns if str(c).startswith("sed__") and str(c).endswith("__qty_6h")]
-    if not cols:
-        return None
-    exposed = np.zeros(len(bl), bool)
-    for c in cols:
-        exposed |= (bl[c].fillna(0).to_numpy(float) > 0)
-    return exposed
+# `sedation_6h_flag` moved to sortinghat/metrics/intended_use.py (shared with the diagnostic and the D-155 strata)
+sedation_6h_flag = iu_mod.sedation_6h_flag
 
 
 def hours_since_encounter(sel: pd.DataFrame, bl: pd.DataFrame) -> tuple[np.ndarray, str]:
@@ -515,6 +521,7 @@ def assemble(a) -> Assembly:
     if bl_cols.get("P"):
         iu_sets["P"] = list(bl_cols["P"])
     flag, parts = undifferentiated_flag(sel, sel_bl, a.undiff_max_hours)
+    iu_hours, iu_hours_src = hours_since_encounter(sel, sel_bl)
     sub_sites = ssites.to_numpy(object)
     subgroup_info = {
         "definition": {"max_hours_from_visit_start": a.undiff_max_hours, "label_family_dx_before_t0": "none",
@@ -564,7 +571,8 @@ def assemble(a) -> Assembly:
            "sedated": sedation_flag(sel_bl, Hs, a.sedation_source)}
     return Assembly(sel, baseline, eeg_df, y, m, names, primary, e7_primary, bsets, cov, ssites.to_numpy(object),
                     sel["t0"].to_numpy("datetime64[us]"), flow, label_report, site_labels, iu_sets, flag, subgroup_info,
-                    baseline_scope(a.baselines), embedding_info, morgoth_info, morgoth_exposure)
+                    baseline_scope(a.baselines), embedding_info, morgoth_info, morgoth_exposure,
+                    np.asarray(iu_hours, float), iu_hours_src)
 
 
 # ===================================================================================== model data per scheme
@@ -819,7 +827,7 @@ def subgroup_estimable(A: Assembly) -> str | None:
     return f"fewer than {MIN_SITE_CELL} subgroup patients at {', '.join(small)}" if small else None
 
 
-def run_intended_use(A: Assembly, a, cfg: LadderConfig, headline: str, splits: list[str]) -> dict:
+def run_intended_use(A: Assembly, a, cfg: LadderConfig, headline: str, splits: list[str], keep: dict | None = None) -> dict:
     """The "Intended use: undifferentiated AMS" block: three comparisons, each Delta = masked log loss(set + EEG) - masked log
     loss(set) on the SAME evaluation rows, under both validation schemes, for the whole analysed set and for the
     undifferentiated subgroup (trained on all training-fold rows, scored on subgroup rows only). Headline EEG rung only.
@@ -829,7 +837,10 @@ def run_intended_use(A: Assembly, a, cfg: LadderConfig, headline: str, splits: l
       c. 'P'      : EEG + Baseline P (Presentation) vs P
 
     EEG-derived information is never an input or label evidence: the sets hold no EEG-derived column, and the silver labels are
-    EEG-blind (E3 and the EEG-report flags are excluded; reports_findings feeds only the circularity audit)."""
+    EEG-blind (E3 and the EEG-report flags are excluded; reports_findings feeds only the circularity audit).
+
+    ``keep`` (optional dict): receives the whole-set ladder result of each scheme (``keep[scheme]``) so that the D-155 presentation
+    strata and the transport weighting can score subsets of the SAME held-out predictions (no refit)."""
     spec = [r for r in BASE_RUNGS if r.name == headline]
     sets = {k: A.iu_sets[k] for k, _ in IU_COMPARISONS if k in A.iu_sets}
     out: dict = {"title": IU_TITLE, "question": "Given an unknown EEG recorded in the ED or early in an admission, with little or no "
@@ -842,7 +853,7 @@ def run_intended_use(A: Assembly, a, cfg: LadderConfig, headline: str, splits: l
                                              for k, lab in IU_COMPARISONS if k not in sets},
                  "eeg_derived_inputs": "No baseline column and no label is derived from EEG (silver labels are EEG-blind; E3 and EEG-report "
                                        "flags are excluded; reports_findings is used only in the circularity audit)",
-                 "subgroup": A.subgroup_info, "populations": {}, "negative_controls": {}}
+                 "subgroup": A.subgroup_info, "subgroup_label": U0_LABEL, "populations": {}, "negative_controls": {}}
     not_est = subgroup_estimable(A)
     for split in splits:
         out["populations"][split] = {}
@@ -861,6 +872,8 @@ def run_intended_use(A: Assembly, a, cfg: LadderConfig, headline: str, splits: l
                                                           f"this scheme, or fewer than {MIN_SITE_CELL} at a site"}
                         continue
                 out["populations"][split][pop] = {k: _iu_rung(res, k, headline) for k in sets}
+                if keep is not None and pop == "all_analysed":
+                    keep[split] = res
             except (ValueError, ZeroDivisionError) as e:               # too few rows at a site for the scheme
                 out["populations"][split][pop] = {"not_estimable": type(e).__name__}
     if not a.skip_controls:
@@ -889,6 +902,76 @@ def run_intended_use(A: Assembly, a, cfg: LadderConfig, headline: str, splits: l
     else:
         out["negative_controls"] = {"skipped": "--skip-controls was set: the negative controls of this block were NOT run"}
     return clean(out)
+
+
+# ============================================================ presentation strata + transport (D-155)
+def attach_omop(A: Assembly, a, store=None) -> None:
+    """Optional ventilation / vasopressor proxies (OMOP rows in the 24 h before t0) for the analysed rows, from the LOCAL OMOP cache
+    only (``--omop-source cache``, never streams), a store (``store``) or not at all (``none``). On any problem the proxies are left
+    out and the reason (a class name, never a value) is recorded: the IU strata are then defined without them."""
+    mode = getattr(a, "omop_source", "cache")
+    A.omop, A.omop_info = None, {"omop_source": "none"}
+    if mode == "none":
+        return
+    try:
+        readers, info = iu_mod.make_omop_readers(mode, getattr(a, "omop_cache", None), store if mode == "store" else None)
+        if readers is None:
+            A.omop_info = info
+            return
+        remap = None
+        if store is not None and not isinstance(store, dict):
+            try:
+                from sortinghat.cohort import StoreSources
+                remap, _st = StoreSources(store).merge_map()
+            except Exception:                                    # noqa: BLE001 - optional bookkeeping
+                info = {**info, "merge_map": "unavailable: rows keyed by retired ids were not re-keyed"}
+        flags, counts = iu_mod.omop_proxies(A.frame, readers, remap)
+        A.omop = flags.reset_index(drop=True)
+        A.omop_info = clean({**info, "matched_row_counts": {k: suppress_count(v) for k, v in counts.items()},
+                             "proxies_used": ["vent_24h", "vasopressor_24h"]})
+    except Exception as e:                                       # noqa: BLE001 - never lose a long run over an optional proxy
+        A.omop, A.omop_info = None, {"omop_source": f"unavailable ({type(e).__name__})"}
+
+
+def presentation_units(A: Assembly, headline: str, iu_res: dict, results: dict) -> dict:
+    """{scheme: {set key: (d, eval_idx, eval_sites)}}: the held-out per-patient differences of the headline rung (RECORD-LEVEL,
+    memory only): the intended-use sets from the whole-set intended-use fits, Baselines A and C from the headline ladder."""
+    units: dict = {}
+    for split in results:
+        per: dict = {}
+        res = iu_res.get(split)
+        if res is not None:
+            for k in A.iu_sets:
+                rr = res.get(headline, k)
+                if rr.d is not None:
+                    per[k] = (np.asarray(rr.d, float), np.asarray(res.eval_idx), np.asarray(res.eval_sites).astype(str))
+        res = results[split]
+        for b in A.baseline_sets:
+            if b in ("A", "C"):
+                rr = res.get(headline, b)
+                if rr.d is not None:
+                    per[f"baseline_{b}"] = (np.asarray(rr.d, float), np.asarray(res.eval_idx), np.asarray(res.eval_sites).astype(str))
+        units[split] = per
+    return units
+
+
+def run_presentation_strata(A: Assembly, a, cfg: LadderConfig, headline: str, iu_res: dict, results: dict) -> dict:
+    """D-155: the presentation-based IU-large / IU-small strata (no diagnosis-code condition) scored from the existing held-out
+    predictions, and the transport re-weighting toward IU-large (``sortinghat.metrics.intended_use``). Aggregate-only."""
+    present = {s for s in A.sites.astype(str)}
+    site_labels = {s: lab for s, lab in A.site_labels.items() if s in present}
+    dur = A.covariates["duration_s"]
+    hours = A.hours if A.hours is not None else np.full(len(A.frame), np.nan)
+    try:
+        blk = iu_mod.presentation_block(
+            baseline=A.baseline, frame=A.frame, hours=hours, hours_src=A.hours_src, dur=dur, omop=A.omop, omop_info=A.omop_info,
+            y=A.y, m=A.m, label_names=A.label_names, sites=A.sites, site_labels=site_labels,
+            units=presentation_units(A, headline, iu_res, results), boot=cfg.n_boot, seed=cfg.seed,
+            alpha_primary=cfg.alpha_primary, alpha_secondary=cfg.alpha_secondary)
+    except Exception as e:                                       # noqa: BLE001 - class name only (a traceback could carry values)
+        print(f"presentation strata failed: {type(e).__name__}", file=sys.stderr)
+        return {"title": iu_mod.TITLE, "failed": type(e).__name__}
+    return clean(blk)
 
 
 # ============================================================================ commercial-clean gap
@@ -1158,7 +1241,8 @@ def run_analysis(A: Assembly, a, store=None) -> dict:
     R: dict = {"banner": BANNER, "headline_rung": headline, "intended_use": None, "ladder": {}, "discrimination_calibration": {},
                "commercial_clean_gap": {"available": False}, "sedation": None, "sedation_intensity": None, "controls": {}, "circularity_audit": None,
                "label_drift": label_drift_screen(A, a.temporal_fraction, getattr(a, "drift_ratio", DRIFT_RATIO))}
-    R["intended_use"] = run_intended_use(A, a, cfg, headline, splits)             # D-145: reported FIRST
+    iu_res: dict = {}
+    R["intended_use"] = run_intended_use(A, a, cfg, headline, splits, keep=iu_res)  # D-145: reported FIRST
     taps: dict = {}
     mds: dict = {}
     results: dict = {}
@@ -1171,6 +1255,9 @@ def run_analysis(A: Assembly, a, store=None) -> dict:
         R["discrimination_calibration"][split] = {
             b: discrimination_calibration(md, res, tap, b, headline, res.site_labels, min(a.n_boot, a.auc_boot), a.seed)
             for b in A.baseline_sets}
+    if A.omop is None and not A.omop_info:
+        attach_omop(A, a, store)                                                  # D-155: optional vent / pressor proxies (local cache)
+    R["intended_use"]["presentation"] = run_presentation_strata(A, a, cfg, headline, iu_res, results)   # D-155: no refit
     if has_emb and has_mg:
         R["commercial_clean_gap"] = {"available": True, "rungs": list(GAP_RUNGS), "note": GAP_NOTE, "exposure_note": EXPOSURE_NOTE,
                                      "by_scheme": {sp: {b: commercial_gap_block(results[sp], A, cfg, b) for b in A.baseline_sets}
@@ -1234,7 +1321,8 @@ def report_json(A: Assembly, a, R: dict) -> dict:
     return clean({
         "banner": BANNER,
         "intended_use": R.get("intended_use"),                     # D-145: the first reported block
-        "decisions": ["D-145 (intended-use block, Baseline P, current-encounter baselines)", "D-143 (this analysis)", "D-120 (two-site schemes)", "D-095 (99% within-site CI + every-site rule)",
+        "decisions": ["D-155 (presentation-based IU strata and transport weighting; U0 superseded)",
+                      "D-145 (intended-use block, Baseline P, current-encounter baselines)", "D-143 (this analysis)", "D-120 (two-site schemes)", "D-095 (99% within-site CI + every-site rule)",
                       "D-123 (structured-only silver)", "D-124 (t0 anchors)", "D-107 (Baseline D dropped)",
                       "D-122 (no imaging in C, no NESI in A)"],
         "settings": {"cohort_definition": a.cohort_def, "sites": list(A.site_labels.values()),
@@ -1434,6 +1522,89 @@ def _controls_markdown(c: dict) -> list[str]:
     return L
 
 
+def _delta_row(prefix: str, label: str, r: dict) -> str:
+    if not r.get("estimable"):
+        return f"| {prefix} | {label} | {r.get('n', '')} | not estimable: {r.get('not_estimable', '')} | | | | | |"
+    ps = ", ".join(f"{k}: {_f(v['delta'])} (n={v['n']})" for k, v in r.get("per_site", {}).items())
+    extra = f" ESS {r['ess']:.1f}" if "ess" in r else ""
+    uw = f" (unweighted {_f(r['unweighted_delta'])})" if "unweighted_delta" in r else ""
+    return (f"| {prefix} | {label} | {r['n']}{extra} | {_f(r['delta'])}{uw} | {_ci_str(r.get('ci_99_within_site'))} | "
+            f"{_ci_str(r.get('ci_95_within_site'))} | {ps} | {r.get('all_sites_favorable')} | {r.get('pattern_met')} |")
+
+
+def _presentation_markdown(pr: dict | None) -> list[str]:
+    """D-155: presentation-based strata (sizes, positives, Delta by comparison) and the transport re-weighting."""
+    if not pr:
+        return []
+    L = [f"### {pr['title']} (D-155)", ""]
+    if "failed" in pr:
+        return L + [f"Not computed: the block failed ({pr['failed']}); the rest of the report is unaffected.", ""]
+    sm = pr["summary"]
+    src = pr["sources"]
+    L += ["Pre-specified in D-155 before any stratum-level Delta was computed on real data. The strata are defined by PRESENTATION ONLY: "
+          "no diagnosis-code condition, no silver label, no EEG-derived quantity (the U0 subgroup above conditioned on label-family codes, "
+          "which share their evidence with the silver labels).", ""]
+    for nm, d in sm["definitions"].items():
+        L.append(f"- **{nm.replace('_', '-')}**: {d} Components applied: {', '.join(sm['applied_components'][nm])}.")
+    L += ["", f"Sources: visit start `{src['visit_start']}`; infusion at t0 = {src['infusion_at_t0']}; ventilation / vasopressor proxies: "
+          + ("included (OMOP: " + str(src["omop"].get("omop_source")) + "; free-text rules over the cache, not chart-validated)"
+             if sm["proxies_included"] else "NOT included, the strata are defined without them (" + str(src["omop"].get("omop_source")) + ")") + ".",
+          "Calendar-day timing is over-stated by 0-24 h because the visit start is date-only. A component that cannot be established "
+          "counts as not met."]
+    for k, v in sm["missing"].items():
+        L.append(f"- Missing: {v}.")
+    for k, v in sm["unavailable"].items():
+        L.append(f"- Unavailable ({k}): {v}.")
+    sites = [k for k in next(iter(sm["components_met"].values())).keys()] if sm["components_met"] else []
+    L += ["", "**Sizes** (counts < 11 shown as <11; a pooled count is also hidden when one site count is):", "",
+          "| Stratum | " + " | ".join(sites) + " | share of analysed |", "|---|" + "---|" * (len(sites) + 1)]
+    for nm, v in sm["strata"].items():
+        if not v.get("available"):
+            L.append(f"| {nm.replace('_', '-')} | " + " | ".join("n/a" for _ in sites) + f" | unavailable: {v['why']} |")
+        else:
+            L.append(f"| {nm.replace('_', '-')} | " + " | ".join(str(v["size"].get(s, "")) for s in sites) + f" | {v['share_of_analysed']} |")
+    L += ["", "Components met (rows meeting each condition on its own):", "", "| Component | " + " | ".join(sites) + " |", "|---|" + "---|" * len(sites)]
+    for c, row in sm["components_met"].items():
+        L.append(f"| {c} | " + " | ".join(str(row.get(s, "")) for s in sites) + " |")
+    L += ["", "**Silver-label positives / assessable per stratum** (pooled; per-site positives in brackets):", "",
+          "| Stratum | Label | assessable | positive | per-site positive |", "|---|---|---|---|---|"]
+    for nm, v in sm["strata"].items():
+        if not v.get("available"):
+            continue
+        for lab, c in v["per_label"].items():
+            ps = ", ".join(f"{s}: {c['positive'].get(s, '')}" for s in sites if s != "all_sites")
+            ass, pos = c["assessable"].get("all_sites", ""), c["positive"].get("all_sites", "")
+            L.append(f"| {nm.replace('_', '-')} | {lab} | {ass} | {pos} | {ps} |")
+    L += ["", "**Delta by comparison within the strata** (" + pr["delta_reading"] + ")", "",
+          "| Scheme | Stratum | Comparison | scored n | Delta | 99% CI | 95% CI | per-site Delta | every site < 0 | pattern |",
+          "|---|---|---|---|---|---|---|---|---|---|"]
+    for split, per in pr["delta"].items():
+        for nm, sets in per.items():
+            for k, r in sets.items():
+                L.append(_delta_row(f"{split} | {nm.replace('_', '-')}", pr["set_labels"].get(k, k), r))
+    tr = pr.get("transport", {})
+    L += ["", "**Transport: re-weighting toward IU-large**", ""]
+    info = tr.get("info")
+    if not info:
+        return L + [f"Not run: {tr.get('not_estimable', 'unavailable')}.", ""]
+    L += [f"Domain model: P(IU-large | {', '.join(info['covariates'])}), cross-fitted ({info.get('crossfit_folds', 'n/a')} folds); {info['weights']}. "
+          "Diagnosis codes, silver labels and EEG-derived quantities are not covariates.", ""]
+    if not info.get("estimable", False) and "not_estimable" in info:
+        return L + [f"Not estimable: {info['not_estimable']}.", ""]
+    L += [f"Rows: IU-large {info['rows']['iu']}, other {info['rows']['other']}; cross-fitted AUC {info['crossfit_auc']}; effective sample size "
+          f"all rows {info['ess_all']}, other rows {info['ess_other']} ({info['ess_other_over_rows']} of the other rows); trimmed "
+          f"{info['trimmed_other']} other rows; top 5% of other rows carry {info['weight_top5pct_share_other']} of their weight; "
+          f"max |SMD| before {info['max_abs_smd_before']} and after {info['max_abs_smd_after']} weighting. {info['overlap_reading']}.", ""]
+    if "delta" in tr:
+        L += [tr["reading"], "", "| Scheme | Comparison | scored n (ESS) | Delta (weighted) | 99% CI | 95% CI | per-site Delta | every site < 0 | pattern |",
+              "|---|---|---|---|---|---|---|---|---|"]
+        for split, sets in tr["delta"].items():
+            for k, r in sets.items():
+                L.append(_delta_row(split, pr["set_labels"].get(k, k), r))
+        L.append("")
+    return L
+
+
 def _iu_markdown(iu: dict) -> list[str]:
     """The first block of report.md (D-145)."""
     L = [f"## {iu['title']}", "", f"**Question.** {iu['question']}", "",
@@ -1446,7 +1617,10 @@ def _iu_markdown(iu: dict) -> list[str]:
         L += ["Not run: " + "; ".join(f"{k} ({v})" for k, v in iu["comparisons_unavailable"].items()) + ".", ""]
     sg = iu["subgroup"]
     d = sg["definition"]
-    L += ["### Undifferentiated subgroup", "",
+    L += [f"### Undifferentiated subgroup: {iu.get('subgroup_label', U0_LABEL)}", "",
+          "Kept for continuity. It requires NO label-family ICD code before t0, but the silver labels are built from those code "
+          "families, so the subgroup has almost no positives by construction; it is superseded by the presentation-based strata "
+          "below (D-155).", "",
           f"All three: EEG on encounter day 0-1 (t0 within {d['max_hours_from_visit_start']:g} h of the encounter start); no ICD "
           f"diagnosis code of the primary label families recorded at or before t0; no sedative or opioid exposure in the "
           f"{d['sedative_opioid_window_hours']:g} h before t0 (Baseline A sedation features). A component that cannot be established "
@@ -1459,17 +1633,18 @@ def _iu_markdown(iu: dict) -> list[str]:
     for split, pops in iu["populations"].items():
         for pop, comps in pops.items():
             if "not_estimable" in comps:
-                L.append(f"| {split} | {pop} | all | n/a | n/a | not estimable: {comps['not_estimable']} | | | | | |")
+                L.append(f"| {split} | {POP_LABELS.get(pop, pop)} | all | n/a | n/a | not estimable: {comps['not_estimable']} | | | | | |")
                 continue
             for k, r in comps.items():
                 ci99, ci95 = r.get("ci_primary_within_site", {}), r.get("ci_95", {}).get("within_site", {})
                 ps = ", ".join(f"{s_}: {_f(v['delta'])} (n={v['n']})" for s_, v in r.get("per_site", {}).items())
-                L.append(f"| {split} | {pop} | {iu['comparisons'][k]} | {r.get('n_eval', '')} | {_f(r.get('loss_reference'))} | "
+                L.append(f"| {split} | {POP_LABELS.get(pop, pop)} | {iu['comparisons'][k]} | {r.get('n_eval', '')} | {_f(r.get('loss_reference'))} | "
                          f"{_f(r.get('delta'))} | [{_f(ci99.get('lo'))}, {_f(ci99.get('hi'))}] | "
                          f"[{_f(ci95.get('lo'))}, {_f(ci95.get('hi'))}] | {ps} | {r.get('all_sites_favorable')} | "
                          f"{r.get('h1h2_rule_met')} |")
     L += ["", "Reference = the prevalence prior (a), age/sex only (b), Baseline P only (c), each fitted with the same head, grid and "
           "recalibration as the EEG model. The subgroup rows are scored from models trained on all training-fold rows.", ""]
+    L += _presentation_markdown(iu.get("presentation"))
     nc = iu.get("negative_controls", {})
     if "skipped" in nc:
         L += [nc["skipped"], ""]
@@ -1678,6 +1853,10 @@ def build_parser() -> argparse.ArgumentParser:
     ap.add_argument("--seed", type=int, default=0)
     ap.add_argument("--undiff-max-hours", type=float, default=UNDIFF_MAX_H,
                     help="undifferentiated subgroup: EEG within this many hours of the encounter start (default 36, D-145)")
+    ap.add_argument("--omop-source", choices=["cache", "store", "none"], default="cache",
+                    help="OMOP rows for the ventilation / vasopressor proxies of the D-155 intended-use strata: the local OMOP cache (default; "
+                         "never streams), the store given by --data / --s3, or none (the strata are then defined without those two conditions)")
+    ap.add_argument("--omop-cache", default=None, help="root of the local OMOP cache (default: the pipeline's out/local_only/omop_cache)")
     ap.add_argument("--blas-threads", type=int, default=1,
                     help="BLAS/OpenMP threads during model fitting (1 is several times faster for these small logistic fits "
                          "than oversubscribed defaults; 0 = library default)")
@@ -1732,6 +1911,13 @@ def _run(a) -> int:
                 ci = r.get("ci_primary_within_site", {})
                 safe_print(f"  {split} {pop} {J['intended_use']['comparisons'][k]}: Delta={_f(r.get('delta'))} 99% CI "
                            f"[{_f(ci.get('lo'))}, {_f(ci.get('hi'))}] every-site<0={r.get('all_sites_favorable')}", known_ids=known)
+    pres = J["intended_use"].get("presentation") or {}
+    for nm, v in (pres.get("summary", {}).get("strata") or {}).items():
+        safe_print(f"  {nm.replace('_', '-')}: " + (f"n={v['size'].get('all_sites')} ({v['share_of_analysed']} of analysed)" if v.get("available") else "unavailable"),
+                   known_ids=known)
+    tw = (pres.get("transport") or {}).get("info") or {}
+    if "ess_all" in tw:
+        safe_print(f"  transport weights: ESS {tw['ess_all']} (other rows {tw['ess_other']}), crossfit AUC {tw['crossfit_auc']}", known_ids=known)
     safe_print(f"analysed={J['n_analysed']} labels={','.join(A.label_names)} primary={','.join(A.primary)} rung={R['headline_rung']}",
                known_ids=known)
     for split, lad in J["ladder"].items():

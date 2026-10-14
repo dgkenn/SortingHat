@@ -359,6 +359,13 @@ All numbers below read from the tables above.
 
 Any change after freeze is an amendment with a date, reason and a statement of whether outcome data had been seen (same rules as DECISION_LOG: append-only, supersede by citing the earlier ID). Deviations are listed in the final report.
 
+> **Amendment / EXPLORATORY note (2026-10-09, D-155; not part of the frozen SAP).** The exploratory silver feasibility analysis (D-143) reports
+> two pre-specified PRESENTATION-based intended-use strata, IU-large and IU-small, and a transport re-weighting toward IU-large, in place of
+> the code-conditioned undifferentiated subgroup of D-145 (kept for continuity, labelled superseded). Outcome data seen: aggregate v3
+> feasibility and an aggregate intended-use fit diagnostic only; no outcome-by-stratum result existed when the strata were fixed. These
+> are exploratory, create no confirmatory hypothesis and move no gate; definitions in `docs/silver_feasibility.md` section 2.4 and
+> DECISION_LOG D-155. Any confirmatory use in Study 1 would need its own dated amendment before the evaluation set is unblinded.
+
 ## 16. Operationalizations the plan does not state (need DECISION_LOG entries before freeze)
 
 1. Scoring of "possible" (section 3.2): y = 0, with sensitivities. Follows `docs/labels_spec.md`.
