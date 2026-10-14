@@ -9,6 +9,8 @@
 **Outcome data seen at drafting:** none. No HEEDB table, Phase 0 audit result, pilot label, or model output has been viewed (consistent with the DECISION_LOG header).
 **Sign-off required before freeze:** biostatistician `[pending]`; senior EEG or neurocritical-care co-investigator `[pending]`.
 
+> **Amended 2026-10-14 (Amendment A1, appended at the end of this file, before any gold label exists).** A1 changes the primary label set, the primary population for the intended-use hypotheses and the mandatory controls, and discloses that aggregate silver-label feasibility results had been seen. The line "Outcome data seen at drafting: none" above describes v0.1 drafting on 2026-10-07 only and is no longer true of the SAP as amended. Original text below is unchanged.
+
 Items marked **[OP]** are operationalizations that the plan does not state; they are collected in section 16 and need a DECISION_LOG entry before freeze. Items marked **[PLACEHOLDER]** are numbers that the Phase 0 pilot must replace.
 
 ---
@@ -366,6 +368,8 @@ Any change after freeze is an amendment with a date, reason and a statement of w
 > are exploratory, create no confirmatory hypothesis and move no gate; definitions in `docs/silver_feasibility.md` section 2.4 and
 > DECISION_LOG D-155. Any confirmatory use in Study 1 would need its own dated amendment before the evaluation set is unblinded.
 
+> **Amendment A1 (2026-10-14).** The exploratory strata above are promoted to the pre-specified intended-use population by Amendment A1 (end of this file), which is that dated amendment.
+
 ## 16. Operationalizations the plan does not state (need DECISION_LOG entries before freeze)
 
 1. Scoring of "possible" (section 3.2): y = 0, with sensitivities. Follows `docs/labels_spec.md`.
@@ -419,3 +423,109 @@ The worked example (covid-19 deterioration model, prevalence 0.43, C 0.77) and t
 | Sample size and power tables | `sortinghat/metrics/sample_size.py` |
 | Tests on synthetic predictions with known answers | `tests/test_metrics_*.py` |
 
+
+---
+
+# Amendment A1 (2026-10-14), before any gold label exists
+
+**Status.** Dated amendment to the SAP above. Appended; no earlier text was rewritten (two one-line pointers to this amendment were inserted, in the header and in section 15). DECISION_LOG entry: D-156.
+**Gold labels:** none exist. No adjudication pilot, kappa or evaluation-set label has been produced or viewed.
+**Outcome data seen?** **Yes, aggregate and exploratory.** Aggregate results of the exploratory silver-label feasibility analysis (D-143) had been seen when this amendment was written (section A1.1). The choices in A1.2 and A1.3 were informed by them. They are therefore not independent of those results, and this document says so rather than presenting them as predictions made blind.
+**Freeze order (section 10, item 9) is unchanged:** this amendment, the SAP, the code and the primary EEG model are hashed and registered before any evaluation-set gold label or model output is opened.
+**Items marked [OP-A1]** are operationalizations added here for the project lead and biostatistician to confirm before freeze.
+
+## A1.1 What had been seen (disclosure)
+
+Aggregate-only, small-cell-suppressed outputs of the silver-label feasibility analysis (`docs/silver_feasibility.md`): models trained, tuned and scored on structured, EEG-blind silver labels at the two labelled sites (D-120), strict-cohort runs (several versions) and a broad-cohort run (analysed n in the low thousands). The silver labels are circular by construction and are not the gold reference standard of section 3 (limits in `docs/silver_feasibility.md`, section 4). In outline, and qualitatively:
+
+- For **E1 (structural)**, **E2 (hypoxic-ischemic)** and **E5 (metabolic)**, adding the EEG gave a modest improvement in masked log loss over Baseline A (severity plus sedation), replicated across the exploratory runs, and a smaller improvement over the full t0 picture (Baseline C).
+- The improvement persisted in patients with no recorded sedation and in the presentation-based stratum IU-large (D-155), in which it came mostly through E1.
+- **E4a (toxic, antidote-defined)**: no EEG increment.
+- **E6 (infectious/septic)**: the EEG consistently made predictions worse (a small but consistent loss of AUROC, leave-one-site-out). E6 also has a data-feed availability problem (blood-culture rows are nearly absent early in each site's record period; D-153).
+- **E7**: too rare to estimate.
+- The gap between the CBraMod-based (commercial-clean) and MORGOTH-based combined models was about 0 leave-one-site-out.
+- The sedation-confounding, sedation-intensity (D-154), intended-use stratum (D-155) and label-drift (D-153) analyses had been run on the real data.
+
+Seen earlier and noted in DECISION_LOG: the Phase 0a field-audit aggregates, cohort-flow counts, silver-anchor firing counts and silver label prevalence, and the intended-use fit diagnostic (`docs/research/intended_use_fit_2026-10-09.md`). **Not seen:** any gold label, any pilot kappa, any model output scored against gold, any EEG report used as label evidence, any record-level data in an agent session.
+
+## A1.2 Primary endpoint label set (amends sections 3.1, 5, 6, 8, 11, 12)
+
+**(a) New primary label set: the EEG-plausible etiologies {E1, E2, E5}.**
+
+| Label | Role after A1 |
+|---|---|
+| E1 Acute structural | **Primary** |
+| E2 Global hypoxic-ischemic | **Primary** |
+| E5 Metabolic/physiologic | **Primary** |
+| E3 Epileptic contributor | **Positive control**, reported separately with its own EEG-based adjudication (unchanged role, section 10 item 8c). Never in the primary endpoint |
+| E4a Exogenous intoxication | **Secondary / exploratory** (was primary) |
+| E6 Systemic infection/inflammation | **Secondary / exploratory** (was primary) |
+| E7 CNS infection/inflammation | **Secondary / exploratory**; the eligibility rule of section 3.1 is kept, but even if eligible E7 is reported as secondary |
+| E4b Iatrogenic sedation | Unchanged: covariate and secondary label |
+
+**What changes in the endpoint.** The primary endpoint of section 5 is computed with L_i restricted to {E1, E2, E5}. Patients with no assessable label among the three are dropped identically for model and baseline, and their number is reported. Every other element of section 5 (clipping, patient-weighted pooling) is unchanged. The H-hypotheses of section 6 use this endpoint. H4 (ranking) is label-wide by construction and keeps all labels. The "at least 3 primary families improve individually" requirement of G2 is applied as written to the amended set, so it requires all of E1, E2 and E5 **[OP-A1: the plan's rule was written for a larger set; the lead and biostatistician confirm that this stricter reading stands]**. The Holm family of section 8 is these three labels. Gate G0 is unchanged and is evaluated over the original primary families, because the pilot adjudicates all of them.
+
+**Secondary/exploratory labels (E4a, E6, E7)** are reported with the same Delta, per-label and calibration machinery, at nominal 95% intervals, with no multiplicity control (section 8, "Exploratory" row). They enter no gate and no hypothesis. E6 is reported with the D-153 availability rule applied; a pre-registered expectation is that its Delta is not below 0, and a positive Delta (harm) is reported as such.
+
+**Sensitivity: the original endpoint.** The original all-label endpoint (E1, E2, E4a, E5, E6, plus E7 if eligible) is also computed and reported in the same table, with the same prominence, as new sensitivity analysis row 19 (section A1.6). Its H1/H2 criteria and per-site rule are evaluated and reported; it does not change the status of H1/H2 as defined on the amended endpoint, and a result that is favourable on the amended endpoint and not on the original is reported in the abstract as such.
+
+**Rationale, stated plainly.**
+1. The three retained labels have EEG correlates that were written into the circularity-audit mapping with the feasibility code (D-143, `docs/silver_feasibility.md`) before the feasibility runs, although that mapping is provisional and not independent evidence: focal slowing and periodic or rhythmic patterns for E1, burst-suppression and low voltage for E2, generalized periodic patterns for E5).
+2. The silver feasibility results showed no increment for E4a (consistent with the plan's own low expectation for it, and with its antidote-defined silver label being a proxy), a negative one for E6, and too few E7 cases.
+3. **This choice was nonetheless made with those results in view.** The amended endpoint has a higher prior chance of showing a gain than the original one, for that reason. Readers should therefore give more weight to the sensitivity analysis on the original endpoint, which was not selected on any result, and no claim is made that the amendment was blind. The silver labels measure something different from the gold labels (section 3), so a gain on silver labels does not guarantee a gain on gold labels, but it does mean the amended endpoint is not a neutral test.
+4. A positive result on {E1, E2, E5} supports a claim about those three etiologic families only. No claim is made about infectious, toxic or CNS-infectious etiologies, and the paper's main text states that E4a and E6 were demoted after the feasibility analysis and why.
+
+**No further label-set change** will be made after this amendment except by a new dated amendment before the evaluation set is unblinded; the only new information that could prompt one is the Phase 0b pilot (kappa and prevalence), and the amendment would say so.
+
+## A1.3 Intended-use population (amends sections 2, 4.4, 6, 11; supersedes the exploratory status of the D-155 strata)
+
+**(b) IU-large is the pre-specified primary population for the hypotheses about undifferentiated altered mental status in the ED.** Definition, fixed as in D-155 and `docs/silver_feasibility.md` section 2.4 (code: `sortinghat/metrics/intended_use.py`; the code version is hashed at freeze): t0 on encounter calendar day 0-1; no sedative or opioid continuous infusion running at t0; no ventilation proxy and no vasopressor proxy in the 24 h before t0 (when the OMOP proxies can be loaded; otherwise the definition omits them and the report says so); recording <= 12 h or not a continuous-EEG task folder. A condition that cannot be established counts as not met. IU-small (calendar day 0, not a continuous-EEG task folder) is a nested secondary stratum. The definition contains no diagnosis-code, label or EEG-derived condition. It will not be redefined after unblinding.
+
+**Population rule.**
+- **Primary (intended use):** H1, H2, H3, H5 and H6 of section 6 are each stated for IU-large, and the gates G2 and G3 are evaluated on the IU-large results. Estimands, success criteria, intervals and the every-site rule are exactly those of sections 5 to 8 with the amended label set (A1.2). In this population the sedation conditions of H1 and H3 are partly satisfied by construction (no running infusion), which is why A1.4 remains mandatory.
+- **Secondary:** the same H-hypotheses in the whole cohort of section 2 (strict cohort as originally defined; the broad cohort reported separately as before and never pooled with it). Whole-cohort results are reported in the same table, with the same criteria, and are not combined with IU-large results. H4 is estimated in the whole cohort (primary) and in IU-large (descriptive), because it needs the larger sample.
+- **Domain of IU-large.** IU-large rows come from the broad cohort, because the strict cohort supplies too few of them (`docs/research/intended_use_fit_2026-10-09.md`). IU-large rows of the strict cohort are a sensitivity analysis.
+- **Estimability and fallback.** IU-large is estimable for a hypothesis only with at least 50 scored patients and at least 11 at each site (the D-155 rule). If it is not estimable, the IU-large hypotheses are reported as "not estimable", not as met or unmet, the whole-cohort result is the only evidence, and the claim is restricted accordingly (A1.5).
+- **Transport (D-155)** to IU-large by stabilised inverse-odds weights is a sensitivity analysis (row 21), not the primary estimate. The primary estimate is the unweighted IU-large Delta.
+- **Evaluation-set sampling.** The expected number of IU-large cases among about 1,000 consecutive gold cases is computed from the cohort table (aggregate only) before any case is sampled. If it is too small for H2 in IU-large, the sampling frame may enrich IU-large and the estimates use design weights. The frame is fixed in a dated amendment (A2) before any case is sampled; either way the estimand is IU-large **[OP-A1]**.
+
+**Labelling.** IU-large approximates, and does not identify, the ED population: HEEDB has no ED flag (`visit_concept_id` is 0 throughout) and ED visits released the same day are excluded by the acute-care proxy (section 2). If BDSP can supply an ED indicator or admitted-from field, a new dated amendment would define an ED-flag stratum; the IU-large definition above would stay as a sensitivity analysis.
+
+## A1.4 Mandatory controls added (amends sections 10 and 12)
+
+Both are mandatory (reported in full for every primary and key secondary result, whatever the outcome) and are added to section 10, item 10.
+
+**(c1) Sedation-intensity analysis (D-154).** The ordinal t0 sedation grade 0-3 is built from the Baseline A `sed__*` columns only (`sortinghat.metrics.sedation.GRADE_SPEC`; the cut points are fixed and are not re-tuned on any data). Reported for the primary models in both populations: Delta by grade and in light (grades 0-1) versus heavy (grades 2-3), the heavy-minus-light difference, the site-adjusted trend of the per-patient difference on grade (99% bootstrap interval), and the EEG-only sedation-intensity probe. A grade or stratum under 50 patients is not estimable. The reading rules are those fixed before the silver run (`docs/silver_feasibility.md` section 2.2):
+(a) light-grade 99% interval below 0 and trend interval including 0: against a sedation explanation; (b) light interval including 0 and trend below 0: consistent with a sedation contribution; (c) both below 0: a gain at every level that also grows with intensity, a sedation contribution cannot be excluded for the part that grows; (d) anything not estimable: inconclusive, never exculpatory.
+Consequence: the wording "beyond sedation" for claim 1A is used only under reading (a); under (b) or (c) it is qualified as stated; under (d) no independence from sedation is claimed. G2 criterion (iii) is recorded as "not established" under reading (b) or (d) **[OP-A1]**.
+
+**(c2) Label drift screen and data-feed availability (D-153).** For every analysed label, test versus train prevalence among assessable rows in the temporal holdout, per site and pooled; a ratio above 3 or below 1/3 flags the label, and its temporal results are not interpreted (leave-one-site-out governs). The screen is run on the gold evaluation labels as well as the silver training labels, together with the per-site assessable fraction by calendar tenth. For any label whose evidence source can be absent for a period (E6 blood cultures, and any E5 laboratory component), a case with no source is "unassessable", never negative, and the assessable fraction by era is reported.
+
+## A1.5 External validation plan and claim limits
+
+**(d) External validation.** A frozen model is validated outside HEEDB in two tiers, under the following rules, which hold for both:
+- The model, preprocessing and scoring script are frozen and hashed before any external data are seen. No external data are used for training, selection or recalibration. A recalibrated variant, if shown, is labelled as such and is not the primary result.
+- **Model-to-data:** the collaborators run the frozen model and script locally and return aggregates only, with their small-cell rules applied. We do not receive recordings, rows, identifiers or dates.
+- External success criteria are fixed with the collaborators before any scoring and registered as a dated amendment (A3) before the first external run. The default readout is the masked log-loss Delta over the best available analogue of Baseline P (and over age/sex and the prevalence prior), pooled over the E1, E2 and E5 counterparts, with a 95% interval, reported whichever way it falls. A point estimate below 0 with an interval excluding 0 is read as replication; anything else is reported as not replicated or inconclusive.
+- **Tier 1, intended-use check: Careggi EMINENCE (Florence), adult ED patients with emergency EEG.** Discharge diagnoses there were made with the EEG available, which is the circularity the plan bans, so they are not the reference standard for the primary external result. The primary external result uses an **EEG-blind re-adjudication** of a subset (size and sampling agreed with the collaborators), using our label definitions. Discharge-diagnosis analyses are secondary and labelled as circular. The mapping of Careggi categories to E1, E2 and E5 is fixed in A3, and E4a, E6 and E7 are not testable there.
+- **Tier 2, ICU check: CERTA (Switzerland), adult ICU and ward patients with documented etiology groups and sedation dosing.** The group-to-label mapping is fixed in A3 before scoring; E6 and E7 are not testable there. It is a check of transport of the E1, E2 and E5 result to independent ICU sites, not an ED claim.
+
+**What may and may not be claimed.** **No claim about ED triage will be made from HEEDB alone.** Results in IU-large are described as "undifferentiated, early-presentation acute-care EEG (a HEEDB proxy for the ED)". A claim about the ED population requires, at minimum, the Careggi check on an EEG-blind reference standard; a claim about deployment or triage requires a prospective ED study with rapid-EEG hardware (plan, P1-P2) and is outside this SAP. Claim 1A (etiologic signatures beyond severity and sedation) is a statement about acute-care EEG as sampled in HEEDB. The E3 positive control must show a clear gain for any Delta to be interpreted (section 10 item 8c), as before.
+
+## A1.6 Sensitivity analyses added (appended to section 12)
+
+| # | Sensitivity | Purpose |
+|---|---|---|
+| 19 | Original all-label endpoint (E1, E2, E4a, E5, E6, plus E7 if eligible), in both populations | Show what the A1.2 narrowing changes; the unselected endpoint |
+| 20 | Whole cohort (strict, and broad separately) for H1-H3, H5, H6 | The original population, now secondary |
+| 21 | IU-large transported estimate (stabilised inverse-odds weights), IU-small, IU-large in the strict cohort, U0 | Robustness of the intended-use stratum |
+| 22 | E4a, E6, E7 per-label Delta with the D-153 rule | Secondary labels |
+| 23 | Leave-one-label-out within {E1, E2, E5} | Whether one label carries the primary result (the silver gain was mostly E1 in IU-large) |
+| 24 | With-history baselines (row 17) in IU-large | Value of history the intended user lacks |
+
+## A1.7 Items to complete before freeze
+
+1. Code: `sortinghat/metrics/labels.py` defines `PRIMARY_LABELS` as the original five. The amended endpoint needs its own constants (primary {E1, E2, E5}; secondary {E4a, E6, E7}; the original set kept for row 19) and the harness calls must be switched. The file is outside the scope of this amendment and was not edited.
+2. Confirm the [OP-A1] items above (G2 reading, evaluation-set sampling frame, G2 (iii) sedation rule) with the project lead and the biostatistician; add them to section 16 as items 17 to 19 in the next SAP revision.
+3. Rerun the sample-size and power tables of section 14 for the {E1, E2, E5} endpoint and for the IU-large sample once the pilot supplies prevalence, SD(d_i) and the IU-large share. The numbers of section 14 were computed for the original set and for placeholders.
+4. Amendments A2 (evaluation-set sampling frame) and A3 (external-validation success criteria and label mappings) are due before the corresponding data are touched.
