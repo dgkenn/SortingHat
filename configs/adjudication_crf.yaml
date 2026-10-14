@@ -1,0 +1,100 @@
+# Case report form (CRF) for the gold adjudication pilot (IU-large; D-157).
+# Single source of truth: scripts/adjudication_redcap.py turns this file into docs/adjudication_redcap_dictionary.csv (REDCap data
+# dictionary) and sortinghat/adjudication/crf.py reads the same file to parse a REDCap export for scripts/adjudication_analyze.py.
+# One form instance = one rater x one case.  Raters are EEG-blind: no field asks for, or accepts, EEG information.
+version: 1
+form: adjudication
+title: "Gold adjudication pilot: etiology of altered mental status (EEG-blind)"
+
+# Ordinal gold states (research plan, "Reference standard").  Binary positive = probable or definite (sortinghat.labels.ontology.GoldState).
+state_scale:
+  0: absent
+  1: possible
+  2: probable
+  3: definite
+  9: unassessable
+positive_states: [probable, definite]
+state_help:
+  absent: "No evidence for it and nothing in the packet suggests it."
+  possible: "A plausible contributor but the evidence is inconclusive (clearly less likely than not)."
+  probable: "More likely than not a cause or contributor of the impaired consciousness at t0."
+  definite: "Established by objective evidence or an unambiguous documented diagnosis."
+  unassessable: "The packet lacks the information needed to judge this label (not the same as absent)."
+
+confidence_scale:
+  1: "1 - guess"
+  2: "2 - low"
+  3: "3 - moderate"
+  4: "4 - high"
+  5: "5 - certain"
+
+# Etiology labels (multi-label: several can be present).  `field` is the REDCap field prefix.
+labels:
+  - {code: E1,    field: e1,    name: "Acute structural",           definition: "Stroke, ICH, SAH, SDH/EDH, TBI, mass effect, hydrocephalus. Sub-label focal vs diffuse."}
+  - {code: E2,    field: e2,    name: "Global hypoxic-ischemic",     definition: "Post-arrest, asphyxia, profound shock or global hypoperfusion."}
+  - {code: E3,    field: e3,    name: "Epileptic contributor",       definition: "Seizure, non-convulsive status, causally relevant postictal state. EEG-blind: judge from the clinical record only (witnessed seizure, postictal course, treating team's suspicion). This is NOT the EEG-based positive-control adjudication (D-002)."}
+  - {code: E4a,   field: e4a,   name: "Exogenous intoxication",      definition: "Overdose, drug or toxin exposure that brought the patient in or arose unintentionally (alcohol, opioids, sedative-hypnotics, toxic alcohols, carbon monoxide). Planned medical sedation is E4b, not E4a."}
+  - {code: E4b,   field: e4b,   name: "Iatrogenic sedation",         definition: "Planned or administered sedatives or opioids sufficient to depress the examination (procedural, post-anesthesia, ICU sedation)."}
+  - {code: E5,    field: e5,    name: "Metabolic/physiologic",       definition: "Hepatic, uremic, glucose, sodium, hypercapnia, endocrine, acid-base disturbance."}
+  - {code: E6,    field: e6,    name: "Systemic infection/inflammation", definition: "Sepsis-associated encephalopathy or systemic inflammation WITHOUT CNS infection."}
+  - {code: E7,    field: e7,    name: "CNS infection/inflammation",  definition: "Meningitis, encephalitis, autoimmune encephalitis."}
+  - {code: other, field: other, name: "Other etiology",              definition: "Any other cause not covered above (name it in the comment, no identifiers)."}
+
+primary_etiology_choices:
+  - {code: E1, label: "E1 Acute structural"}
+  - {code: E2, label: "E2 Global hypoxic-ischemic"}
+  - {code: E3, label: "E3 Epileptic contributor"}
+  - {code: E4a, label: "E4a Exogenous intoxication"}
+  - {code: E4b, label: "E4b Iatrogenic sedation"}
+  - {code: E5, label: "E5 Metabolic/physiologic"}
+  - {code: E6, label: "E6 Systemic infection/inflammation"}
+  - {code: E7, label: "E7 CNS infection/inflammation"}
+  - {code: other, label: "Other etiology"}
+  - {code: unknown, label: "Unknown (no etiology can be assigned from the packet)"}
+
+evidence_choices:
+  1: "Notes: history and presentation"
+  2: "Notes: imaging reports"
+  3: "Notes: consult or progress notes"
+  4: "Notes: discharge or later course"
+  5: "Laboratory results"
+  6: "Medications and administrations"
+  7: "Vital signs"
+  8: "Neurological and sedation scores"
+  9: "Diagnosis and procedure codes"
+  10: "Flowsheet observations"
+
+sections:
+  - header: "Case and rater"
+    fields:
+      - {name: case_id, type: text, label: "Case ID (pseudonymous, from the packet)", required: true, annotation: "Record ID. Pre-load from out/local_only/adjudication/redcap_case_ids.csv."}
+      - {name: rater_id, type: dropdown, label: "Rater", choices: {R1: "Rater 1", R2: "Rater 2", R3: "Third rater (disagreements only)"}, required: true}
+      - {name: minutes_spent, type: text, label: "Minutes spent on this case (packet reading plus form)", validation: integer, min: 1, max: 240, required: true}
+  - header: "Presentation check"
+    fields:
+      - {name: ams_at_t0, type: radio, label: "Was the patient acutely unconscious or in an altered mental status at t0?", choices: {1: "Yes, clearly", 2: "Probably", 3: "No or not evident from the packet"}, required: true}
+  - header: "Primary etiology"
+    fields:
+      - {name: primary_etiology, type: radio, label: "Primary etiology (the single best explanation of the impaired consciousness at t0)", choicelist: primary_etiology_choices, required: true}
+      - {name: primary_conf, type: radio, label: "Confidence in the primary etiology (1-5)", choices: confidence_scale, required: true}
+  - header: "Each etiology (multi-label): state and confidence"
+    per_label:
+      state: {name: "{f}_state", type: radio, label: "{code} {name}: present?", choices: state_scale, required: true, note: "{definition}"}
+      conf: {name: "{f}_conf", type: radio, label: "{code}: confidence in the rating above (1-5)", choices: confidence_scale, branching: "[{f}_state] <> '' and [{f}_state] <> '{unassessable}'", required: true}
+    after:
+      e1_conf:
+        - {name: e1_sub, type: radio, label: "E1 sub-label", choices: {1: "Focal", 2: "Diffuse", 3: "Both", 4: "Unspecified"}, branching: "[e1_state] = '{probable}' or [e1_state] = '{definite}'", required: true}
+  - header: "Evidence and timing"
+    fields:
+      - {name: evidence_used, type: checkbox, label: "Evidence you relied on (tick all)", choices: evidence_choices, required: true}
+      - {name: evidence_text, type: notes, label: "Key evidence in one or two lines (no identifiers, do not copy note text)"}
+      - {name: dx_certainty, type: radio, label: "Time of diagnostic certainty: when did the information in the packet first make your primary etiology at least probable?",
+         choices: {1: "Already evident from data before t0", 2: "0 to less than 6 h after t0", 3: "6 to less than 24 h", 4: "1 to less than 3 days", 5: "3 to 7 days", 6: "More than 7 days", 7: "Never reached probable"}, required: true}
+      - {name: dx_certainty_h, type: text, label: "Optional: that time in hours relative to t0 (negative = before)", validation: number, min: -72, max: 720, branching: "[dx_certainty] <> '' and [dx_certainty] <> '7'"}
+  - header: "Packet quality and blinding"
+    fields:
+      - {name: packet_quality, type: radio, label: "How complete was the packet for this judgement?", choices: {1: "Complete", 2: "Some information missing", 3: "Largely missing"}, required: true}
+      - {name: eeg_seen, type: radio, label: "Did the packet contain any EEG information (EEG report, EEG finding, EEG-derived monitor)?", choices: {0: "No", 1: "Minor (an indirect hint)", 2: "Major (an EEG result or report was visible)"}, required: true,
+         note: "If 1 or 2, do not use it for your ratings. Do not copy the text."}
+      - {name: eeg_seen_text, type: notes, label: "If yes: where in the packet (section and note number only, do not copy the text)", branching: "[eeg_seen] = '1' or [eeg_seen] = '2'"}
+      - {name: comments, type: notes, label: "Comments (no identifiers)"}

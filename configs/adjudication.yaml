@@ -1,0 +1,39 @@
+# Gold adjudication pilot, IU-large (D-157).  Read by scripts/adjudication_sample.py, adjudication_packets.py, adjudication_analyze.py.
+# Fixed BEFORE any sample is drawn and before any gold label exists; edits after the draw must be logged in DECISION_LOG.md.
+stratum: IU_large                 # the pre-specified ED-like intended-use stratum (D-155; sortinghat/metrics/intended_use.py)
+cohort:
+  cohort_def: broad               # the broad EHR-phenotype cohort (research plan, Study 1: reported separately from strict)
+  sites: [S0001, S0002]
+
+sampling:
+  n: 200                          # sampled patients (the Phase 0b pilot size)
+  seed: 20261014
+  site_allocation: proportional   # proportional | equal  (allocation of n to sites)
+  duplicate_fraction: 0.10        # extra duplicate packets (same patient, new case id) for intra-rater reliability
+  n_calibration: 5                # rater-training packets drawn from patients NOT in the sample (excluded from every analysis)
+  # Silver-label pattern = first silver-positive label in this priority order (rarest etiology first, fixed a priori), else all_negative.
+  priority: [E7, E2, E4a, E6, E5, E1]
+  # Target share of each site's sample per pattern: enriches the rarer etiologies and the silver all-negative patients.  A stratum smaller
+  # than its target is taken whole; the shortfall goes to the other strata of that site in proportion to these shares.
+  shares: {E7: 0.10, E2: 0.12, E4a: 0.12, E6: 0.14, E5: 0.14, E1: 0.16, all_negative: 0.22}
+
+packets:
+  before_h: 72                    # window start, hours before t0
+  after_days: 30                  # window end, days after t0
+  history_days: 365               # diagnoses only: earlier rows are listed as "prior history"
+  vital_bin_h: 6
+  max_values_per_series: 60
+  max_notes: 400
+  max_note_chars: 250000
+  # notes_after_days: 7          # uncomment to end the NOTES window earlier than after_days if packets prove too long to read (log it in DECISION_LOG.md)
+
+raters: [R1, R2]                  # R3 (third rater) reviews disagreements only
+batch_size: 20                    # packets per rater batch; duplicates are shown at least one batch after their originals
+
+analysis:
+  # The research plan's Gate 0 families are sortinghat.labels.ontology.primary_endpoint_labels() (E1, E2, E4a, E5, E6). SAP Amendment A1
+  # (D-156) narrows the Study 1 primary endpoint to the EEG-plausible etiologies below; the report shows both. Reading Gate 0's "at least 4
+  # families" on a 3-label set is an open item [OP-A1]: the report gives the per-label numbers and does not call a pass or fail on it.
+  amended_primary_labels: [E1, E2, E5]
+  kappa_threshold: 0.6
+  prevalence_threshold: 0.10
