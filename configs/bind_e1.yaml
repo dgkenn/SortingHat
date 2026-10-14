@@ -1,0 +1,99 @@
+# Imaging-anchored structural-injury label (imaging-E1) from BIND. Read by sortinghat/labels/bind.py.
+# Pre-specified in docs/bind_e1_analysis_plan.md (D-158). Fixed BEFORE any BIND label is computed or counted.
+#
+# Provenance of each block:
+#   columns / tables : CONFIRMED  (names-only header read of the BDSP credentialed access point, 2026-10-14).
+#   concept classes  : the clinical definition is fixed by the plan. The regex strings that implement it are ASSUMED:
+#                      no VALUE of any BIND column has been seen. Step 0c of the plan (a values-only vocabulary listing of the
+#                      categorical columns, no counts, no EEG linkage) may adapt the strings; the final file is hashed and
+#                      logged in DECISION_LOG before the first label is linked to an EEG case.
+#   window           : fixed by the plan (calendar days, because the imaging date is date-only; see the plan).
+
+schema_version: 1
+status: ASSUMED_VALUES            # CONFIRMED columns, ASSUMED value vocabularies; change to VERIFIED only after step 0c
+
+prefix: "Imaging/{site}/Clinical/"             # site-level tables only; never open Imaging/<site>/BIDS or Non-BIDS patient folders
+sites: [I0001, I0004]                          # I0001 = MGB (EEG-linked); I0004 = Stanford (PSG-linked, not in the EEG cohort)
+tables:                                        # CONFIRMED file names
+  findings: "{site}_imaging_findings_De-id.csv"
+  reports: "{site}_reports.csv"
+  demographics: "{site}_demographics.csv"
+
+# canonical name -> real header name (CONFIRMED). The findings header is identical at I0001 and I0004.
+findings_columns:
+  person: BDSPPatientID
+  session: Session_id
+  dob: ShiftedDateOfBirth
+  study_date: ShiftedStudyDate
+  counts: Counts
+  abnormality: Abnormality
+  brain: Brain
+  finding_id: FindingID
+  present_prior: PresentPrior
+  change: Change
+  name: Name
+  general_name: "General Name"
+  location: Location
+  brain_related: "Brain-related"
+  magnitude: Magnitude
+  acuity: "Acute/Chronic"
+  test: Test
+  label_manual: Label_manual
+  nullfinding: Nullfinding
+  level2: Label_LLAMA_Level2
+  level1: Label_LLAMA_Level1
+# demographics: header differs by site; only the session catalogue (person, session, study date) and DOB are used.
+demographics_columns:
+  I0001: {person: bdsp_patient_id, session: Session_id, dob: ShiftedDateOfBirth, study_date: ShiftedStudyDate}
+  I0004: {person: bdsp_patient_id, session: Session_id, dob: ShiftedDateOfBirth, study_date: ShiftedStudyDate}
+reports_columns: {person: bdsp_patient_id, session: session_id, type: Type}
+# Free text. NEVER loaded into memory by the loader and never read by an agent (CLAUDE.md rules 1, 3, 4).
+never_load: [Report_txt]
+
+# ---- value vocabularies (ASSUMED until step 0c) -------------------------------------------------------------------
+truthy: ["yes", "y", "true", "1", "t"]
+falsy: ["no", "n", "false", "0", "f"]
+acute_regex: "\\b(acute|subacute|sub-acute|hyperacute|early subacute|new)\\b"
+chronic_regex: "\\b(chronic|remote|old|sequela|sequelae|prior|stable|late subacute)\\b"   # checked FIRST; a chronic qualifier wins
+# columns whose text is searched for the lesion concepts
+match_columns: [name, general_name, level2]
+
+# ---- window (calendar days, imaging date minus t0 date) -----------------------------------------------------------
+window_days: [-1, 3]              # primary; ~[-24 h, +72 h] with day resolution. Sensitivities are in the plan, not here.
+
+# ---- lesion classes (primary imaging-E1 = any of `primary_classes`; mirrors the silver imaging items, configs/silver_anchors.yaml) ----
+primary_classes: [infarct, ich, sah, sdh_edh, tbi_contusion, mass_effect]
+secondary_classes: [hydrocephalus]
+classes:
+  infarct:
+    include: "infarct|ischemi|ischaemi|stroke|restricted diffusion|diffusion restriction|diffusion abnormal"
+    exclude: "lacune|lacunar|microvascular|small vessel|chronic|encephalomalacia|gliosis|leukoaraiosis|white matter hyperintens"
+  ich:
+    include: "intraparenchymal (hemorrhage|haemorrhage|hematoma|haematoma)|intracerebral|intracranial hemorrhage|parenchymal (hemorrhage|hematoma)|\\bich\\b|hemorrhagic (conversion|transformation)"
+    exclude: "microhemorrhage|microbleed|micro-hemorrhage|cavernous|cavernoma|hemosiderin|chronic|old"
+  sah:
+    include: "subarachnoid|\\bsah\\b"
+    exclude: "chronic|old|hemosiderin|superficial siderosis"
+  sdh_edh:
+    include: "subdural|epidural|extra-axial (hemorrhage|hematoma|collection)"
+    exclude: "chronic|hygroma|effusion"
+  tbi_contusion:
+    include: "contusion|diffuse axonal|traumatic brain|\\btbi\\b|intraparenchymal.*trauma"
+    exclude: "chronic|encephalomalacia|gliosis|remote"
+  mass_effect:
+    include: "midline shift|herniation|mass effect|effacement of (the )?(basal cisterns|sulci)|tumou?r with (vasogenic )?edema|vasogenic edema|cerebral edema|brain edema"
+    exclude: "no mass effect|without mass effect|chronic"
+  hydrocephalus:
+    include: "hydrocephalus|ventriculomegaly|ventricular enlargement"
+    exclude: "ex vacuo|chronic|stable|shunt(ed)?"
+# a negated mention is not a finding (the extractor is asked for explicit findings only, but check anyway)
+negation_regex: "\\b(no|without|negative for|absence of|ruled out)\\b"
+
+# ---- assessability ------------------------------------------------------------------------------------------------
+# A session is a BRAIN study (assessable) when it has >= 1 findings row with Brain-related (or Brain) true, or its report
+# Type matches `report_type_regex` (null = not used; the Type vocabulary is unknown).
+session_assessable:
+  from_findings_brain: true
+  report_type_regex: null
+# A lesion-class match whose acuity is blank/unknown is INDETERMINATE (masked), never negative and never positive.
+indeterminate_masks_label: true
